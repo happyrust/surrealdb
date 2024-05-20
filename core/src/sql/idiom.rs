@@ -2,6 +2,7 @@ use crate::ctx::Context;
 use crate::dbs::{Options, Transaction};
 use crate::doc::CursorDoc;
 use crate::err::Error;
+use crate::sql::statements::info::InfoStructure;
 use crate::sql::{
 	fmt::{fmt_separated_by, Fmt},
 	part::Next,
@@ -20,6 +21,7 @@ pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Idiom";
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct Idioms(pub Vec<Idiom>);
 
 impl Deref for Idioms {
@@ -47,6 +49,7 @@ impl Display for Idioms {
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Idiom")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct Idiom(pub Vec<Part>);
 
 impl Deref for Idiom {
@@ -62,6 +65,12 @@ impl From<String> for Idiom {
 	}
 }
 
+impl From<&str> for Idiom {
+	fn from(v: &str) -> Self {
+		Self(vec![Part::from(v)])
+	}
+}
+
 impl From<Vec<Part>> for Idiom {
 	fn from(v: Vec<Part>) -> Self {
 		Self(v)
@@ -73,6 +82,7 @@ impl From<&[Part]> for Idiom {
 		Self(v.to_vec())
 	}
 }
+
 impl From<Part> for Idiom {
 	fn from(v: Part) -> Self {
 		Self(vec![v])
@@ -188,5 +198,17 @@ impl Display for Idiom {
 			),
 			f,
 		)
+	}
+}
+
+impl InfoStructure for Idioms {
+	fn structure(self) -> Value {
+		self.to_string().into()
+	}
+}
+
+impl InfoStructure for Idiom {
+	fn structure(self) -> Value {
+		self.to_string().into()
 	}
 }

@@ -10,6 +10,7 @@ use std::ops::{Add, Sub};
 // have a better structure.
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, PartialOrd, Hash, Store)]
+#[non_exhaustive]
 pub struct ClusterMembership {
 	pub name: String,
 	// TiKV = TiKV TSO Timestamp as u64
@@ -23,6 +24,7 @@ pub struct ClusterMembership {
 #[derive(
 	Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, Ord, PartialOrd, Hash, Store, Default,
 )]
+#[non_exhaustive]
 pub struct Timestamp {
 	pub value: u64,
 }
@@ -39,6 +41,7 @@ impl From<u64> for Timestamp {
 // conflicts when you have Store and Key derive macros.
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, PartialOrd, Hash, Key)]
+#[non_exhaustive]
 pub struct KeyTimestamp {
 	pub value: u64,
 }

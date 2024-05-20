@@ -17,6 +17,7 @@ pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Regex";
 
 #[revisioned(revision = 1)]
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Regex(pub regex::Regex);
 
 impl Regex {
@@ -61,7 +62,9 @@ impl FromStr for Regex {
 
 impl PartialEq for Regex {
 	fn eq(&self, other: &Self) -> bool {
-		self.0.as_str().eq(other.0.as_str())
+		let str_left = self.0.as_str();
+		let str_right = other.0.as_str();
+		str_left == str_right
 	}
 }
 

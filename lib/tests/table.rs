@@ -15,7 +15,9 @@ async fn define_foreign_table() -> Result<(), Error> {
 				count(),
 				age,
 				math::sum(age) AS total,
-				math::mean(score) AS average
+				math::mean(score) AS average,
+				math::max(score) AS max,
+				math::min(score) AS min
 			FROM person
 			GROUP BY age
 		;
@@ -43,7 +45,7 @@ async fn define_foreign_table() -> Result<(), Error> {
 		"{
 			events: {},
 			fields: {},
-			tables: { person_by_age: 'DEFINE TABLE person_by_age SCHEMALESS AS SELECT count(), age, math::sum(age) AS total, math::mean(score) AS average FROM person GROUP BY age PERMISSIONS NONE' },
+			tables: { person_by_age: 'DEFINE TABLE person_by_age TYPE ANY SCHEMALESS AS SELECT count(), age, math::sum(age) AS total, math::mean(score) AS average, math::max(score) AS max, math::min(score) AS min FROM person GROUP BY age PERMISSIONS NONE' },
 			indexes: {},
 			lives: {},
 		}",
@@ -62,6 +64,8 @@ async fn define_foreign_table() -> Result<(), Error> {
 				average: 70,
 				count: 1,
 				id: person_by_age:[39],
+				max: 70,
+				min: 70,
 				total: 39
 			}
 		]",
@@ -80,6 +84,8 @@ async fn define_foreign_table() -> Result<(), Error> {
 				average: 75,
 				count: 2,
 				id: person_by_age:[39],
+				max: 80,
+				min: 70,
 				total: 78
 			}
 		]",
@@ -98,7 +104,71 @@ async fn define_foreign_table() -> Result<(), Error> {
 				average: 80,
 				count: 2,
 				id: person_by_age:[39],
+				max: 90,
+				min: 70,
 				total: 78
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	Ok(())
+}
+
+#[tokio::test]
+async fn define_foreign_table_no_doubles() -> Result<(), Error> {
+	// From: https://github.com/surrealdb/surrealdb/issues/3556
+	let sql = "
+		CREATE happy:1 SET year=2024, month=1, day=1;
+		CREATE happy:2 SET year=2024, month=1, day=1;
+		CREATE happy:3 SET year=2024, month=1, day=1;
+		DEFINE TABLE monthly AS SELECT count() as activeRounds, year, month FROM happy GROUP BY year, month;
+		DEFINE TABLE daily AS SELECT count() as activeRounds, year, month, day FROM happy GROUP BY year, month, day;
+		SELECT * FROM monthly;
+		SELECT * FROM daily;
+	";
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
+	assert_eq!(res.len(), 7);
+	//
+	let tmp = res.remove(0).result;
+	assert!(tmp.is_ok());
+	//
+	let tmp = res.remove(0).result;
+	assert!(tmp.is_ok());
+	//
+	let tmp = res.remove(0).result;
+	assert!(tmp.is_ok());
+	//
+	let tmp = res.remove(0).result;
+	assert!(tmp.is_ok());
+	//
+	let tmp = res.remove(0).result;
+	assert!(tmp.is_ok());
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				id: monthly:[2024, 1],
+				activeRounds: 3,
+				year: 2024,
+				month: 1,
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				id: daily:[2024, 1, 1],
+				activeRounds: 3,
+				year: 2024,
+				month: 1,
+				day: 1,
 			}
 		]",
 	);

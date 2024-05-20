@@ -11,6 +11,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -38,12 +39,14 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeDefineFunctionStatement {
 	name: Ident,
 	args: Vec<(Ident, Kind)>,
 	block: Block,
 	comment: Option<Strand>,
 	permissions: Permission,
+	if_not_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeDefineFunctionStatement {
@@ -70,6 +73,9 @@ impl serde::ser::SerializeStruct for SerializeDefineFunctionStatement {
 			"permissions" => {
 				self.permissions = value.serialize(ser::permission::Serializer.wrap())?;
 			}
+			"if_not_exists" => {
+				self.if_not_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?
+			}
 			key => {
 				return Err(Error::custom(format!(
 					"unexpected field `DefineFunctionStatement::{key}`"
@@ -86,6 +92,7 @@ impl serde::ser::SerializeStruct for SerializeDefineFunctionStatement {
 			block: self.block,
 			comment: self.comment,
 			permissions: self.permissions,
+			if_not_exists: self.if_not_exists,
 		})
 	}
 }

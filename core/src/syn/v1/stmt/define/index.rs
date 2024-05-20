@@ -22,6 +22,14 @@ use nom::{
 
 pub fn index(i: &str) -> IResult<&str, DefineIndexStatement> {
 	let (i, _) = tag_no_case("INDEX")(i)?;
+	let (i, if_not_exists) = opt(tuple((
+		shouldbespace,
+		tag_no_case("IF"),
+		shouldbespace,
+		tag_no_case("NOT"),
+		shouldbespace,
+		cut(tag_no_case("EXISTS")),
+	)))(i)?;
 	let (i, _) = shouldbespace(i)?;
 	let (i, (name, what, opts)) = cut(|i| {
 		let (i, name) = ident(i)?;
@@ -38,6 +46,7 @@ pub fn index(i: &str) -> IResult<&str, DefineIndexStatement> {
 	let mut res = DefineIndexStatement {
 		name,
 		what,
+		if_not_exists: if_not_exists.is_some(),
 		..Default::default()
 	};
 	// Assign any defined options
@@ -102,11 +111,13 @@ fn index_comment(i: &str) -> IResult<&str, DefineIndexOption> {
 mod tests {
 
 	use super::*;
-	use crate::sql::index::{Distance, Distance1, MTreeParams, SearchParams, VectorType};
-	use crate::sql::Ident;
-	use crate::sql::Idiom;
+	use crate::sql::index::{
+		Distance, Distance1, HnswParams, MTreeParams, SearchParams, VectorType,
+	};
 	use crate::sql::Part;
 	use crate::sql::Scoring;
+	use crate::sql::{Ident, Index};
+	use crate::sql::{Idiom, Number};
 
 	#[test]
 	fn check_create_non_unique_index() {
@@ -120,6 +131,7 @@ mod tests {
 				cols: Idioms(vec![Idiom(vec![Part::Field(Ident("my_col".to_string()))])]),
 				index: Index::Idx,
 				comment: None,
+				if_not_exists: false,
 			}
 		);
 		assert_eq!(idx.to_string(), "DEFINE INDEX my_index ON my_table FIELDS my_col");
@@ -137,6 +149,7 @@ mod tests {
 				cols: Idioms(vec![Idiom(vec![Part::Field(Ident("my_col".to_string()))])]),
 				index: Index::Uniq,
 				comment: None,
+				if_not_exists: false,
 			}
 		);
 		assert_eq!(idx.to_string(), "DEFINE INDEX my_index ON my_table FIELDS my_col UNIQUE");
@@ -171,6 +184,7 @@ mod tests {
 					terms_cache: 400,
 				}),
 				comment: None,
+				if_not_exists: false,
 			}
 		);
 		assert_eq!(idx.to_string(), "DEFINE INDEX my_index ON my_table FIELDS my_col SEARCH ANALYZER my_analyzer BM25(1.2,0.75) \
@@ -202,6 +216,7 @@ mod tests {
 					terms_cache: 100,
 				}),
 				comment: None,
+				if_not_exists: false,
 			}
 		);
 		assert_eq!(
@@ -231,11 +246,44 @@ mod tests {
 					mtree_cache: 100,
 				}),
 				comment: None,
+				if_not_exists: false,
 			}
 		);
 		assert_eq!(
 			idx.to_string(),
 			"DEFINE INDEX my_index ON my_table FIELDS my_col MTREE DIMENSION 4 DIST EUCLIDEAN TYPE F64 CAPACITY 40 DOC_IDS_ORDER 100 DOC_IDS_CACHE 100 MTREE_CACHE 100"
+		);
+	}
+
+	#[test]
+	fn check_create_hnsw_index() {
+		let sql =
+			"INDEX my_index ON my_table FIELDS my_col HNSW DIMENSION 4 EXTEND_CANDIDATES EFC 500 KEEP_PRUNED_CONNECTIONS DIST MANHATTAN TYPE F32 M 16 M0 24 LM 0.5";
+		let (_, idx) = index(sql).unwrap();
+		assert_eq!(
+			idx,
+			DefineIndexStatement {
+				name: Ident("my_index".to_string()),
+				what: Ident("my_table".to_string()),
+				cols: Idioms(vec![Idiom(vec![Part::Field(Ident("my_col".to_string()))])]),
+				index: Index::Hnsw(HnswParams {
+					dimension: 4,
+					distance: Distance::Manhattan,
+					vector_type: VectorType::F32,
+					m: 16,
+					m0: 24,
+					ml: Number::Float(0.5),
+					ef_construction: 500,
+					extend_candidates: true,
+					keep_pruned_connections: true
+				}),
+				comment: None,
+				if_not_exists: false,
+			}
+		);
+		assert_eq!(
+			idx.to_string(),
+			"DEFINE INDEX my_index ON my_table FIELDS my_col HNSW DIMENSION 4 DIST MANHATTAN TYPE F32 EFC 500 M 16 M0 24 LM 0.5f EXTEND_CANDIDATES KEEP_PRUNED_CONNECTIONS"
 		);
 	}
 

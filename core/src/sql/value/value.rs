@@ -5,6 +5,7 @@ use crate::dbs::{Options, Transaction};
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::fnc::util::string::fuzzy::Fuzzy;
+use crate::sql::statements::info::InfoStructure;
 use crate::sql::{
 	array::Uniq,
 	fmt::{Fmt, Pretty},
@@ -33,6 +34,7 @@ pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Value";
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct Values(pub Vec<Value>);
 
 impl Deref for Values {
@@ -60,6 +62,7 @@ impl Display for Values {
 #[derive(Clone, Debug, Default, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Value")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum Value {
 	// These value types are simple values which
 	// can be used in query responses sent to
@@ -2603,6 +2606,12 @@ impl fmt::Display for Value {
 	}
 }
 
+impl InfoStructure for Value {
+	fn structure(self) -> Value {
+		self.to_string().into()
+	}
+}
+
 impl Value {
 	/// Check if we require a writeable transaction
 	pub(crate) fn writeable(&self) -> bool {
@@ -2855,20 +2864,16 @@ mod tests {
 
 	#[test]
 	fn check_size() {
-		assert!(
-			64 >= std::mem::size_of::<Value>(),
-			"expected Value to be smaller then 64 bytes found {:?}",
-			std::mem::size_of::<Value>()
-		);
-		assert!(112 >= std::mem::size_of::<Error>());
-		assert!(112 >= std::mem::size_of::<Result<Value, Error>>());
+		assert!(64 >= std::mem::size_of::<Value>(), "size of value too big");
+		assert_eq!(112, std::mem::size_of::<Error>());
+		assert_eq!(112, std::mem::size_of::<Result<Value, Error>>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::number::Number>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::strand::Strand>());
 		assert_eq!(16, std::mem::size_of::<crate::sql::duration::Duration>());
 		assert_eq!(12, std::mem::size_of::<crate::sql::datetime::Datetime>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::array::Array>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::object::Object>());
-		assert_eq!(56, std::mem::size_of::<crate::sql::geometry::Geometry>());
+		assert_eq!(48, std::mem::size_of::<crate::sql::geometry::Geometry>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::param::Param>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::idiom::Idiom>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::table::Table>());

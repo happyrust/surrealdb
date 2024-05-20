@@ -40,6 +40,7 @@ use std::fmt::{self, Display};
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum DefineStatement {
 	Namespace(DefineNamespaceStatement),
 	Database(DefineDatabaseStatement),
@@ -120,6 +121,6 @@ mod tests {
 			..Default::default()
 		});
 		let enc: Vec<u8> = stm.into();
-		assert_eq!(11, enc.len());
+		assert_eq!(12, enc.len());
 	}
 }

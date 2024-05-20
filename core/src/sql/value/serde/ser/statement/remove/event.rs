@@ -7,6 +7,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -34,9 +35,11 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeRemoveEventStatement {
 	name: Ident,
 	what: Ident,
+	if_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeRemoveEventStatement {
@@ -54,6 +57,9 @@ impl serde::ser::SerializeStruct for SerializeRemoveEventStatement {
 			"what" => {
 				self.what = Ident(value.serialize(ser::string::Serializer.wrap())?);
 			}
+			"if_exists" => {
+				self.if_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?
+			}
 			key => {
 				return Err(Error::custom(format!(
 					"unexpected field `RemoveEventStatement::{key}`"
@@ -67,6 +73,7 @@ impl serde::ser::SerializeStruct for SerializeRemoveEventStatement {
 		Ok(RemoveEventStatement {
 			name: self.name,
 			what: self.what,
+			if_exists: self.if_exists,
 		})
 	}
 }

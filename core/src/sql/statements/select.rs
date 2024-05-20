@@ -15,6 +15,7 @@ use std::fmt;
 #[revisioned(revision = 2)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct SelectStatement {
 	pub expr: Fields,
 	pub omit: Option<Idioms>,

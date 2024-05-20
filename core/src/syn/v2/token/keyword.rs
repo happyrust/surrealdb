@@ -3,7 +3,7 @@ macro_rules! keyword {
 
 		#[repr(u8)]
 		#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-		pub enum Keyword{
+		#[non_exhaustive] pub enum Keyword{
 			$($name,)*
 		}
 
@@ -64,12 +64,19 @@ keyword! {
 	DocLengthsOrder => "DOC_LENGTHS_ORDER",
 	Drop => "DROP",
 	Duplicate => "DUPLICATE",
+	Efc => "EFC",
 	Edgengram => "EDGENGRAM",
 	Event => "EVENT",
 	Else => "ELSE",
 	End => "END",
 	Exists => "EXISTS",
 	Explain => "EXPLAIN",
+	ExtendCandidates => "EXTEND_CANDIDATES",
+	F64 => "F64",
+	F32 => "F32",
+	I64 => "I64",
+	I32 => "I32",
+	I16 => "I16",
 	False => "false",
 	Fetch => "FETCH",
 	Field => "FIELD",
@@ -82,6 +89,7 @@ keyword! {
 	Function => "FUNCTION",
 	Group => "GROUP",
 	Highlights => "HIGHLIGHTS",
+	Hnsw => "HNSW",
 	Ignore => "IGNORE",
 	Index => "INDEX",
 	Info => "INFO",
@@ -90,11 +98,15 @@ keyword! {
 	If => "IF",
 	Is => "IS",
 	Key => "KEY",
+	KeepPrunedConnections => "KEEP_PRUNED_CONNECTIONS",
 	Kill => "KILL",
 	Let => "LET",
 	Limit => "LIMIT",
 	Live => "LIVE",
 	Lowercase => "LOWERCASE",
+	Lm => "LM",
+	M => "M",
+	M0 => "M0",
 	Merge => "MERGE",
 	Model => "MODEL",
 	MTree => "MTREE",
@@ -121,7 +133,9 @@ keyword! {
 	PostingsOrder => "POSTINGS_ORDER",
 	Punct => "PUNCT",
 	Readonly => "READONLY",
+	Rebuild => "REBUILD",
 	Relate => "RELATE",
+	Relation => "RELATION",
 	Remove => "REMOVE",
 	Replace => "REPLACE",
 	Return => "RETURN",
@@ -142,6 +156,7 @@ keyword! {
 	Snowball => "SNOWBALL",
 	Split => "SPLIT",
 	Start => "START",
+	Structure => "STRUCTURE",
 	Table => "TABLE",
 	TermsCache => "TERMS_CACHE",
 	TermsOrder => "TERMS_ORDER",
@@ -150,6 +165,7 @@ keyword! {
 	Timeout => "TIMEOUT",
 	Tokenizers => "TOKENIZERS",
 	Token => "TOKEN",
+	To => "TO",
 	Transaction => "TRANSACTION",
 	True => "true",
 	Type => "TYPE",
@@ -184,6 +200,8 @@ keyword! {
 	ContainsNot => "CONTAINSNOT",
 	Contains => "CONTAINS",
 	In => "IN",
+	Out => "OUT",
+	Normal => "NORMAL",
 
 	Any => "ANY",
 	Array => "ARRAY",

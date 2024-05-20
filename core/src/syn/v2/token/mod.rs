@@ -8,10 +8,12 @@ pub use keyword::Keyword;
 mod mac;
 pub(crate) use mac::t;
 
+use crate::sql::change_feed_include::ChangeFeedInclude;
 use crate::sql::{language::Language, Algorithm};
 
 /// A location in the source passed to the lexer.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub struct Span {
 	/// Offset in bytes.
 	pub offset: u32,
@@ -54,6 +56,7 @@ impl Span {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub enum Operator {
 	/// `!`
 	Not,
@@ -180,6 +183,7 @@ impl Operator {
 
 /// A delimiting token, denoting the start or end of a certain production.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub enum Delim {
 	/// `()`
 	Paren,
@@ -190,6 +194,7 @@ pub enum Delim {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub enum DistanceKind {
 	Chebyshev,
 	Cosine,
@@ -217,6 +222,29 @@ impl DistanceKind {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
+pub enum VectorTypeKind {
+	F64,
+	F32,
+	I64,
+	I32,
+	I16,
+}
+
+impl VectorTypeKind {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::F64 => "F64",
+			Self::F32 => "F32",
+			Self::I64 => "I64",
+			Self::I32 => "I32",
+			Self::I16 => "I16",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub enum NumberKind {
 	// A plain integer number.
 	Integer,
@@ -226,6 +254,8 @@ pub enum NumberKind {
 	DecimalExponent,
 	// A number with a float postfix.
 	Float,
+	// A number with a float postfix that had a mantissa.
+	FloatMantissa,
 	// A number with a `.3` part.
 	Mantissa,
 	// A number with a `.3e10` part.
@@ -237,11 +267,14 @@ pub enum NumberKind {
 
 /// The type of token
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub enum TokenKind {
 	Keyword(Keyword),
 	Algorithm(Algorithm),
+	ChangeFeedInclude(ChangeFeedInclude),
 	Language(Language),
 	Distance(DistanceKind),
+	VectorType(VectorTypeKind),
 	Operator(Operator),
 	OpenDelim(Delim),
 	CloseDelim(Delim),
@@ -347,6 +380,7 @@ impl TokenKind {
 			Algorithm::Rs256 => "RS256",
 			Algorithm::Rs384 => "RS384",
 			Algorithm::Rs512 => "RS512",
+			Algorithm::Jwks => "JWKS",
 		}
 	}
 
@@ -357,6 +391,7 @@ impl TokenKind {
 			TokenKind::Algorithm(x) => Self::algorithm_as_str(x),
 			TokenKind::Language(x) => x.as_str(),
 			TokenKind::Distance(x) => x.as_str(),
+			TokenKind::VectorType(x) => x.as_str(),
 			TokenKind::OpenDelim(Delim::Paren) => "(",
 			TokenKind::OpenDelim(Delim::Brace) => "{",
 			TokenKind::OpenDelim(Delim::Bracket) => "[",
@@ -397,11 +432,13 @@ impl TokenKind {
 			TokenKind::At => "@",
 			TokenKind::Invalid => "Invalid",
 			TokenKind::Eof => "Eof",
+			TokenKind::ChangeFeedInclude(_) => "change feed include",
 		}
 	}
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[non_exhaustive]
 pub struct Token {
 	pub kind: TokenKind,
 	pub span: Span,

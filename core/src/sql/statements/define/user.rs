@@ -3,7 +3,8 @@ use crate::dbs::{Options, Transaction};
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::iam::{Action, ResourceKind};
-use crate::sql::{escape::quote_str, fmt::Fmt, Base, Ident, Strand, Value};
+use crate::sql::statements::info::InfoStructure;
+use crate::sql::{escape::quote_str, fmt::Fmt, Base, Ident, Object, Strand, Value};
 use argon2::{
 	password_hash::{PasswordHasher, SaltString},
 	Argon2,
@@ -14,9 +15,10 @@ use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct DefineUserStatement {
 	pub name: Ident,
 	pub base: Base,
@@ -24,6 +26,8 @@ pub struct DefineUserStatement {
 	pub code: String,
 	pub roles: Vec<Ident>,
 	pub comment: Option<Strand>,
+	#[revision(start = 2)]
+	pub if_not_exists: bool,
 }
 
 impl From<(Base, &str, &str)> for DefineUserStatement {
@@ -42,6 +46,7 @@ impl From<(Base, &str, &str)> for DefineUserStatement {
 				.collect::<String>(),
 			roles: vec!["owner".into()],
 			comment: None,
+			if_not_exists: false,
 		}
 	}
 }
@@ -89,9 +94,23 @@ impl DefineUserStatement {
 				let mut run = txn.lock().await;
 				// Clear the cache
 				run.clear_cache();
+				// Check if user already exists
+				if self.if_not_exists && run.get_root_user(&self.name).await.is_ok() {
+					return Err(Error::UserRootAlreadyExists {
+						value: self.name.to_string(),
+					});
+				}
 				// Process the statement
 				let key = crate::key::root::us::new(&self.name);
-				run.set(key, self).await?;
+				run.set(
+					key,
+					DefineUserStatement {
+						// Don't persist the "IF NOT EXISTS" clause to schema
+						if_not_exists: false,
+						..self.clone()
+					},
+				)
+				.await?;
 				// Ok all good
 				Ok(Value::None)
 			}
@@ -100,10 +119,25 @@ impl DefineUserStatement {
 				let mut run = txn.lock().await;
 				// Clear the cache
 				run.clear_cache();
+				// Check if user already exists
+				if self.if_not_exists && run.get_ns_user(opt.ns(), &self.name).await.is_ok() {
+					return Err(Error::UserNsAlreadyExists {
+						value: self.name.to_string(),
+						ns: opt.ns().into(),
+					});
+				}
 				// Process the statement
 				let key = crate::key::namespace::us::new(opt.ns(), &self.name);
 				run.add_ns(opt.ns(), opt.strict).await?;
-				run.set(key, self).await?;
+				run.set(
+					key,
+					DefineUserStatement {
+						// Don't persist the "IF NOT EXISTS" clause to schema
+						if_not_exists: false,
+						..self.clone()
+					},
+				)
+				.await?;
 				// Ok all good
 				Ok(Value::None)
 			}
@@ -112,11 +146,29 @@ impl DefineUserStatement {
 				let mut run = txn.lock().await;
 				// Clear the cache
 				run.clear_cache();
+				// Check if user already exists
+				if self.if_not_exists
+					&& run.get_db_user(opt.ns(), opt.db(), &self.name).await.is_ok()
+				{
+					return Err(Error::UserDbAlreadyExists {
+						value: self.name.to_string(),
+						ns: opt.ns().into(),
+						db: opt.db().into(),
+					});
+				}
 				// Process the statement
 				let key = crate::key::database::us::new(opt.ns(), opt.db(), &self.name);
 				run.add_ns(opt.ns(), opt.strict).await?;
 				run.add_db(opt.ns(), opt.db(), opt.strict).await?;
-				run.set(key, self).await?;
+				run.set(
+					key,
+					DefineUserStatement {
+						// Don't persist the "IF NOT EXISTS" clause to schema
+						if_not_exists: false,
+						..self.clone()
+					},
+				)
+				.await?;
 				// Ok all good
 				Ok(Value::None)
 			}
@@ -128,9 +180,13 @@ impl DefineUserStatement {
 
 impl Display for DefineUserStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		write!(f, "DEFINE USER")?;
+		if self.if_not_exists {
+			write!(f, " IF NOT EXISTS")?
+		}
 		write!(
 			f,
-			"DEFINE USER {} ON {} PASSHASH {} ROLES {}",
+			" {} ON {} PASSHASH {} ROLES {}",
 			self.name,
 			self.base,
 			quote_str(&self.hash),
@@ -142,5 +198,36 @@ impl Display for DefineUserStatement {
 			write!(f, " COMMENT {v}")?
 		}
 		Ok(())
+	}
+}
+
+impl InfoStructure for DefineUserStatement {
+	fn structure(self) -> Value {
+		let Self {
+			name,
+			base,
+			hash,
+			roles,
+			comment,
+			..
+		} = self;
+		let mut acc = Object::default();
+
+		acc.insert("name".to_string(), name.structure());
+
+		acc.insert("base".to_string(), base.structure());
+
+		acc.insert("passhash".to_string(), hash.into());
+
+		acc.insert(
+			"roles".to_string(),
+			Value::Array(roles.into_iter().map(|r| r.structure()).collect()),
+		);
+
+		if let Some(comment) = comment {
+			acc.insert("comment".to_string(), comment.into());
+		}
+
+		Value::Object(acc)
 	}
 }

@@ -8,6 +8,7 @@ use crate::sql::escape::escape_ident;
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct UseStatement {
 	pub ns: Option<String>,
 	pub db: Option<String>,

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub fn serialize<T>(value: &T) -> Result<Vec<u8>>
 where
-	T: Serialize + ?Sized,
+	T: ?Sized + Serialize,
 {
 	bincode::options()
 		.with_no_limit()

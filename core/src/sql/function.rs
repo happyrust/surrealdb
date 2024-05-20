@@ -24,11 +24,24 @@ pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Function";
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Function")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum Function {
 	Normal(String, Vec<Value>),
 	Custom(String, Vec<Value>),
 	Script(Script, Vec<Value>),
 	// Add new variants here
+}
+
+pub(crate) enum OptimisedAggregate {
+	None,
+	Count,
+	CountFunction,
+	MathMax,
+	MathMin,
+	MathSum,
+	MathMean,
+	TimeMax,
+	TimeMin,
 }
 
 impl PartialOrd for Function {
@@ -140,6 +153,24 @@ impl Function {
 			Self::Normal(f, _) if f == "time::max" => true,
 			Self::Normal(f, _) if f == "time::min" => true,
 			_ => false,
+		}
+	}
+	pub(crate) fn get_optimised_aggregate(&self) -> OptimisedAggregate {
+		match self {
+			Self::Normal(f, v) if f == "count" => {
+				if v.is_empty() {
+					OptimisedAggregate::Count
+				} else {
+					OptimisedAggregate::CountFunction
+				}
+			}
+			Self::Normal(f, _) if f == "math::max" => OptimisedAggregate::MathMax,
+			Self::Normal(f, _) if f == "math::mean" => OptimisedAggregate::MathMean,
+			Self::Normal(f, _) if f == "math::min" => OptimisedAggregate::MathMin,
+			Self::Normal(f, _) if f == "math::sum" => OptimisedAggregate::MathSum,
+			Self::Normal(f, _) if f == "time::max" => OptimisedAggregate::TimeMax,
+			Self::Normal(f, _) if f == "time::min" => OptimisedAggregate::TimeMin,
+			_ => OptimisedAggregate::None,
 		}
 	}
 }

@@ -8,6 +8,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -35,9 +36,11 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeRemoveTokenStatement {
 	name: Ident,
 	base: Base,
+	if_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeRemoveTokenStatement {
@@ -55,6 +58,9 @@ impl serde::ser::SerializeStruct for SerializeRemoveTokenStatement {
 			"base" => {
 				self.base = value.serialize(ser::base::Serializer.wrap())?;
 			}
+			"if_exists" => {
+				self.if_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?;
+			}
 			key => {
 				return Err(Error::custom(format!(
 					"unexpected field `RemoveTokenStatement::{key}`"
@@ -68,6 +74,7 @@ impl serde::ser::SerializeStruct for SerializeRemoveTokenStatement {
 		Ok(RemoveTokenStatement {
 			name: self.name,
 			base: self.base,
+			if_exists: self.if_exists,
 		})
 	}
 }

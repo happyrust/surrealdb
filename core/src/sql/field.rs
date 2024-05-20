@@ -2,6 +2,7 @@ use crate::ctx::Context;
 use crate::dbs::{Options, Transaction};
 use crate::doc::CursorDoc;
 use crate::err::Error;
+use crate::sql::statements::info::InfoStructure;
 use crate::sql::{fmt::Fmt, Idiom, Part, Value};
 use crate::syn;
 use revision::revisioned;
@@ -13,6 +14,7 @@ use std::ops::Deref;
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct Fields(pub Vec<Field>, pub bool);
 
 impl Fields {
@@ -64,6 +66,11 @@ impl Display for Fields {
 	}
 }
 
+impl InfoStructure for Fields {
+	fn structure(self) -> Value {
+		self.to_string().into()
+	}
+}
 impl Fields {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
@@ -238,6 +245,7 @@ impl Fields {
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum Field {
 	/// The `*` in `SELECT * FROM ...`
 	#[default]

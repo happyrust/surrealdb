@@ -12,6 +12,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -39,16 +40,19 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeDefineFieldStatement {
 	name: Idiom,
 	what: Ident,
 	flex: bool,
 	kind: Option<Kind>,
+	readonly: bool,
 	value: Option<Value>,
 	assert: Option<Value>,
 	default: Option<Value>,
 	permissions: Permissions,
 	comment: Option<Strand>,
+	if_not_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeDefineFieldStatement {
@@ -72,6 +76,9 @@ impl serde::ser::SerializeStruct for SerializeDefineFieldStatement {
 			"kind" => {
 				self.kind = value.serialize(ser::kind::opt::Serializer.wrap())?;
 			}
+			"readonly" => {
+				self.readonly = value.serialize(ser::primitive::bool::Serializer.wrap())?;
+			}
 			"value" => {
 				self.value = value.serialize(ser::value::opt::Serializer.wrap())?;
 			}
@@ -86,6 +93,9 @@ impl serde::ser::SerializeStruct for SerializeDefineFieldStatement {
 			}
 			"comment" => {
 				self.comment = value.serialize(ser::strand::opt::Serializer.wrap())?;
+			}
+			"if_not_exists" => {
+				self.if_not_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?
 			}
 			key => {
 				return Err(Error::custom(format!(
@@ -102,11 +112,13 @@ impl serde::ser::SerializeStruct for SerializeDefineFieldStatement {
 			what: self.what,
 			flex: self.flex,
 			kind: self.kind,
+			readonly: self.readonly,
 			value: self.value,
 			assert: self.assert,
 			default: self.default,
 			permissions: self.permissions,
 			comment: self.comment,
+			if_not_exists: self.if_not_exists,
 		})
 	}
 }

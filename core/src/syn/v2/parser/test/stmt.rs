@@ -25,7 +25,7 @@ use crate::{
 		Expression, Fetch, Fetchs, Field, Fields, Future, Graph, Group, Groups, Id, Ident, Idiom,
 		Idioms, Index, Kind, Limit, Number, Object, Operator, Order, Orders, Output, Param, Part,
 		Permission, Permissions, Scoring, Split, Splits, Start, Statement, Strand, Subquery, Table,
-		Tables, Thing, Timeout, Uuid, Value, Values, Version, With,
+		TableType, Tables, Thing, Timeout, Uuid, Value, Values, Version, With,
 	},
 	syn::v2::parser::mac::test_parse,
 };
@@ -122,6 +122,7 @@ fn parse_define_namespace() {
 			id: None,
 			name: Ident("a".to_string()),
 			comment: Some(Strand("test".to_string())),
+			if_not_exists: false,
 		}))
 	);
 
@@ -132,13 +133,16 @@ fn parse_define_namespace() {
 			id: None,
 			name: Ident("a".to_string()),
 			comment: None,
+			if_not_exists: false,
 		}))
 	)
 }
 
 #[test]
 fn parse_define_database() {
-	let res = test_parse!(parse_stmt, "DEFINE DATABASE a COMMENT 'test' CHANGEFEED 10m").unwrap();
+	let res =
+		test_parse!(parse_stmt, "DEFINE DATABASE a COMMENT 'test' CHANGEFEED 10m INCLUDE ORIGINAL")
+			.unwrap();
 	assert_eq!(
 		res,
 		Statement::Define(DefineStatement::Database(DefineDatabaseStatement {
@@ -147,7 +151,9 @@ fn parse_define_database() {
 			comment: Some(Strand("test".to_string())),
 			changefeed: Some(ChangeFeed {
 				expiry: std::time::Duration::from_secs(60) * 10,
+				store_original: true,
 			}),
+			if_not_exists: false,
 		}))
 	);
 
@@ -159,6 +165,7 @@ fn parse_define_database() {
 			name: Ident("a".to_string()),
 			comment: None,
 			changefeed: None,
+			if_not_exists: false,
 		}))
 	)
 }
@@ -188,6 +195,7 @@ fn parse_define_function() {
 			})]),
 			comment: Some(Strand("test".to_string())),
 			permissions: Permission::Full,
+			if_not_exists: false,
 		}))
 	)
 }
@@ -226,6 +234,7 @@ fn parse_define_token() {
 			kind: Algorithm::EdDSA,
 			code: "foo".to_string(),
 			comment: Some(Strand("bar".to_string())),
+			if_not_exists: false,
 		}))
 	)
 }
@@ -270,6 +279,7 @@ fn parse_define_param() {
 			)),
 			comment: None,
 			permissions: Permission::Specific(Value::Null),
+			if_not_exists: false,
 		}))
 	);
 }
@@ -277,7 +287,7 @@ fn parse_define_param() {
 #[test]
 fn parse_define_table() {
 	let res =
-		test_parse!(parse_stmt, r#"DEFINE TABLE name DROP SCHEMAFUL CHANGEFEED 1s PERMISSIONS FOR SELECT WHERE a = 1 AS SELECT foo FROM bar GROUP BY foo"#)
+		test_parse!(parse_stmt, r#"DEFINE TABLE name DROP SCHEMAFUL CHANGEFEED 1s INCLUDE ORIGINAL PERMISSIONS FOR SELECT WHERE a = 1 AS SELECT foo FROM bar GROUP BY foo"#)
 			.unwrap();
 
 	assert_eq!(
@@ -312,9 +322,12 @@ fn parse_define_table() {
 				delete: Permission::None,
 			},
 			changefeed: Some(ChangeFeed {
-				expiry: std::time::Duration::from_secs(1)
+				expiry: std::time::Duration::from_secs(1),
+				store_original: true,
 			}),
 			comment: None,
+			if_not_exists: false,
+			kind: TableType::Any,
 		}))
 	);
 }
@@ -333,6 +346,7 @@ fn parse_define_event() {
 			when: Value::Null,
 			then: Values(vec![Value::Null, Value::None]),
 			comment: None,
+			if_not_exists: false,
 		}))
 	)
 }
@@ -359,6 +373,7 @@ fn parse_define_field() {
 				Kind::Number,
 				Kind::Array(Box::new(Kind::Record(vec![Table("foo".to_owned())])), Some(10))
 			])))),
+			readonly: false,
 			value: Some(Value::Null),
 			assert: Some(Value::Bool(true)),
 			default: Some(Value::Bool(false)),
@@ -369,6 +384,7 @@ fn parse_define_field() {
 				select: Permission::Full,
 			},
 			comment: None,
+			if_not_exists: false,
 		}))
 	)
 }
@@ -416,6 +432,7 @@ fn parse_define_index() {
 				terms_cache: 8,
 			}),
 			comment: None,
+			if_not_exists: false,
 		}))
 	);
 
@@ -430,6 +447,7 @@ fn parse_define_index() {
 			cols: Idioms(vec![Idiom(vec![Part::Field(Ident("a".to_owned()))]),]),
 			index: Index::Uniq,
 			comment: None,
+			if_not_exists: false,
 		}))
 	);
 
@@ -453,6 +471,7 @@ fn parse_define_index() {
 				vector_type: VectorType::F64,
 			}),
 			comment: None,
+			if_not_exists: false,
 		}))
 	);
 }
@@ -483,6 +502,8 @@ fn parse_define_analyzer() {
 				Filter::Uppercase,
 			]),
 			comment: None,
+			function: Some(Ident("foo::bar".to_string())),
+			if_not_exists: false,
 		})),
 	)
 }
@@ -626,28 +647,31 @@ fn parse_if_block() {
 #[test]
 fn parse_info() {
 	let res = test_parse!(parse_stmt, "INFO FOR ROOT").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::Root));
+	assert_eq!(res, Statement::Info(InfoStatement::Root(false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR KV").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::Root));
+	assert_eq!(res, Statement::Info(InfoStatement::Root(false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR NAMESPACE").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::Ns));
+	assert_eq!(res, Statement::Info(InfoStatement::Ns(false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR NS").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::Ns));
+	assert_eq!(res, Statement::Info(InfoStatement::Ns(false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR SCOPE scope").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::Sc(Ident("scope".to_owned()))));
+	assert_eq!(res, Statement::Info(InfoStatement::Sc(Ident("scope".to_owned()), false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR TABLE table").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::Tb(Ident("table".to_owned()))));
+	assert_eq!(res, Statement::Info(InfoStatement::Tb(Ident("table".to_owned()), false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR USER user").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::User(Ident("user".to_owned()), None)));
+	assert_eq!(res, Statement::Info(InfoStatement::User(Ident("user".to_owned()), None, false)));
 
 	let res = test_parse!(parse_stmt, "INFO FOR USER user ON namespace").unwrap();
-	assert_eq!(res, Statement::Info(InfoStatement::User(Ident("user".to_owned()), Some(Base::Ns))));
+	assert_eq!(
+		res,
+		Statement::Info(InfoStatement::User(Ident("user".to_owned()), Some(Base::Ns), false))
+	);
 }
 
 #[test]
@@ -1050,6 +1074,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Namespace(RemoveNamespaceStatement {
 			name: Ident("ns".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1058,6 +1083,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Database(RemoveDatabaseStatement {
 			name: Ident("database".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1066,6 +1092,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Function(RemoveFunctionStatement {
 			name: Ident("foo::bar".to_owned()),
+			if_exists: false,
 		}))
 	);
 	let res = test_parse!(parse_stmt, r#"REMOVE FUNCTION fn::foo::bar();"#).unwrap();
@@ -1073,6 +1100,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Function(RemoveFunctionStatement {
 			name: Ident("foo::bar".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1082,6 +1110,7 @@ fn parse_remove() {
 		Statement::Remove(RemoveStatement::Token(RemoveTokenStatement {
 			name: Ident("foo".to_owned()),
 			base: Base::Sc(Ident("bar".to_owned())),
+			if_exists: false,
 		}))
 	);
 
@@ -1090,6 +1119,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Scope(RemoveScopeStatement {
 			name: Ident("foo".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1098,6 +1128,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Param(RemoveParamStatement {
 			name: Ident("foo".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1106,6 +1137,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Table(RemoveTableStatement {
 			name: Ident("foo".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1115,6 +1147,7 @@ fn parse_remove() {
 		Statement::Remove(RemoveStatement::Event(RemoveEventStatement {
 			name: Ident("foo".to_owned()),
 			what: Ident("bar".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1128,6 +1161,7 @@ fn parse_remove() {
 				Part::Index(Number::Int(10))
 			]),
 			what: Ident("bar".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1137,6 +1171,7 @@ fn parse_remove() {
 		Statement::Remove(RemoveStatement::Index(RemoveIndexStatement {
 			name: Ident("foo".to_owned()),
 			what: Ident("bar".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1145,6 +1180,7 @@ fn parse_remove() {
 		res,
 		Statement::Remove(RemoveStatement::Analyzer(RemoveAnalyzerStatement {
 			name: Ident("foo".to_owned()),
+			if_exists: false,
 		}))
 	);
 
@@ -1154,6 +1190,7 @@ fn parse_remove() {
 		Statement::Remove(RemoveStatement::User(RemoveUserStatement {
 			name: Ident("foo".to_owned()),
 			base: Base::Db,
+			if_exists: false,
 		}))
 	);
 }

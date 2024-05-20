@@ -20,6 +20,7 @@ pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Array";
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Array")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct Array(pub Vec<Value>);
 
 impl From<Value> for Array {
@@ -289,6 +290,7 @@ impl Complement<Array> for Array {
 
 // ------------------------------
 
+#[allow(dead_code)]
 pub(crate) trait Concat<T> {
 	fn concat(self, other: T) -> T;
 }
@@ -297,6 +299,12 @@ impl Concat<Array> for Array {
 	fn concat(mut self, mut other: Array) -> Array {
 		self.append(&mut other);
 		self
+	}
+}
+
+impl Concat<String> for String {
+	fn concat(self, other: String) -> String {
+		self + &other
 	}
 }
 

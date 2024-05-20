@@ -1,3 +1,5 @@
+use crate::sql::statements::info::InfoStructure;
+use crate::sql::Value;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -5,6 +7,7 @@ use std::fmt;
 #[revisioned(revision = 1)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum Algorithm {
 	EdDSA,
 	Es256,
@@ -19,6 +22,7 @@ pub enum Algorithm {
 	Rs256,
 	Rs384,
 	Rs512,
+	Jwks, // Not an argorithm.
 }
 
 impl Default for Algorithm {
@@ -43,6 +47,12 @@ impl fmt::Display for Algorithm {
 			Self::Rs256 => "RS256",
 			Self::Rs384 => "RS384",
 			Self::Rs512 => "RS512",
+			Self::Jwks => "JWKS", // Not an algorithm.
 		})
+	}
+}
+impl InfoStructure for Algorithm {
+	fn structure(self) -> Value {
+		self.to_string().into()
 	}
 }

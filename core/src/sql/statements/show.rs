@@ -13,6 +13,7 @@ use std::fmt;
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum ShowSince {
 	Timestamp(Datetime),
 	Versionstamp(u64),
@@ -36,6 +37,7 @@ impl ShowSince {
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct ShowStatement {
 	pub table: Option<Table>,
 	pub since: ShowSince,
@@ -94,35 +96,5 @@ impl fmt::Display for ShowStatement {
 			write!(f, " LIMIT {}", v)?
 		}
 		Ok(())
-	}
-}
-
-#[cfg(test)]
-mod test {
-	use crate::sql::Datetime;
-
-	#[test]
-	fn timestamps_are_not_versionstamps() {
-		// given
-		let sql_dt = Datetime::try_from("2020-01-01T00:00:00Z").unwrap();
-
-		// when
-		let since = super::ShowSince::Timestamp(sql_dt);
-
-		// then
-		assert_eq!(since.as_versionstamp(), None);
-	}
-
-	#[test]
-	fn versionstamp_can_be_converted() {
-		// given
-		let versionstamp = crate::vs::conv::u64_to_versionstamp(1234567890);
-		let since = super::ShowSince::Versionstamp(1234567890);
-
-		// when
-		let converted = since.as_versionstamp().unwrap();
-
-		// then
-		assert_eq!(converted, versionstamp);
 	}
 }

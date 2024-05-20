@@ -65,10 +65,120 @@ macro_rules! expected {
 }
 
 #[cfg(test)]
+#[macro_export]
 macro_rules! test_parse {
 	($func:ident$( ( $($e:expr),* $(,)? ))? , $t:literal) => {{
 		let mut parser = $crate::syn::v2::parser::Parser::new($t.as_bytes());
-		parser.$func($($($e),*)*)
+		let mut stack = reblessive::Stack::new();
+		stack.enter(|ctx| parser.$func(ctx,$($($e),*)*)).finish()
+	}};
+}
+
+#[macro_export]
+macro_rules! enter_object_recursion {
+	($name:ident = $this:expr => { $($t:tt)* }) => {{
+		if $this.object_recursion == 0 {
+			return Err($crate::syn::v2::parser::ParseError::new(
+				$crate::syn::v2::parser::ParseErrorKind::ExceededObjectDepthLimit,
+				$this.last_span(),
+			));
+		}
+		struct Dropper<'a, 'b>(&'a mut $crate::syn::v2::parser::Parser<'b>);
+		impl Drop for Dropper<'_, '_> {
+			fn drop(&mut self) {
+				self.0.object_recursion += 1;
+			}
+		}
+		impl<'a> ::std::ops::Deref for Dropper<'_,'a>{
+			type Target = $crate::syn::v2::parser::Parser<'a>;
+
+			fn deref(&self) -> &Self::Target{
+				self.0
+			}
+		}
+
+		impl<'a> ::std::ops::DerefMut for Dropper<'_,'a>{
+			fn deref_mut(&mut self) -> &mut Self::Target{
+				self.0
+			}
+		}
+
+		$this.object_recursion -= 1;
+		let mut $name = Dropper($this);
+		{
+			$($t)*
+		}
+	}};
+}
+
+#[macro_export]
+macro_rules! enter_query_recursion {
+	($name:ident = $this:expr => { $($t:tt)* }) => {{
+		if $this.query_recursion == 0 {
+			return Err($crate::syn::v2::parser::ParseError::new(
+				$crate::syn::v2::parser::ParseErrorKind::ExceededQueryDepthLimit,
+				$this.last_span(),
+			));
+		}
+		struct Dropper<'a, 'b>(&'a mut $crate::syn::v2::parser::Parser<'b>);
+		impl Drop for Dropper<'_, '_> {
+			fn drop(&mut self) {
+				self.0.query_recursion += 1;
+			}
+		}
+		impl<'a> ::std::ops::Deref for Dropper<'_,'a>{
+			type Target = $crate::syn::v2::parser::Parser<'a>;
+
+			fn deref(&self) -> &Self::Target{
+				self.0
+			}
+		}
+
+		impl<'a> ::std::ops::DerefMut for Dropper<'_,'a>{
+			fn deref_mut(&mut self) -> &mut Self::Target{
+				self.0
+			}
+		}
+
+		$this.query_recursion -= 1;
+        #[allow(unused_mut)]
+		let mut $name = Dropper($this);
+		{
+			$($t)*
+		}
+	}};
+}
+
+#[macro_export]
+macro_rules! enter_flexible_ident{
+	($name:ident = $this:expr => ($enabled:expr){ $($t:tt)* }) => {{
+		struct Dropper<'a, 'b>(&'a mut $crate::syn::v2::parser::Parser<'b>,bool);
+		impl Drop for Dropper<'_, '_> {
+			fn drop(&mut self) {
+				self.0.lexer.flexible_ident = self.1;
+			}
+		}
+		impl<'a> ::std::ops::Deref for Dropper<'_,'a>{
+			type Target = $crate::syn::v2::parser::Parser<'a>;
+
+			fn deref(&self) -> &Self::Target{
+				self.0
+			}
+		}
+
+		impl<'a> ::std::ops::DerefMut for Dropper<'_,'a>{
+			fn deref_mut(&mut self) -> &mut Self::Target{
+				self.0
+			}
+		}
+
+		let enabled = $this.lexer.flexible_ident;
+		$this.lexer.flexible_ident = $enabled;
+        #[allow(unused_mut)]
+		let mut $name = Dropper($this,enabled);
+		{
+			$($t)*
+		}
 	}};
 }
 

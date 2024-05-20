@@ -7,6 +7,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -34,8 +35,10 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeRemoveAnalyzerStatement {
 	name: Ident,
+	if_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeRemoveAnalyzerStatement {
@@ -50,6 +53,9 @@ impl serde::ser::SerializeStruct for SerializeRemoveAnalyzerStatement {
 			"name" => {
 				self.name = Ident(value.serialize(ser::string::Serializer.wrap())?);
 			}
+			"if_exists" => {
+				self.if_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?
+			}
 			key => {
 				return Err(Error::custom(format!(
 					"unexpected field `RemoveAnalyzerStatement::{key}`"
@@ -62,6 +68,7 @@ impl serde::ser::SerializeStruct for SerializeRemoveAnalyzerStatement {
 	fn end(self) -> Result<Self::Ok, Error> {
 		Ok(RemoveAnalyzerStatement {
 			name: self.name,
+			if_exists: self.if_exists,
 		})
 	}
 }

@@ -10,6 +10,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -37,11 +38,13 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeDefineParamStatement {
 	name: Ident,
 	value: Value,
 	comment: Option<Strand>,
 	permissions: Permission,
+	if_not_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeDefineParamStatement {
@@ -65,6 +68,9 @@ impl serde::ser::SerializeStruct for SerializeDefineParamStatement {
 			"permissions" => {
 				self.permissions = value.serialize(ser::permission::Serializer.wrap())?;
 			}
+			"if_not_exists" => {
+				self.if_not_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?
+			}
 			key => {
 				return Err(Error::custom(format!(
 					"unexpected field `DefineParamStatement::{key}`"
@@ -80,6 +86,7 @@ impl serde::ser::SerializeStruct for SerializeDefineParamStatement {
 			value: self.value,
 			comment: self.comment,
 			permissions: self.permissions,
+			if_not_exists: self.if_not_exists,
 		})
 	}
 }

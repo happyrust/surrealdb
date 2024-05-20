@@ -12,6 +12,7 @@ use std::fmt::{self, Display};
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct ForeachStatement {
 	pub param: Param,
 	pub range: Value,
@@ -65,6 +66,7 @@ impl ForeachStatement {
 							Entry::Relate(v) => v.compute(&ctx, opt, txn, doc).await,
 							Entry::Insert(v) => v.compute(&ctx, opt, txn, doc).await,
 							Entry::Define(v) => v.compute(&ctx, opt, txn, doc).await,
+							Entry::Rebuild(v) => v.compute(&ctx, opt, txn, doc).await,
 							Entry::Remove(v) => v.compute(&ctx, opt, txn, doc).await,
 							Entry::Output(v) => {
 								return v.compute(&ctx, opt, txn, doc).await;

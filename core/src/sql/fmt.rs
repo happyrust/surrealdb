@@ -153,11 +153,11 @@ thread_local! {
 	// `thread_local!` so all accesses can use `Ordering::Relaxed`.
 
 	/// Whether pretty-printing.
-	static PRETTY: AtomicBool = const { AtomicBool::new(false) };
+	static PRETTY: AtomicBool = const {AtomicBool::new(false)};
 	/// The current level of indentation, in units of tabs.
-	static INDENT: AtomicU32 = const { AtomicU32::new(0) };
+	static INDENT: AtomicU32 = const{AtomicU32::new(0)};
 	/// Whether the next formatting action should be preceded by a newline and indentation.
-	static NEW_LINE: AtomicBool = const{ AtomicBool::new(false) };
+	static NEW_LINE: AtomicBool = const{AtomicBool::new(false)};
 }
 
 /// An adapter that, if enabled, adds pretty print formatting.
@@ -293,8 +293,8 @@ mod tests {
 	#[test]
 	fn pretty_define_query() {
 		let query = parse("DEFINE TABLE test SCHEMAFULL PERMISSIONS FOR create, update, delete NONE FOR select WHERE public = true;").unwrap();
-		assert_eq!(format!("{}", query), "DEFINE TABLE test SCHEMAFULL PERMISSIONS FOR select WHERE public = true, FOR create, update, delete NONE;");
-		assert_eq!(format!("{:#}", query), "DEFINE TABLE test SCHEMAFULL\n\tPERMISSIONS\n\t\tFOR select\n\t\t\tWHERE public = true\n\t\tFOR create, update, delete NONE\n;");
+		assert_eq!(format!("{}", query), "DEFINE TABLE test TYPE ANY SCHEMAFULL PERMISSIONS FOR select WHERE public = true, FOR create, update, delete NONE;");
+		assert_eq!(format!("{:#}", query), "DEFINE TABLE test TYPE ANY SCHEMAFULL\n\tPERMISSIONS\n\t\tFOR select\n\t\t\tWHERE public = true\n\t\tFOR create, update, delete NONE\n;");
 	}
 
 	#[test]

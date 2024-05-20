@@ -4,7 +4,7 @@ mod helpers;
 use helpers::new_ds;
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;
-use surrealdb_core::sql::{self, Number, Value};
+use surrealdb::sql::{self, Number, Value};
 
 async fn test_queries(sql: &str, desired_responses: &[&str]) -> Result<(), Error> {
 	let db = new_ds().await?;
@@ -62,9 +62,10 @@ async fn check_test_is_error(sql: &str, expected_errors: &[&str]) -> Result<(), 
 #[tokio::test]
 async fn error_on_invalid_function() -> Result<(), Error> {
 	let dbs = new_ds().await?;
-	let query = sql::Query(sql::Statements(vec![sql::Statement::Value(sql::Value::Function(
-		Box::new(sql::Function::Normal("this is an invalid function name".to_string(), Vec::new())),
-	))]));
+	let mut query = sql::Query::default();
+	query.0 .0 = vec![sql::Statement::Value(sql::Value::Function(Box::new(
+		sql::Function::Normal("this is an invalid function name".to_string(), Vec::new()),
+	)))];
 	let session = Session::owner().with_ns("test").with_db("test");
 	let mut resp = dbs.process(query, &session, None).await.unwrap();
 	assert_eq!(resp.len(), 1);
@@ -3575,7 +3576,7 @@ async fn function_parse_is_latitude() -> Result<(), Error> {
 #[tokio::test]
 async fn function_parse_is_longitude() -> Result<(), Error> {
 	let sql = r#"
-		RETURN string::is::longitude("-0.136439");
+		RETURN string::is::longitude("-90.136439");
 		RETURN string::is::longitude("this is a test!");
 	"#;
 	let dbs = new_ds().await?;

@@ -10,6 +10,7 @@ use serde::ser::Error as _;
 use serde::ser::Impossible;
 use serde::ser::Serialize;
 
+#[non_exhaustive]
 pub struct Serializer;
 
 impl ser::Serializer for Serializer {
@@ -37,12 +38,14 @@ impl ser::Serializer for Serializer {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct SerializeDefineEventStatement {
 	name: Ident,
 	what: Ident,
 	when: Value,
 	then: Values,
 	comment: Option<Strand>,
+	if_not_exists: bool,
 }
 
 impl serde::ser::SerializeStruct for SerializeDefineEventStatement {
@@ -69,6 +72,9 @@ impl serde::ser::SerializeStruct for SerializeDefineEventStatement {
 			"comment" => {
 				self.comment = value.serialize(ser::strand::opt::Serializer.wrap())?;
 			}
+			"if_not_exists" => {
+				self.if_not_exists = value.serialize(ser::primitive::bool::Serializer.wrap())?
+			}
 			key => {
 				return Err(Error::custom(format!(
 					"unexpected field `DefineEventStatement::{key}`"
@@ -85,6 +91,7 @@ impl serde::ser::SerializeStruct for SerializeDefineEventStatement {
 			when: self.when,
 			then: self.then,
 			comment: self.comment,
+			if_not_exists: self.if_not_exists,
 		})
 	}
 }

@@ -14,13 +14,22 @@
 //! # Examples
 //!
 //! ```no_run
+//! use std::borrow::Cow;
 //! use serde::{Serialize, Deserialize};
 //! use serde_json::json;
-//! use std::borrow::Cow;
-//! use surrealdb::{Result, Surreal};
-//! use surrealdb::sql;
+//! use surrealdb::{Error, Surreal};
 //! use surrealdb::opt::auth::Root;
 //! use surrealdb::engine::remote::ws::Ws;
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Person {
+//!     title: String,
+//!     name: Name,
+//!     marketing: bool,
+//! }
+//!
+//! // Pro tip: Replace String with Cow<'static, str> to
+//! // avoid unnecessary heap allocations when inserting
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Name {
@@ -28,15 +37,16 @@
 //!     last: Cow<'static, str>,
 //! }
 //!
-//! #[derive(Serialize, Deserialize)]
-//! struct Person {
-//!     title: Cow<'static, str>,
-//!     name: Name,
-//!     marketing: bool,
-//! }
-//!
+//! // Install at https://surrealdb.com/install
+//! // and use `surreal start --user root --pass root`
+//! // to start a working database to take the following queries
+
+//! // See the results via `surreal sql --ns namespace --db database --pretty`
+//! // or https://surrealist.app/
+//! // followed by the query `SELECT * FROM person;`
+
 //! #[tokio::main]
-//! async fn main() -> Result<()> {
+//! async fn main() -> Result<(), Error> {
 //!     let db = Surreal::new::<Ws>("localhost:8000").await?;
 //!
 //!     // Signin as a namespace, database, or root user
@@ -81,13 +91,13 @@
 //!     let people: Vec<Person> = db.select("person").await?;
 //!
 //!     // Perform a custom advanced query
-//!     let sql = r#"
+//!     let query = r#"
 //!         SELECT marketing, count()
 //!         FROM type::table($table)
 //!         GROUP BY marketing
 //!     "#;
 //!
-//!     let groups = db.query(sql)
+//!     let groups = db.query(query)
 //!         .bind(("table", "person"))
 //!         .await?;
 //!
@@ -108,14 +118,6 @@ compile_error!(
 #[cfg(all(not(surrealdb_unstable), feature = "ml2"))]
 compile_error!(
 	"`ml2` is currently unstable. You need to enable the `surrealdb_unstable` flag to use it."
-);
-
-#[cfg(all(not(surrealdb_unstable), feature = "jwks"))]
-compile_error!("`jwks` depends on a currently unstable feature, `sql2`. You need to enable the `surrealdb_unstable` flag to use it.");
-
-#[cfg(all(not(surrealdb_unstable), feature = "sql2"))]
-compile_error!(
-	"`sql2` is currently unstable. You need to enable the `surrealdb_unstable` flag to use it."
 );
 
 #[cfg(all(not(surrealdb_unstable), feature = "kv-surrealkv"))]
@@ -148,8 +150,12 @@ pub use api::Result;
 #[doc(inline)]
 pub use api::Surreal;
 
+#[cfg(not(feature = "sql2"))]
 #[doc(inline)]
-pub use surrealdb_core::*;
+pub use surrealdb_core1::*;
+#[cfg(feature = "sql2")]
+#[doc(inline)]
+pub use surrealdb_core2::*;
 
 use uuid::Uuid;
 
@@ -185,6 +191,8 @@ impl From<dbs::Action> for Action {
 			dbs::Action::Create => Self::Create,
 			dbs::Action::Update => Self::Update,
 			dbs::Action::Delete => Self::Delete,
+			#[cfg(feature = "sql2")]
+			_ => unreachable!(),
 		}
 	}
 }

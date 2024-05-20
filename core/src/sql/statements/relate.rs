@@ -11,6 +11,7 @@ use std::fmt;
 #[revisioned(revision = 2)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct RelateStatement {
 	#[revision(start = 2)]
 	pub only: bool,
@@ -131,7 +132,7 @@ impl RelateStatement {
 			for w in with.iter() {
 				let f = f.clone();
 				let w = w.clone();
-				match &self.kind {
+				match &self.kind.compute(ctx, opt, txn, doc).await? {
 					// The relation has a specific record id
 					Value::Thing(id) => i.ingest(Iterable::Relatable(f, id.to_owned(), w)),
 					// The relation does not have a specific record id
@@ -148,7 +149,11 @@ impl RelateStatement {
 						None => i.ingest(Iterable::Relatable(f, tb.generate(), w)),
 					},
 					// The relation can not be any other type
-					_ => unreachable!(),
+					v => {
+						return Err(Error::RelateStatement {
+							value: v.to_string(),
+						})
+					}
 				};
 			}
 		}

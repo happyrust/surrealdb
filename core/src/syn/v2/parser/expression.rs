@@ -1,8 +1,11 @@
 //! This module defines the pratt parser for operators.
 
+use reblessive::Stk;
+
 use super::mac::unexpected;
 use super::ParseError;
 use crate::sql::{value::TryNeg, Cast, Expression, Number, Operator, Value};
+use crate::syn::v2::token::Token;
 use crate::syn::v2::{
 	parser::{mac::expected, ParseErrorKind, ParseResult, Parser},
 	token::{t, NumberKind, TokenKind},
@@ -15,10 +18,10 @@ impl Parser<'_> {
 	/// A generic loose ident like `foo` in for example `foo.bar` can be two different values
 	/// depending on context: a table or a field the current document. This function parses loose
 	/// idents as a table, see [`parse_value_field`] for parsing loose idents as fields
-	pub fn parse_value(&mut self) -> ParseResult<Value> {
+	pub async fn parse_value(&mut self, ctx: &mut Stk) -> ParseResult<Value> {
 		let old = self.table_as_field;
 		self.table_as_field = false;
-		let res = self.pratt_parse_expr(0);
+		let res = self.pratt_parse_expr(ctx, 0).await;
 		self.table_as_field = old;
 		res
 	}
@@ -28,10 +31,10 @@ impl Parser<'_> {
 	/// A generic loose ident like `foo` in for example `foo.bar` can be two different values
 	/// depending on context: a table or a field the current document. This function parses loose
 	/// idents as a field, see [`parse_value`] for parsing loose idents as table
-	pub fn parse_value_field(&mut self) -> ParseResult<Value> {
+	pub async fn parse_value_field(&mut self, ctx: &mut Stk) -> ParseResult<Value> {
 		let old = self.table_as_field;
 		self.table_as_field = true;
-		let res = self.pratt_parse_expr(0);
+		let res = self.pratt_parse_expr(ctx, 0).await;
 		self.table_as_field = old;
 		res
 	}
@@ -126,7 +129,7 @@ impl Parser<'_> {
 		}
 	}
 
-	fn parse_prefix_op(&mut self, min_bp: u8) -> ParseResult<Value> {
+	async fn parse_prefix_op(&mut self, ctx: &mut Stk, min_bp: u8) -> ParseResult<Value> {
 		const I64_ABS_MAX: u64 = 9223372036854775808;
 
 		let token = self.next();
@@ -135,8 +138,8 @@ impl Parser<'_> {
 			t!("-") => Operator::Neg,
 			t!("!") => Operator::Not,
 			t!("<") => {
-				let kind = self.parse_kind(token.span)?;
-				let value = self.pratt_parse_expr(min_bp)?;
+				let kind = self.parse_kind(ctx, token.span).await?;
+				let value = ctx.run(|ctx| self.pratt_parse_expr(ctx, min_bp)).await?;
 				let cast = Cast(kind, value);
 				return Ok(Value::Cast(Box::new(cast)));
 			}
@@ -167,7 +170,7 @@ impl Parser<'_> {
 			}
 		}
 
-		let v = self.pratt_parse_expr(min_bp)?;
+		let v = ctx.run(|ctx| self.pratt_parse_expr(ctx, min_bp)).await?;
 
 		// HACK: For compatiblity with the old parser apply + and - operator immediately if the
 		// left value is a number.
@@ -192,8 +195,43 @@ impl Parser<'_> {
 			})))
 		}
 	}
+	pub fn parse_knn(&mut self, token: Token) -> ParseResult<Operator> {
+		let amount = self.next_token_value()?;
+		let op = if self.eat(t!(",")) {
+			let token = self.next();
+			match &token.kind {
+				TokenKind::Distance(k) => {
+					let d = self.convert_distance(k).map(Some)?;
+					Operator::Knn(amount, d)
+				},
+				TokenKind::Number(NumberKind::Integer) => {
+					let ef = self.token_value(token)?;
+					Operator::Ann(amount, ef)
+				}
+				_ => {
+					return Err(ParseError::new(
+						ParseErrorKind::UnexpectedExplain {
+							found: token.kind,
+							expected: "a distance or an integer",
+							explain: "The NN operator accepts either a distance for brute force operation, or an EF value for approximate operations",
+						},
+						token.span,
+					))
+				}
+			}
+		} else {
+			Operator::Knn(amount, None)
+		};
+		self.expect_closing_delimiter(t!("|>"), token.span)?;
+		Ok(op)
+	}
 
-	fn parse_infix_op(&mut self, min_bp: u8, lhs: Value) -> ParseResult<Value> {
+	async fn parse_infix_op(
+		&mut self,
+		ctx: &mut Stk,
+		min_bp: u8,
+		lhs: Value,
+	) -> ParseResult<Value> {
 		let token = self.next();
 		let operator = match token.kind {
 			// TODO: change operator name?
@@ -253,17 +291,12 @@ impl Parser<'_> {
 				Operator::NotInside
 			}
 			t!("IN") => Operator::Inside,
-			t!("<|") => {
-				let amount = self.next_token_value()?;
-				let dist = self.eat(t!(",")).then(|| self.parse_distance()).transpose()?;
-				self.expect_closing_delimiter(t!("|>"), token.span)?;
-				Operator::Knn(amount, dist)
-			}
+			t!("<|") => self.parse_knn(token)?,
 
 			// should be unreachable as we previously check if the token was a prefix op.
 			x => unreachable!("found non-operator token {x:?}"),
 		};
-		let rhs = self.pratt_parse_expr(min_bp)?;
+		let rhs = ctx.run(|ctx| self.pratt_parse_expr(ctx, min_bp)).await?;
 		Ok(Value::Expression(Box::new(Expression::Binary {
 			l: lhs,
 			o: operator,
@@ -273,12 +306,12 @@ impl Parser<'_> {
 
 	/// The pratt parsing loop.
 	/// Parses expression according to binding power.
-	fn pratt_parse_expr(&mut self, min_bp: u8) -> ParseResult<Value> {
+	async fn pratt_parse_expr(&mut self, ctx: &mut Stk, min_bp: u8) -> ParseResult<Value> {
 		let peek = self.peek();
 		let mut lhs = if let Some(((), r_bp)) = self.prefix_binding_power(peek.kind) {
-			self.parse_prefix_op(r_bp)?
+			self.parse_prefix_op(ctx, r_bp).await?
 		} else {
-			self.parse_idiom_expression()?
+			self.parse_idiom_expression(ctx).await?
 		};
 
 		loop {
@@ -302,7 +335,7 @@ impl Parser<'_> {
 				break;
 			}
 
-			lhs = self.parse_infix_op(r_bp, lhs)?;
+			lhs = self.parse_infix_op(ctx, r_bp, lhs).await?;
 		}
 
 		Ok(lhs)

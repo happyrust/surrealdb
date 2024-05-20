@@ -8,6 +8,7 @@ pub(crate) mod base;
 pub(crate) mod block;
 pub(crate) mod bytes;
 pub(crate) mod cast;
+pub(crate) mod change_feed_include;
 pub(crate) mod changefeed;
 pub(crate) mod cond;
 pub(crate) mod constant;
@@ -57,6 +58,7 @@ pub(crate) mod statement;
 pub(crate) mod strand;
 pub(crate) mod subquery;
 pub(crate) mod table;
+pub(crate) mod table_type;
 pub(crate) mod thing;
 pub(crate) mod timeout;
 pub(crate) mod tokenizer;
@@ -132,6 +134,7 @@ pub use self::strand::Strand;
 pub use self::subquery::Subquery;
 pub use self::table::Table;
 pub use self::table::Tables;
+pub use self::table_type::{Relation, TableType};
 pub use self::thing::Thing;
 pub use self::timeout::Timeout;
 pub use self::tokenizer::Tokenizer;
@@ -152,6 +155,3 @@ mod parser {
 }
 
 pub use self::parser::{idiom, json, parse, subquery, thing, value};
-
-#[deprecated(since = "1.2.0")]
-pub use self::parser::error::ParseError;

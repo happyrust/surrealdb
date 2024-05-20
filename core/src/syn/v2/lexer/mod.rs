@@ -10,7 +10,7 @@ mod datetime;
 mod duration;
 mod ident;
 mod js;
-mod keywords;
+pub mod keywords;
 mod number;
 mod reader;
 mod strand;
@@ -27,6 +27,7 @@ pub use reader::{BytesReader, CharError};
 /// Can be retrieved from the `Lexer::error` field whenever it returned a [`TokenKind::Invalid`]
 /// token.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
 	#[error("Lexer encountered unexpected character {0:?}")]
 	UnexpectedCharacter(char),
@@ -71,6 +72,7 @@ impl From<CharError> for Error {
 /// Note that SurrealQL syntax cannot be lexed in advance. For example, record strings and regexes,
 /// both cannot be parsed correctly without knowledge of previous tokens as they are both ambigious
 /// with other tokens.
+#[non_exhaustive]
 pub struct Lexer<'a> {
 	/// The reader for reading the source bytes.
 	pub reader: BytesReader<'a>,
@@ -81,6 +83,10 @@ pub struct Lexer<'a> {
 	/// A buffer used to build the value of tokens which can't be read straight from the source.
 	/// like for example strings with escape characters.
 	scratch: String,
+
+	/// Allow the next parsed idents to be flexible, i.e. support idents which don't start with a
+	/// number.
+	pub flexible_ident: bool,
 
 	// below are a collection of storage for values produced by tokens.
 	// For performance reasons we wan't to keep the tokens as small as possible.
@@ -115,6 +121,7 @@ impl<'a> Lexer<'a> {
 			last_offset: 0,
 			whitespace_span: None,
 			scratch: String::new(),
+			flexible_ident: false,
 			string: None,
 			datetime: None,
 			duration: None,
@@ -130,6 +137,7 @@ impl<'a> Lexer<'a> {
 	pub fn reset(&mut self) {
 		self.last_offset = 0;
 		self.scratch.clear();
+		self.flexible_ident = false;
 		self.whitespace_span = None;
 		self.string = None;
 		self.datetime = None;
@@ -153,6 +161,7 @@ impl<'a> Lexer<'a> {
 			last_offset: 0,
 			whitespace_span: None,
 			scratch: self.scratch,
+			flexible_ident: false,
 			string: self.string,
 			datetime: self.datetime,
 			duration: self.duration,

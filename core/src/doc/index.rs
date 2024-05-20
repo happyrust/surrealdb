@@ -1,5 +1,5 @@
 use crate::ctx::Context;
-use crate::dbs::Statement;
+use crate::dbs::{Force, Statement};
 use crate::dbs::{Options, Transaction};
 use crate::doc::{CursorDoc, Document};
 use crate::err::Error;
@@ -9,7 +9,7 @@ use crate::idx::IndexKeyBase;
 use crate::key;
 use crate::kvs::TransactionType;
 use crate::sql::array::Array;
-use crate::sql::index::{Index, MTreeParams, SearchParams};
+use crate::sql::index::{HnswParams, Index, MTreeParams, SearchParams};
 use crate::sql::statements::DefineIndexStatement;
 use crate::sql::{Part, Thing, Value};
 
@@ -21,14 +21,23 @@ impl<'a> Document<'a> {
 		txn: &Transaction,
 		_stm: &Statement<'_>,
 	) -> Result<(), Error> {
-		// Check indexes
-		if !opt.indexes {
+		// Check import
+		if opt.import {
 			return Ok(());
 		}
-		// Check if forced
-		if !opt.force && !self.changed() {
-			return Ok(());
-		}
+		// Was this force targeted at a specific index?
+		let targeted_force = matches!(opt.force, Force::Index(_));
+		// Collect indexes or skip
+		let ixs = match &opt.force {
+			Force::Index(ix)
+				if ix.first().is_some_and(|ix| self.id.is_some_and(|id| ix.what.0 == id.tb)) =>
+			{
+				ix.clone()
+			}
+			Force::All => self.ix(opt, txn).await?,
+			_ if self.changed() => self.ix(opt, txn).await?,
+			_ => return Ok(()),
+		};
 		// Check if the table is a view
 		if self.tb(opt, txn).await?.drop {
 			return Ok(());
@@ -36,7 +45,7 @@ impl<'a> Document<'a> {
 		// Get the record id
 		let rid = self.id.as_ref().unwrap();
 		// Loop through all index statements
-		for ix in self.ix(opt, txn).await?.iter() {
+		for ix in ixs.iter() {
 			// Calculate old values
 			let o = build_opt_values(ctx, opt, txn, ix, &self.initial).await?;
 
@@ -44,7 +53,7 @@ impl<'a> Document<'a> {
 			let n = build_opt_values(ctx, opt, txn, ix, &self.current).await?;
 
 			// Update the index entries
-			if opt.force || o != n {
+			if targeted_force || o != n {
 				// Store all the variable and parameters required by the index operation
 				let mut ic = IndexOperation::new(opt, ix, o, n, rid);
 
@@ -54,6 +63,7 @@ impl<'a> Document<'a> {
 					Index::Idx => ic.index_non_unique(txn).await?,
 					Index::Search(p) => ic.index_full_text(ctx, txn, p).await?,
 					Index::MTree(p) => ic.index_mtree(ctx, txn, p).await?,
+					Index::Hnsw(p) => ic.index_hnsw(ctx, p).await?,
 				};
 			}
 		}
@@ -385,12 +395,26 @@ impl<'a> IndexOperation<'a> {
 				.await?;
 		// Delete the old index data
 		if let Some(o) = self.o.take() {
-			mt.remove_document(&mut tx, self.rid, o).await?;
+			mt.remove_document(&mut tx, self.rid, &o).await?;
 		}
 		// Create the new index data
 		if let Some(n) = self.n.take() {
-			mt.index_document(&mut tx, self.rid, n).await?;
+			mt.index_document(&mut tx, self.rid, &n).await?;
 		}
 		mt.finish(&mut tx).await
+	}
+
+	async fn index_hnsw(&mut self, ctx: &Context<'_>, p: &HnswParams) -> Result<(), Error> {
+		let hnsw = ctx.get_index_stores().get_index_hnsw(self.opt, self.ix, p).await;
+		let mut hnsw = hnsw.write().await;
+		// Delete the old index data
+		if let Some(o) = self.o.take() {
+			hnsw.remove_document(self.rid, &o)?;
+		}
+		// Create the new index data
+		if let Some(n) = self.n.take() {
+			hnsw.index_document(self.rid, &n)?;
+		}
+		Ok(())
 	}
 }
