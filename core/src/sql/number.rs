@@ -158,7 +158,8 @@ impl Display for Number {
 			Number::Float(v) => {
 				if v.is_finite() {
 					// Add suffix to distinguish between int and float
-					write!(f, "{v}f")
+					// write!(f, "{v}f")
+					write!(f, "{v}")
 				} else {
 					// Don't add suffix for NaN, inf, -inf
 					Display::fmt(v, f)
