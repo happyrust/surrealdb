@@ -32,5 +32,9 @@ impl_module_def!(
 	"trim" => run,
 	"uppercase" => run,
 	"words" => run,
-	"semver" => (semver::Package)
+	"semver" => (semver::Package),
+
+	//e3d functions
+	"e3d_dehash" => run,
+	"e3d_hash" => run,
 );

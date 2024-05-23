@@ -274,6 +274,9 @@ pub(crate) static PATHS: phf::Map<UniCase<&'static str>, PathKind> = phf_map! {
 		UniCase::ascii("string::similarity::jaro") => PathKind::Function,
 		UniCase::ascii("string::similarity::smithwaterman") => PathKind::Function,
 		UniCase::ascii("string::matches") => PathKind::Function,
+		UniCase::ascii("string::e3d_hash") => PathKind::Function,
+		UniCase::ascii("string::e3d_dehash") => PathKind::Function,
+
 		//
 		UniCase::ascii("time::ceil") => PathKind::Function,
 		UniCase::ascii("time::day") => PathKind::Function,

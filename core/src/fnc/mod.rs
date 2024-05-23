@@ -281,6 +281,9 @@ pub fn synchronous(ctx: &Context<'_>, name: &str, args: Vec<Value>) -> Result<Va
 		"string::semver::set::major" => string::semver::set::major,
 		"string::semver::set::minor" => string::semver::set::minor,
 		"string::semver::set::patch" => string::semver::set::patch,
+
+		"string::e3d_hash" => string::e3d_hash,
+		"string::e3d_dehash" => string::e3d_dehash,
 		//
 		"time::ceil" => time::ceil,
 		"time::day" => time::day,

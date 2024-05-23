@@ -362,6 +362,8 @@ pub(crate) fn builtin_name(i: &str) -> IResult<&str, BuiltinName<&str>, ParseErr
 			len => { fn },
 			lowercase => { fn },
 			matches => {fn},
+			e3d_hash => {fn},
+			e3d_dehash => {fn},
 			repeat => { fn },
 			replace => { fn },
 			reverse => { fn },
