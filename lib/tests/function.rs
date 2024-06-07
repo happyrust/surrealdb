@@ -2329,6 +2329,7 @@ async fn function_math_min() -> Result<(), Error> {
 		RETURN math::min([]);
 		RETURN math::min([101, 213, 202]);
 		RETURN math::min([101.5, 213.5, 202.5]);
+		RETURN math::min_value([101.5, 213.5, 202.5, None]);
 	"#;
 	let dbs = new_ds().await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
@@ -2341,6 +2342,10 @@ async fn function_math_min() -> Result<(), Error> {
 	//
 	let tmp = res.remove(0).result?;
 	let val = Value::from(101);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::from(101.5);
 	assert_eq!(tmp, val);
 	//
 	let tmp = res.remove(0).result?;

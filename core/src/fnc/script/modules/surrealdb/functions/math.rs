@@ -30,5 +30,8 @@ impl_module_def!(
 	"sum" => run,
 	"top" => run,
 	"trimean" => run,
-	"variance" => run
+	"variance" => run,
+
+	"max_value" => run,
+	"min_value" => run
 );

@@ -150,6 +150,8 @@ impl Function {
 			Self::Normal(f, _) if f == "math::top" => true,
 			Self::Normal(f, _) if f == "math::trimean" => true,
 			Self::Normal(f, _) if f == "math::variance" => true,
+			Self::Normal(f, _) if f == "math::max_value" => true,
+			Self::Normal(f, _) if f == "math::min_value" => true,
 			Self::Normal(f, _) if f == "time::max" => true,
 			Self::Normal(f, _) if f == "time::min" => true,
 			_ => false,

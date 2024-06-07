@@ -12,6 +12,7 @@ use crate::fnc::util::math::spread::Spread;
 use crate::fnc::util::math::top::Top;
 use crate::fnc::util::math::trimean::Trimean;
 use crate::fnc::util::math::variance::Variance;
+use crate::sql::Array;
 use crate::sql::number::{Number, Sort};
 use crate::sql::value::{TryPow, Value};
 
@@ -81,6 +82,32 @@ pub fn min((array,): (Vec<Number>,)) -> Result<Value, Error> {
 		None => Value::None,
 	})
 }
+
+pub fn max_value((array,): (Array,)) -> Result<Value, Error> {
+	Ok(match array.into_iter().filter_map(|x| {
+		match x {
+			Value::Number(n) => Some(n),
+			_ => None,
+		}
+	}).map(|x| x).max() {
+		Some(v) => v.into(),
+		None => Value::None,
+	})
+}
+
+pub fn min_value((array,): (Array,)) -> Result<Value, Error> {
+	Ok(match array.into_iter().filter_map(|x| {
+		match x {
+			Value::Number(n) => Some(n),
+			_ => None,
+		}
+	}).map(|x| x).min() {
+		Some(v) => v.into(),
+		None => Value::None,
+	})
+}
+
+
 
 pub fn mode((array,): (Vec<Number>,)) -> Result<Value, Error> {
 	Ok(array.mode().into())

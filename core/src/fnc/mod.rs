@@ -191,6 +191,10 @@ pub fn synchronous(ctx: &Context<'_>, name: &str, args: Vec<Value>) -> Result<Va
 		"math::top" => math::top,
 		"math::trimean" => math::trimean,
 		"math::variance" => math::variance,
+
+		"math::max_value" => math::max_value,
+		"math::min_value" => math::min_value,
+
 		//
 		"meta::id" => meta::id,
 		"meta::table" => meta::tb,
