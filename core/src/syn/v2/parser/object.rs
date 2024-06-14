@@ -15,7 +15,7 @@ use crate::{
 use super::mac::unexpected;
 
 impl Parser<'_> {
-	/// Parse an production which starts with an `{`
+	/// Parse a production which starts with an `{`
 	///
 	/// Either a block statemnt, a object or geometry.
 	pub(super) async fn parse_object_like(

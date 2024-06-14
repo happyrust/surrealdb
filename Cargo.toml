@@ -22,7 +22,7 @@ ml = ["surrealdb/ml"]
 jwks = ["surrealdb/jwks"]
 sql2 = [] # Deprecated since v1.4
 parser2 = ["surrealdb/parser2"]
-performance-profiler = ["dep:pprof"]
+#performance-profiler = ["dep:pprof"]
 
 [workspace]
 members = [

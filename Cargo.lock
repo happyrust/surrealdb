@@ -4136,7 +4136,6 @@ checksum = "ef5c97c51bd34c7e742402e216abdeb44d415fbe6ae41d56b114723e953711cb"
 dependencies = [
  "backtrace",
  "cfg-if",
- "criterion",
  "findshlibs",
  "inferno",
  "libc",
@@ -5891,7 +5890,6 @@ dependencies = [
  "once_cell",
  "path-clean",
  "pharos",
- "pprof",
  "radix_trie",
  "rand 0.8.5",
  "regex",
@@ -6060,7 +6058,6 @@ dependencies = [
  "pharos",
  "phf",
  "pin-project-lite",
- "pprof",
  "quick_cache",
  "radix_trie",
  "rand 0.8.5",

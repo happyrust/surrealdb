@@ -277,6 +277,8 @@ pub(crate) fn builtin_name(i: &str) -> IResult<&str, BuiltinName<&str>, ParseErr
 			top => { fn },
 			trimean => { fn },
 			variance => { fn },
+			min_value => { fn },
+			max_value => { fn },
 			E => { const = constant::Constant::MathE },
 			FRAC_1_PI => { const = constant::Constant::MathFrac1Pi },
 			FRAC_1_SQRT_2 => { const = constant::Constant::MathFrac1Sqrt2 },

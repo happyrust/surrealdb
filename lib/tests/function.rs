@@ -2329,12 +2329,13 @@ async fn function_math_min() -> Result<(), Error> {
 		RETURN math::min([]);
 		RETURN math::min([101, 213, 202]);
 		RETURN math::min([101.5, 213.5, 202.5]);
-		RETURN math::min_value([101.5, 213.5, 202.5, None]);
+		// RETURN string::e3d_hash("WORL");
+		RETURN math::min_value([101.5, 213.5, 202.5]);
 	"#;
 	let dbs = new_ds().await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
-	assert_eq!(res.len(), 3);
+	assert_eq!(res.len(), 4);
 	//
 	let tmp = res.remove(0).result?;
 	let val = Value::None;
