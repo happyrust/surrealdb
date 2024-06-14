@@ -227,7 +227,7 @@ impl TryFrom<Cbor> for Value {
 						_ => Err("Expected a CBOR array with Geometry Point values"),
 					},
 					TAG_GEOMETRY_POLYGON => match v.deref() {
-						Data::Array(v) if v.len() >= 2 => {
+						Data::Array(v) if !v.is_empty() => {
 							let lines = v
 								.iter()
 								.map(|v| match Value::try_from(Cbor(v.clone()))? {
@@ -236,19 +236,20 @@ impl TryFrom<Cbor> for Value {
 								})
 								.collect::<Result<Vec<LineString>, &str>>()?;
 
-							let first = match lines.first() {
+							let exterior = match lines.first() {
 								Some(v) => v,
 								_ => return Err(
-									"Expected a CBOR array with at least two Geometry Line values",
+									"Expected a CBOR array with at least one Geometry Line values",
 								),
 							};
+							let interiors = Vec::from(&lines[1..]);
 
 							Ok(Value::Geometry(Geometry::Polygon(Polygon::new(
-								first.clone(),
-								Vec::from(&lines[1..]),
+								exterior.clone(),
+								interiors,
 							))))
 						}
-						_ => Err("Expected a CBOR array with at least two Geometry Line values"),
+						_ => Err("Expected a CBOR array with at least one Geometry Line values"),
 					},
 					TAG_GEOMETRY_MULTIPOINT => match v.deref() {
 						Data::Array(v) => {
@@ -396,54 +397,69 @@ impl TryFrom<Value> for Cbor {
 				])),
 			))),
 			Value::Table(v) => Ok(Cbor(Data::Tag(TAG_TABLE, Box::new(Data::Text(v.0))))),
-			Value::Geometry(v) => Ok(Cbor(encode_geometry(v))),
+			Value::Geometry(v) => Ok(Cbor(encode_geometry(v)?)),
 			// We shouldn't reach here
 			_ => Err("Found unsupported SurrealQL value being encoded into a CBOR value"),
 		}
 	}
 }
 
-fn encode_geometry(v: Geometry) -> Data {
+fn encode_geometry(v: Geometry) -> Result<Data, &'static str> {
 	match v {
-		Geometry::Point(v) => Data::Tag(
+		Geometry::Point(v) => Ok(Data::Tag(
 			TAG_GEOMETRY_POINT,
 			Box::new(Data::Array(vec![
 				Data::Tag(TAG_STRING_DECIMAL, Box::new(Data::Text(v.x().to_string()))),
 				Data::Tag(TAG_STRING_DECIMAL, Box::new(Data::Text(v.y().to_string()))),
 			])),
-		),
+		)),
 		Geometry::Line(v) => {
-			let data = v.points().map(|v| encode_geometry(v.into())).collect::<Vec<Data>>();
+			let data = v
+				.points()
+				.map(|v| encode_geometry(v.into()))
+				.collect::<Result<Vec<Data>, &'static str>>()?;
 
-			Data::Tag(TAG_GEOMETRY_LINE, Box::new(Data::Array(data)))
+			Ok(Data::Tag(TAG_GEOMETRY_LINE, Box::new(Data::Array(data))))
 		}
 		Geometry::Polygon(v) => {
 			let data = once(v.exterior())
 				.chain(v.interiors())
 				.map(|v| encode_geometry(v.clone().into()))
-				.collect::<Vec<Data>>();
+				.collect::<Result<Vec<Data>, &'static str>>()?;
 
-			Data::Tag(TAG_GEOMETRY_POLYGON, Box::new(Data::Array(data)))
+			Ok(Data::Tag(TAG_GEOMETRY_POLYGON, Box::new(Data::Array(data))))
 		}
 		Geometry::MultiPoint(v) => {
-			let data = v.iter().map(|v| encode_geometry((*v).into())).collect::<Vec<Data>>();
+			let data = v
+				.iter()
+				.map(|v| encode_geometry((*v).into()))
+				.collect::<Result<Vec<Data>, &'static str>>()?;
 
-			Data::Tag(TAG_GEOMETRY_MULTIPOINT, Box::new(Data::Array(data)))
+			Ok(Data::Tag(TAG_GEOMETRY_MULTIPOINT, Box::new(Data::Array(data))))
 		}
 		Geometry::MultiLine(v) => {
-			let data = v.iter().map(|v| encode_geometry(v.clone().into())).collect::<Vec<Data>>();
+			let data = v
+				.iter()
+				.map(|v| encode_geometry(v.clone().into()))
+				.collect::<Result<Vec<Data>, &'static str>>()?;
 
-			Data::Tag(TAG_GEOMETRY_MULTILINE, Box::new(Data::Array(data)))
+			Ok(Data::Tag(TAG_GEOMETRY_MULTILINE, Box::new(Data::Array(data))))
 		}
 		Geometry::MultiPolygon(v) => {
-			let data = v.iter().map(|v| encode_geometry(v.clone().into())).collect::<Vec<Data>>();
+			let data = v
+				.iter()
+				.map(|v| encode_geometry(v.clone().into()))
+				.collect::<Result<Vec<Data>, &'static str>>()?;
 
-			Data::Tag(TAG_GEOMETRY_MULTIPOLYGON, Box::new(Data::Array(data)))
+			Ok(Data::Tag(TAG_GEOMETRY_MULTIPOLYGON, Box::new(Data::Array(data))))
 		}
 		Geometry::Collection(v) => {
-			let data = v.iter().map(|v| encode_geometry(v.clone())).collect::<Vec<Data>>();
+			let data = v
+				.iter()
+				.map(|v| encode_geometry(v.clone()))
+				.collect::<Result<Vec<Data>, &'static str>>()?;
 
-			Data::Tag(TAG_GEOMETRY_COLLECTION, Box::new(Data::Array(data)))
+			Ok(Data::Tag(TAG_GEOMETRY_COLLECTION, Box::new(Data::Array(data))))
 		}
 	}
 }

@@ -1,6 +1,5 @@
 use crate::ctx::Context;
 use crate::dbs::Options;
-use crate::dbs::Transaction;
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::iam::{Action, ResourceKind};
@@ -9,6 +8,7 @@ use crate::sql::statements::RemoveIndexStatement;
 use crate::sql::value::Value;
 use crate::sql::Base;
 use derive::Store;
+use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -30,13 +30,13 @@ impl RebuildStatement {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
 		&self,
+		stk: &mut Stk,
 		ctx: &Context<'_>,
 		opt: &Options,
-		txn: &Transaction,
 		doc: Option<&CursorDoc<'_>>,
 	) -> Result<Value, Error> {
 		match self {
-			Self::Index(s) => s.compute(ctx, opt, txn, doc).await,
+			Self::Index(s) => s.compute(stk, ctx, opt, doc).await,
 		}
 	}
 }
@@ -63,9 +63,9 @@ impl RebuildIndexStatement {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
 		&self,
+		stk: &mut Stk,
 		ctx: &Context<'_>,
 		opt: &Options,
-		txn: &Transaction,
 		doc: Option<&CursorDoc<'_>>,
 	) -> Result<Value, Error> {
 		let future = async {
@@ -73,10 +73,15 @@ impl RebuildIndexStatement {
 			opt.is_allowed(Action::Edit, ResourceKind::Index, &Base::Db)?;
 
 			// Get the index definition
-			let ix = txn
-				.lock()
+			let ix = ctx
+				.tx_lock()
 				.await
-				.get_and_cache_tb_index(opt.ns(), opt.db(), self.what.as_str(), self.name.as_str())
+				.get_and_cache_tb_index(
+					opt.ns()?,
+					opt.db()?,
+					self.what.as_str(),
+					self.name.as_str(),
+				)
 				.await?;
 
 			// Remove the index
@@ -85,10 +90,10 @@ impl RebuildIndexStatement {
 				what: self.what.clone(),
 				if_exists: false,
 			};
-			remove.compute(ctx, opt, txn).await?;
+			remove.compute(ctx, opt).await?;
 
 			// Rebuild the index
-			ix.compute(ctx, opt, txn, doc).await?;
+			ix.compute(stk, ctx, opt, doc).await?;
 
 			// Return the result object
 			Ok(Value::None)

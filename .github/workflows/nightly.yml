@@ -1,0 +1,34 @@
+# This workflow triggers nightly releases
+
+name: Nightly release
+
+run-name: "Nightly release (publish: ${{ inputs.publish || github.event_name == 'schedule' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        required: false
+        type: boolean
+        default: false
+        description: "Publish the nightly release"
+  schedule:
+    - cron: '0 0 * * *'
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Prepare nightly release
+    uses: ./.github/workflows/reusable_publish_version.yml
+    with:
+      environment: nightly
+      extra-features: storage-surrealkv
+      git-ref: main
+      publish: ${{ inputs.publish || github.event_name == 'schedule' }}
+    secrets: inherit

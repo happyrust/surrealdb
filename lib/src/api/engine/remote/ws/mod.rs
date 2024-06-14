@@ -77,7 +77,6 @@ impl Surreal<Client> {
 			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
-			client: PhantomData,
 			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
@@ -135,7 +134,6 @@ impl DbResponse {
 								(stats, Err(Error::Query(response.result.as_raw_string()).into())),
 							);
 						}
-						#[cfg(feature = "sql2")]
 						_ => unreachable!(),
 					}
 				}

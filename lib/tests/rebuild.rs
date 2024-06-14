@@ -2,7 +2,7 @@ mod parse;
 use parse::Parse;
 
 mod helpers;
-use helpers::new_ds;
+use helpers::*;
 
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;

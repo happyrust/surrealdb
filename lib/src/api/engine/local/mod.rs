@@ -38,6 +38,7 @@ use crate::api::engine::merge_statement;
 use crate::api::engine::patch_statement;
 use crate::api::engine::select_statement;
 use crate::api::engine::update_statement;
+use crate::api::engine::upsert_statement;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::api::err::Error;
 use crate::api::Connect;
@@ -47,28 +48,28 @@ use crate::api::Surreal;
 use crate::dbs::Notification;
 use crate::dbs::Response;
 use crate::dbs::Session;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::iam::check::check_ns_db;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::iam::Action;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::iam::ResourceKind;
 use crate::kvs::Datastore;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::kvs::{LockType, TransactionType};
 use crate::method::Stats;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ml::storage::surml_file::SurMlFile;
 use crate::opt::IntoEndpoint;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::sql::statements::DefineModelStatement;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use crate::sql::statements::DefineStatement;
 use crate::sql::statements::KillStatement;
@@ -77,7 +78,7 @@ use crate::sql::Statement;
 use crate::sql::Uuid;
 use crate::sql::Value;
 use channel::Sender;
-#[cfg(any(feature = "ml", feature = "ml2"))]
+#[cfg(feature = "ml")]
 #[cfg(not(target_arch = "wasm32"))]
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -88,7 +89,6 @@ use std::mem;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(feature = "sql2")]
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::fs::OpenOptions;
@@ -99,7 +99,6 @@ use tokio::io::AsyncReadExt;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::io::AsyncWriteExt;
 
-#[cfg(feature = "sql2")]
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// In-memory database
@@ -228,42 +227,6 @@ pub struct File;
 #[derive(Debug)]
 pub struct RocksDb;
 
-/// SpeeDB database
-///
-/// # Examples
-///
-/// Instantiating a SpeeDB-backed instance
-///
-/// ```no_run
-/// # #[tokio::main]
-/// # async fn main() -> surrealdb::Result<()> {
-/// use surrealdb::Surreal;
-/// use surrealdb::engine::local::SpeeDb;
-///
-/// let db = Surreal::new::<SpeeDb>("path/to/database-folder").await?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// Instantiating a SpeeDB-backed strict instance
-///
-/// ```no_run
-/// # #[tokio::main]
-/// # async fn main() -> surrealdb::Result<()> {
-/// use surrealdb::opt::Config;
-/// use surrealdb::Surreal;
-/// use surrealdb::engine::local::SpeeDb;
-///
-/// let config = Config::default().strict();
-/// let db = Surreal::new::<SpeeDb>(("path/to/database-folder", config)).await?;
-/// # Ok(())
-/// # }
-/// ```
-#[cfg(feature = "kv-speedb")]
-#[cfg_attr(docsrs, doc(cfg(feature = "kv-speedb")))]
-#[derive(Debug)]
-pub struct SpeeDb;
-
 /// IndxDB database
 ///
 /// # Examples
@@ -372,6 +335,37 @@ pub struct TiKv;
 #[derive(Debug)]
 pub struct FDb;
 
+/// SurrealKV database
+///
+/// # Examples
+///
+/// Instantiating a SurrealKV-backed instance
+///
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> surrealdb::Result<()> {
+/// use surrealdb::Surreal;
+/// use surrealdb::engine::local::SurrealKV;
+///
+/// let db = Surreal::new::<SurrealKV>("path/to/database-folder").await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Instantiating a SurrealKV-backed strict instance
+///
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> surrealdb::Result<()> {
+/// use surrealdb::opt::Config;
+/// use surrealdb::Surreal;
+/// use surrealdb::engine::local::SurrealKV;
+///
+/// let config = Config::default().strict();
+/// let db = Surreal::new::<SurrealKV>(("path/to/database-folder", config)).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(feature = "kv-surrealkv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "kv-surrealkv")))]
 #[derive(Debug)]
@@ -391,7 +385,6 @@ impl Surreal<Db> {
 			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
-			client: PhantomData,
 			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
@@ -445,7 +438,7 @@ async fn export(
 	ml_config: Option<MlConfig>,
 ) -> Result<()> {
 	match ml_config {
-		#[cfg(any(feature = "ml", feature = "ml2"))]
+		#[cfg(feature = "ml")]
 		Some(MlConfig::Export {
 			name,
 			version,
@@ -573,6 +566,14 @@ async fn router(
 			query.0 .0 = vec![Statement::Create(statement)];
 			let response = kvs.process(query, &*session, Some(vars.clone())).await?;
 			let value = take(true, response).await?;
+			Ok(DbResponse::Other(value))
+		}
+		Method::Upsert => {
+			let mut query = Query::default();
+			let (one, statement) = upsert_statement(&mut params);
+			query.0 .0 = vec![Statement::Upsert(statement)];
+			let response = kvs.process(query, &*session, Some(vars.clone())).await?;
+			let value = take(one, response).await?;
 			Ok(DbResponse::Other(value))
 		}
 		Method::Update => {
@@ -722,7 +723,7 @@ async fn router(
 				}
 			};
 			let responses = match param.ml_config {
-				#[cfg(any(feature = "ml", feature = "ml2"))]
+				#[cfg(feature = "ml")]
 				Some(MlConfig::Import) => {
 					// Ensure a NS and DB are set
 					let (nsv, dbv) = check_ns_db(session)?;

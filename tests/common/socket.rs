@@ -41,7 +41,7 @@ struct SigninParams<'a> {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	db: Option<&'a str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	sc: Option<&'a str>,
+	ac: Option<&'a str>,
 }
 
 enum SocketMsg {
@@ -115,7 +115,7 @@ impl Socket {
 				// First of all we convert the JSON type to a string.
 				let json = message.to_string();
 				// Then we parse the JSON in to SurrealQL.
-				let surrealql = surrealdb::sql::value(&json)?;
+				let surrealql = surrealdb::syn::value_legacy_strand(&json)?;
 				// Then we convert the SurrealQL in to CBOR.
 				let cbor = Cbor::try_from(surrealql)?;
 				// Then serialize the CBOR as binary data.
@@ -132,7 +132,7 @@ impl Socket {
 				// First of all we convert the JSON type to a string.
 				let json = message.to_string();
 				// Then we parse the JSON in to SurrealQL.
-				let surrealql = surrealdb::sql::value(&json)?;
+				let surrealql = surrealdb::syn::value_legacy_strand(&json)?;
 				// Then we convert the SurrealQL in to MessagePack.
 				let pack = Pack::try_from(surrealql)?;
 				// Then serialize the MessagePack as binary data.
@@ -385,7 +385,7 @@ impl Socket {
 		pass: &str,
 		ns: Option<&str>,
 		db: Option<&str>,
-		sc: Option<&str>,
+		ac: Option<&str>,
 	) -> Result<String> {
 		// Send message and receive response
 		let msg = self
@@ -396,7 +396,7 @@ impl Socket {
 					pass,
 					ns,
 					db,
-					sc
+					ac
 				}]),
 			)
 			.await?;

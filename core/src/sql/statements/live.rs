@@ -1,5 +1,5 @@
 use crate::ctx::Context;
-use crate::dbs::{Options, Transaction};
+use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::{Error, LiveQueryCause};
 use crate::fflags::FFLAGS;
@@ -9,6 +9,7 @@ use crate::sql::statements::info::InfoStructure;
 use crate::sql::{Cond, Fetchs, Fields, Object, Table, Uuid, Value};
 use derive::Store;
 use futures::lock::MutexGuard;
+use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -27,18 +28,20 @@ pub struct LiveStatement {
 	// When a live query is marked for archiving, this will
 	// be set to the node ID that archived the query. This
 	// is an internal property, set by the database runtime.
-	// This is optional, and os only set when archived.
+	// This is optional, and is only set when archived.
+	//
+	// This is deprecated from 2.0
 	pub(crate) archived: Option<Uuid>,
 	// When a live query is created, we must also store the
 	// authenticated session of the user who made the query,
-	// so we can chack it later when sending notifications.
+	// so we can check it later when sending notifications.
 	// This is optional as it is only set by the database
 	// runtime when storing the live query to storage.
 	#[revision(start = 2)]
 	pub(crate) session: Option<Value>,
 	// When a live query is created, we must also store the
 	// authenticated session of the user who made the query,
-	// so we can chack it later when sending notifications.
+	// so we can check it later when sending notifications.
 	// This is optional as it is only set by the database
 	// runtime when storing the live query to storage.
 	pub(crate) auth: Option<Auth>,
@@ -76,9 +79,9 @@ impl LiveStatement {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
 		&self,
+		stk: &mut Stk,
 		ctx: &Context<'_>,
 		opt: &Options,
-		txn: &Transaction,
 		doc: Option<&CursorDoc<'_>>,
 	) -> Result<Value, Error> {
 		// Is realtime enabled?
@@ -102,11 +105,15 @@ impl LiveStatement {
 		let id = stm.id.0;
 		match FFLAGS.change_feed_live_queries.enabled() {
 			true => {
-				let mut run = txn.lock().await;
-				match stm.what.compute(ctx, opt, txn, doc).await? {
+				let mut run = ctx.tx_lock().await;
+				match stm.what.compute(stk, ctx, opt, doc).await? {
 					Value::Table(tb) => {
-						let ns = opt.ns().to_string();
-						let db = opt.db().to_string();
+						// We modify the table as it can be a $PARAM and the compute evaluates that
+						let mut stm = stm;
+						stm.what = Value::Table(tb.clone());
+
+						let ns = opt.ns()?.to_string();
+						let db = opt.db()?.to_string();
 						self.validate_change_feed_valid(&mut run, &ns, &db, &tb).await?;
 						// Send the live query registration hook to the transaction pre-commit channel
 						run.pre_commit_register_async_event(TrackedResult::LiveQuery(LqEntry {
@@ -126,16 +133,16 @@ impl LiveStatement {
 			}
 			false => {
 				// Claim transaction
-				let mut run = txn.lock().await;
+				let mut run = ctx.tx_lock().await;
 				// Process the live query table
-				match stm.what.compute(ctx, opt, txn, doc).await? {
+				match stm.what.compute(stk, ctx, opt, doc).await? {
 					Value::Table(tb) => {
 						// Store the current Node ID
 						stm.node = nid.into();
 						// Insert the node live query
-						run.putc_ndlq(nid, id, opt.ns(), opt.db(), tb.as_str(), None).await?;
+						run.putc_ndlq(nid, id, opt.ns()?, opt.db()?, tb.as_str(), None).await?;
 						// Insert the table live query
-						run.putc_tblq(opt.ns(), opt.db(), &tb, stm, None).await?;
+						run.putc_tblq(opt.ns()?, opt.db()?, &tb, stm, None).await?;
 					}
 					v => {
 						return Err(Error::LiveStatement {
@@ -168,7 +175,7 @@ impl LiveStatement {
 			.changefeed
 			.ok_or(Error::LiveQueryError(LiveQueryCause::MissingChangeFeed))?;
 		// check the change feed includes the original - required for differentiating between CREATE and UPDATE
-		if !cf.store_original {
+		if !cf.store_diff {
 			return Err(Error::LiveQueryError(LiveQueryCause::ChangeFeedNoOriginal));
 		}
 		Ok(())

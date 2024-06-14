@@ -1,7 +1,7 @@
 #![allow(clippy::derive_ord_xor_partial_ord)]
 
 use crate::ctx::Context;
-use crate::dbs::{Options, Transaction};
+use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::fnc::util::string::fuzzy::Fuzzy;
@@ -13,12 +13,12 @@ use crate::sql::{
 	model::Model,
 	Array, Block, Bytes, Cast, Constant, Datetime, Duration, Edges, Expression, Function, Future,
 	Geometry, Idiom, Kind, Mock, Number, Object, Operation, Param, Part, Query, Range, Regex,
-	Strand, Subquery, Table, Thing, Uuid,
+	Strand, Subquery, Table, Tables, Thing, Uuid,
 };
-use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use derive::Store;
 use geo::Point;
+use reblessive::tree::Stk;
 use revision::revisioned;
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,12 @@ impl IntoIterator for Values {
 impl Display for Values {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		Display::fmt(&Fmt::comma_separated(&self.0), f)
+	}
+}
+
+impl From<&Tables> for Values {
+	fn from(tables: &Tables) -> Self {
+		Self(tables.0.iter().map(|t| Value::Table(t.clone())).collect())
 	}
 }
 
@@ -506,6 +512,15 @@ impl From<Option<String>> for Value {
 
 impl From<Option<i64>> for Value {
 	fn from(v: Option<i64>) -> Self {
+		match v {
+			Some(v) => Value::from(v),
+			None => Value::None,
+		}
+	}
+}
+
+impl From<Option<Duration>> for Value {
+	fn from(v: Option<Duration>) -> Self {
 		match v {
 			Some(v) => Value::from(v),
 			None => Value::None,
@@ -1917,18 +1932,7 @@ impl Value {
 			// Allow any decimal number
 			Value::Number(v) if v.is_decimal() => Ok(v),
 			// Attempt to convert an int number
-			// #[allow(clippy::unnecessary_fallible_conversions)] // `Decimal::from` can panic
-			// `clippy::unnecessary_fallible_conversions` not available on Rust < v1.75
-			#[allow(warnings)]
-			Value::Number(Number::Int(ref v)) => match Decimal::try_from(*v) {
-				// The Int can be represented as a Decimal
-				Ok(v) => Ok(Number::Decimal(v)),
-				// This Int does not convert to a Decimal
-				_ => Err(Error::ConvertTo {
-					from: self,
-					into: "decimal".into(),
-				}),
-			},
+			Value::Number(Number::Int(ref v)) => Ok(Number::Decimal(Decimal::from(*v))),
 			// Attempt to convert an float number
 			Value::Number(Number::Float(ref v)) => match Decimal::try_from(*v) {
 				// The Float can be represented as a Decimal
@@ -2630,33 +2634,33 @@ impl Value {
 		}
 	}
 	/// Process this type returning a computed simple Value
-	#[cfg_attr(not(target_arch = "wasm32"), async_recursion)]
-	#[cfg_attr(target_arch = "wasm32", async_recursion(?Send))]
+	///
+	/// Is used recursively.
 	pub(crate) async fn compute(
 		&self,
+		stk: &mut Stk,
 		ctx: &Context<'_>,
 		opt: &Options,
-		txn: &Transaction,
-		doc: Option<&'async_recursion CursorDoc<'_>>,
+		doc: Option<&CursorDoc<'_>>,
 	) -> Result<Value, Error> {
 		// Prevent infinite recursion due to casting, expressions, etc.
 		let opt = &opt.dive(1)?;
 
 		match self {
-			Value::Cast(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Thing(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Block(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Range(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Param(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Idiom(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Array(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Object(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Future(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Constant(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Function(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Model(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Subquery(v) => v.compute(ctx, opt, txn, doc).await,
-			Value::Expression(v) => v.compute(ctx, opt, txn, doc).await,
+			Value::Cast(v) => v.compute(stk, ctx, opt, doc).await,
+			Value::Thing(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Block(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Range(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Param(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Idiom(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Array(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Object(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Future(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Constant(v) => v.compute(),
+			Value::Function(v) => v.compute(stk, ctx, opt, doc).await,
+			Value::Model(v) => v.compute(stk, ctx, opt, doc).await,
+			Value::Subquery(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Expression(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
 			_ => Ok(self.to_owned()),
 		}
 	}

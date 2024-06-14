@@ -1,5 +1,5 @@
 use crate::ctx::Context;
-use crate::dbs::{Options, Transaction};
+use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::sql::Cond;
@@ -11,6 +11,7 @@ use crate::sql::Part;
 use crate::sql::Thing;
 use crate::sql::{strand::no_nul_bytes, Id, Value};
 use crate::syn;
+use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -158,21 +159,21 @@ impl Range {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
 		&self,
+		stk: &mut Stk,
 		ctx: &Context<'_>,
 		opt: &Options,
-		txn: &Transaction,
 		doc: Option<&CursorDoc<'_>>,
 	) -> Result<Value, Error> {
 		Ok(Value::Range(Box::new(Range {
 			tb: self.tb.clone(),
 			beg: match &self.beg {
-				Bound::Included(id) => Bound::Included(id.compute(ctx, opt, txn, doc).await?),
-				Bound::Excluded(id) => Bound::Excluded(id.compute(ctx, opt, txn, doc).await?),
+				Bound::Included(id) => Bound::Included(id.compute(stk, ctx, opt, doc).await?),
+				Bound::Excluded(id) => Bound::Excluded(id.compute(stk, ctx, opt, doc).await?),
 				Bound::Unbounded => Bound::Unbounded,
 			},
 			end: match &self.end {
-				Bound::Included(id) => Bound::Included(id.compute(ctx, opt, txn, doc).await?),
-				Bound::Excluded(id) => Bound::Excluded(id.compute(ctx, opt, txn, doc).await?),
+				Bound::Included(id) => Bound::Included(id.compute(stk, ctx, opt, doc).await?),
+				Bound::Excluded(id) => Bound::Excluded(id.compute(stk, ctx, opt, doc).await?),
 				Bound::Unbounded => Bound::Unbounded,
 			},
 		})))

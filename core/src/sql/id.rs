@@ -1,10 +1,11 @@
 use crate::cnf::ID_CHARS;
 use crate::ctx::Context;
-use crate::dbs::{Options, Transaction};
+use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::sql::{escape::escape_rid, Array, Number, Object, Strand, Thing, Uuid, Value};
 use nanoid::nanoid;
+use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -182,19 +183,19 @@ impl Id {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
 		&self,
+		stk: &mut Stk,
 		ctx: &Context<'_>,
 		opt: &Options,
-		txn: &Transaction,
 		doc: Option<&CursorDoc<'_>>,
 	) -> Result<Id, Error> {
 		match self {
 			Id::Number(v) => Ok(Id::Number(*v)),
 			Id::String(v) => Ok(Id::String(v.clone())),
-			Id::Array(v) => match v.compute(ctx, opt, txn, doc).await? {
+			Id::Array(v) => match v.compute(stk, ctx, opt, doc).await? {
 				Value::Array(v) => Ok(Id::Array(v)),
 				_ => unreachable!(),
 			},
-			Id::Object(v) => match v.compute(ctx, opt, txn, doc).await? {
+			Id::Object(v) => match v.compute(stk, ctx, opt, doc).await? {
 				Value::Object(v) => Ok(Id::Object(v)),
 				_ => unreachable!(),
 			},
