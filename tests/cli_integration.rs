@@ -1119,6 +1119,7 @@ mod cli_integration {
 		}
 
 		info!("* The path is a valid directory");
+		#[cfg(feature = "storage-surrealkv")]
 		{
 			let path = format!("surrealkv:{}", tempfile::tempdir().unwrap().path().display());
 			let temp_dir = tempfile::tempdir().unwrap();
