@@ -108,6 +108,9 @@ impl LiveStatement {
 					db: db.to_string(),
 					tb: tb.to_string(),
 				};
+				// Ensure that the table definition exists
+				let tb_name = &tb.0;
+				ensure_table_definition_exists(ctx, opt, &tb_name).await?;
 				// Get the transaction
 				let txn = ctx.tx();
 				// Lock the transaction
@@ -151,5 +154,33 @@ impl InfoStructure for LiveStatement {
 			"cond".to_string(), if let Some(v) = self.cond => v.structure(),
 			"fetch".to_string(), if let Some(v) = self.fetch => v.structure(),
 		})
+	}
+}
+
+async fn ensure_table_definition_exists<'a>(
+	ctx: &Context<'a>,
+	opt: &Options,
+	tb_name: &String,
+) -> Result<(), Error> {
+	// Get the transaction from the context
+	let txn = ctx.tx();
+
+	// Get the table definition
+	let tb = txn.get_tb(opt.ns()?, opt.db()?, &tb_name).await;
+
+	// Return the table or attempt to define it
+	match tb {
+		// The table doesn't exist
+		Err(Error::TbNotFound {
+				..
+			}) => {
+			// We can create the table automatically
+			txn.ensure_ns_db_tb(opt.ns()?, opt.db()?, &tb_name, opt.strict).await?;
+			Ok(())
+		}
+		// There was an error
+		Err(err) => Err(err),
+		// The table exists
+		Ok(_) => Ok(()),
 	}
 }
