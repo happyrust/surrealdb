@@ -179,7 +179,7 @@ async fn define_statement_table_schemafull() -> Result<(), Error> {
 			functions: {},
 			models: {},
 			params: {},
-			tables: { test: 'DEFINE TABLE test TYPE ANY SCHEMAFULL PERMISSIONS NONE' },
+			tables: { test: 'DEFINE TABLE test TYPE NORMAL SCHEMAFULL PERMISSIONS NONE' },
 			users: {},
 		}",
 	)?;
@@ -208,7 +208,7 @@ async fn define_statement_table_schemaful() -> Result<(), Error> {
 			functions: {},
 			models: {},
 			params: {},
-			tables: { test: 'DEFINE TABLE test TYPE ANY SCHEMAFULL PERMISSIONS NONE' },
+			tables: { test: 'DEFINE TABLE test TYPE NORMAL SCHEMAFULL PERMISSIONS NONE' },
 			users: {},
 		}",
 	);
@@ -248,7 +248,7 @@ async fn define_statement_table_foreigntable() -> Result<(), Error> {
 			models: {},
 			params: {},
 			tables: {
-				test: 'DEFINE TABLE test TYPE ANY SCHEMAFULL PERMISSIONS NONE',
+				test: 'DEFINE TABLE test TYPE NORMAL SCHEMAFULL PERMISSIONS NONE',
 				view: 'DEFINE TABLE view TYPE ANY SCHEMALESS AS SELECT count() FROM test GROUP ALL PERMISSIONS NONE',
 			},
 			users: {},
@@ -280,7 +280,7 @@ async fn define_statement_table_foreigntable() -> Result<(), Error> {
 			models: {},
 			params: {},
 			tables: {
-				test: 'DEFINE TABLE test TYPE ANY SCHEMAFULL PERMISSIONS NONE',
+				test: 'DEFINE TABLE test TYPE NORMAL SCHEMAFULL PERMISSIONS NONE',
 			},
 			users: {},
 		}",
@@ -740,6 +740,38 @@ async fn define_statement_index_single() -> Result<(), Error> {
 		"[{ id: user:1, email: 'test@surrealdb.com' }]",
 		"[{ id: user:2, email: 'test@surrealdb.com' }]",
 	])?;
+	Ok(())
+}
+
+#[tokio::test]
+async fn define_statement_index_concurrently() -> Result<(), Error> {
+	let sql = "
+		CREATE user:1 SET email = 'test@surrealdb.com';
+		CREATE user:2 SET email = 'test@surrealdb.com';
+		DEFINE INDEX test ON user FIELDS email CONCURRENTLY;
+		SLEEP 1s;
+		INFO FOR TABLE user;
+		INFO FOR INDEX test ON user;
+	";
+	let mut t = Test::new(sql).await?;
+	t.skip_ok(4)?;
+	t.expect_val(
+		"{
+			events: {},
+			fields: {},
+			tables: {},
+			indexes: {
+				test: 'DEFINE INDEX test ON user FIELDS email CONCURRENTLY',
+			},
+			lives: {},
+		}",
+	)?;
+	t.expect_val(
+		"{
+			building: { status: 'built' }
+		}",
+	)?;
+
 	Ok(())
 }
 
@@ -2039,6 +2071,7 @@ async fn define_remove_analyzer() -> Result<(), Error> {
 	let sql = "
 		DEFINE ANALYZER example_blank TOKENIZERS blank;
 		DEFINE ANALYZER IF NOT EXISTS example_blank TOKENIZERS blank;
+		DEFINE ANALYZER OVERWRITE example_blank TOKENIZERS blank;
 		DEFINE ANALYZER example_blank TOKENIZERS blank;
 		REMOVE ANALYZER IF EXISTS example_blank;
 		REMOVE ANALYZER example_blank;
@@ -2047,6 +2080,7 @@ async fn define_remove_analyzer() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The analyzer 'example_blank' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The analyzer 'example_blank' does not exist")?;
@@ -2059,6 +2093,7 @@ async fn define_remove_database() -> Result<(), Error> {
 	let sql = "
 		DEFINE DATABASE example;
 		DEFINE DATABASE IF NOT EXISTS example;
+		DEFINE DATABASE OVERWRITE example;
 		DEFINE DATABASE example;
 		REMOVE DATABASE IF EXISTS example;
 		REMOVE DATABASE example;
@@ -2067,6 +2102,7 @@ async fn define_remove_database() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The database 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The database 'example' does not exist")?;
@@ -2079,6 +2115,7 @@ async fn define_remove_event() -> Result<(), Error> {
 	let sql = "
 		DEFINE EVENT example ON example THEN {};
 		DEFINE EVENT IF NOT EXISTS example ON example THEN {};
+		DEFINE EVENT OVERWRITE example ON example THEN {};
 		DEFINE EVENT example ON example THEN {};
 		REMOVE EVENT IF EXISTS example ON example;
 		REMOVE EVENT example ON example;
@@ -2087,6 +2124,7 @@ async fn define_remove_event() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The event 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The event 'example' does not exist")?;
@@ -2099,6 +2137,7 @@ async fn define_remove_field() -> Result<(), Error> {
 	let sql = "
 		DEFINE FIELD example ON example;
 		DEFINE FIELD IF NOT EXISTS example ON example;
+		DEFINE FIELD OVERWRITE example ON example;
 		DEFINE FIELD example ON example;
 		REMOVE FIELD IF EXISTS example ON example;
 		REMOVE FIELD example ON example;
@@ -2107,6 +2146,7 @@ async fn define_remove_field() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The field 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The field 'example' does not exist")?;
@@ -2119,6 +2159,7 @@ async fn define_remove_function() -> Result<(), Error> {
 	let sql = "
 		DEFINE FUNCTION fn::example() {};
 		DEFINE FUNCTION IF NOT EXISTS fn::example() {};
+		DEFINE FUNCTION OVERWRITE fn::example() {};
 		DEFINE FUNCTION fn::example() {};
 		REMOVE FUNCTION IF EXISTS fn::example();
 		REMOVE FUNCTION fn::example();
@@ -2127,6 +2168,7 @@ async fn define_remove_function() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The function 'fn::example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The function 'fn::example' does not exist")?;
@@ -2139,6 +2181,7 @@ async fn define_remove_indexes() -> Result<(), Error> {
 	let sql = "
 		DEFINE INDEX example ON example FIELDS example;
 		DEFINE INDEX IF NOT EXISTS example ON example FIELDS example;
+		DEFINE INDEX OVERWRITE example ON example FIELDS example;
 		DEFINE INDEX example ON example FIELDS example;
 		REMOVE INDEX IF EXISTS example ON example;
 		REMOVE INDEX example ON example;
@@ -2147,6 +2190,7 @@ async fn define_remove_indexes() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The index 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The index 'example' does not exist")?;
@@ -2159,6 +2203,7 @@ async fn define_remove_namespace() -> Result<(), Error> {
 	let sql = "
 		DEFINE NAMESPACE example;
 		DEFINE NAMESPACE IF NOT EXISTS example;
+		DEFINE NAMESPACE OVERWRITE example;
 		DEFINE NAMESPACE example;
 		REMOVE NAMESPACE IF EXISTS example;
 		REMOVE NAMESPACE example;
@@ -2167,6 +2212,7 @@ async fn define_remove_namespace() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The namespace 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The namespace 'example' does not exist")?;
@@ -2179,6 +2225,7 @@ async fn define_remove_param() -> Result<(), Error> {
 	let sql = "
 		DEFINE PARAM $example VALUE 123;
 		DEFINE PARAM IF NOT EXISTS $example VALUE 123;
+		DEFINE PARAM OVERWRITE $example VALUE 123;
 		DEFINE PARAM $example VALUE 123;
 		REMOVE PARAM IF EXISTS $example;
 		REMOVE PARAM $example;
@@ -2187,6 +2234,7 @@ async fn define_remove_param() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The param '$example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The param '$example' does not exist")?;
@@ -2199,6 +2247,7 @@ async fn define_remove_access() -> Result<(), Error> {
 	let sql = "
 		DEFINE ACCESS example ON DATABASE TYPE JWT ALGORITHM HS512 KEY 'secret';
 		DEFINE ACCESS IF NOT EXISTS example ON DATABASE TYPE JWT ALGORITHM HS512 KEY 'secret';
+		DEFINE ACCESS OVERWRITE example ON DATABASE TYPE JWT ALGORITHM HS512 KEY 'secret';
 		DEFINE ACCESS example ON DATABASE TYPE JWT ALGORITHM HS512 KEY 'secret';
 		REMOVE ACCESS IF EXISTS example ON DB;
 		REMOVE ACCESS example ON DB;
@@ -2207,6 +2256,7 @@ async fn define_remove_access() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The access method 'example' already exists in the database 'test'")?;
 	t.skip_ok(1)?;
 	t.expect_error("The access method 'example' does not exist in the database 'test'")?;
@@ -2219,6 +2269,7 @@ async fn define_remove_tables() -> Result<(), Error> {
 	let sql = "
 		DEFINE TABLE example;
 		DEFINE TABLE IF NOT EXISTS example;
+		DEFINE TABLE OVERWRITE example;
 		DEFINE TABLE example;
 		REMOVE TABLE IF EXISTS example;
 		REMOVE TABLE example;
@@ -2227,6 +2278,7 @@ async fn define_remove_tables() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The table 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The table 'example' does not exist")?;
@@ -2239,6 +2291,7 @@ async fn define_remove_users() -> Result<(), Error> {
 	let sql = "
 		DEFINE USER example ON ROOT PASSWORD \"example\" ROLES OWNER DURATION FOR TOKEN 15m, FOR SESSION 6h;
 		DEFINE USER IF NOT EXISTS example ON ROOT PASSWORD \"example\" ROLES OWNER DURATION FOR TOKEN 15m, FOR SESSION 6h;
+		DEFINE USER OVERWRITE example ON ROOT PASSWORD \"example\" ROLES OWNER DURATION FOR TOKEN 15m, FOR SESSION 6h;
 		DEFINE USER example ON ROOT PASSWORD \"example\" ROLES OWNER DURATION FOR TOKEN 15m, FOR SESSION 6h;
 		REMOVE USER IF EXISTS example ON ROOT;
 		REMOVE USER example ON ROOT;
@@ -2247,6 +2300,7 @@ async fn define_remove_users() -> Result<(), Error> {
 	let mut t = Test::new(sql).await?;
 	t.skip_ok(1)?;
 	t.expect_val("None")?;
+	t.skip_ok(1)?;
 	t.expect_error("The root user 'example' already exists")?;
 	t.skip_ok(1)?;
 	t.expect_error("The root user 'example' does not exist")?;

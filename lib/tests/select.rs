@@ -2,10 +2,10 @@ mod parse;
 use parse::Parse;
 mod helpers;
 use helpers::new_ds;
-use surrealdb::dbs::Session;
-use surrealdb::err::Error;
-use surrealdb::iam::Role;
-use surrealdb::sql::Value;
+use surrealdb_core::dbs::Session;
+use surrealdb_core::err::Error;
+use surrealdb_core::iam::Role;
+use surrealdb_core::sql::Value;
 
 #[tokio::test]
 async fn select_field_value() -> Result<(), Error> {
@@ -866,6 +866,8 @@ async fn common_permissions_checks(auth_enabled: bool) {
 	];
 	let statement = "SELECT * FROM person";
 
+	let empty_array = Value::parse("[]");
+
 	for ((level, role), (ns, db), should_succeed, msg) in tests.into_iter() {
 		let sess = Session::for_level(level, role).with_ns(ns).with_db(db);
 
@@ -879,7 +881,7 @@ async fn common_permissions_checks(auth_enabled: bool) {
 				.unwrap();
 			let res = resp.remove(0).output();
 			assert!(
-				res.is_ok() && res.unwrap() != Value::parse("[]"),
+				res.is_ok() && res.unwrap() != empty_array,
 				"unexpected error creating person record"
 			);
 			let mut resp = ds
@@ -888,7 +890,7 @@ async fn common_permissions_checks(auth_enabled: bool) {
 				.unwrap();
 			let res = resp.remove(0).output();
 			assert!(
-				res.is_ok() && res.unwrap() != Value::parse("[]"),
+				res.is_ok() && res.unwrap() != empty_array,
 				"unexpected error creating person record"
 			);
 			let mut resp = ds
@@ -897,7 +899,7 @@ async fn common_permissions_checks(auth_enabled: bool) {
 				.unwrap();
 			let res = resp.remove(0).output();
 			assert!(
-				res.is_ok() && res.unwrap() != Value::parse("[]"),
+				res.is_ok() && res.unwrap() != empty_array,
 				"unexpected error creating person record"
 			);
 
@@ -909,9 +911,9 @@ async fn common_permissions_checks(auth_enabled: bool) {
 			assert!(res.is_ok());
 
 			if should_succeed {
-				assert!(res.unwrap() != Value::parse("[]"), "{}", msg);
+				assert!(res.unwrap() != empty_array, "{}", msg);
 			} else {
-				assert!(res.unwrap() == Value::parse("[]"), "{}", msg);
+				assert!(res.unwrap() == empty_array, "{}", msg);
 			}
 		}
 	}
@@ -1153,5 +1155,146 @@ async fn select_issue_3510() -> Result<(), Error> {
 	//
 	let tmp = res.remove(0).result?;
 	assert_eq!(format!("{:#}", tmp), format!("{:#}", val));
+	Ok(())
+}
+
+#[tokio::test]
+async fn select_destructure() -> Result<(), Error> {
+	let sql = "
+		CREATE person:1 SET name = 'John', age = 21, obj = { a: 1, b: 2, c: { d: 3, e: 4, f: 5 } };
+		SELECT obj.{ a, c.{ e, f } } FROM person;
+		SELECT * OMIT obj.c.{ d, f } FROM person;
+	";
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
+	assert_eq!(res.len(), 3);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				id: person:1,
+				name: 'John',
+				age: 21,
+				obj: {
+                    a: 1,
+                    b: 2,
+                    c: {
+                        d: 3,
+                        e: 4,
+                        f: 5
+                    }
+                }
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				obj: {
+                    a: 1,
+                    c: {
+                        e: 4,
+                        f: 5
+                    }
+                }
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				id: person:1,
+				name: 'John',
+				age: 21,
+				obj: {
+                    a: 1,
+                    b: 2,
+                    c: { e: 4 }
+                }
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	Ok(())
+}
+
+#[tokio::test]
+async fn select_field_from_graph_no_flattening() -> Result<(), Error> {
+	let sql = "
+        CREATE a:1, a:2;
+
+        RELATE a:1->b:1->a:2 SET list = [1, 2, 3];
+        RELATE a:1->b:2->a:2 SET list = [4, 5, 6];
+
+        SELECT VALUE ->b.list FROM a:1;
+	";
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
+	assert_eq!(res.len(), 4);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+    		{ id: a:1 },
+    		{ id: a:2 }
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				id: b:1,
+				in: a:1,
+				out: a:2,
+				list: [1, 2, 3]
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+			{
+				id: b:2,
+				in: a:1,
+				out: a:2,
+				list: [4, 5, 6]
+			}
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
+	let tmp = res.remove(0).result?;
+	let val = Value::parse(
+		"[
+		    [
+    			[
+    			    1,
+                    2,
+                    3
+                ],
+                [
+                    4,
+                    5,
+                    6
+                ]
+			]
+		]",
+	);
+	assert_eq!(tmp, val);
+	//
 	Ok(())
 }
