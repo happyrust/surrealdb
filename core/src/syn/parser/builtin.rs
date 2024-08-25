@@ -224,10 +224,6 @@ pub(crate) static PATHS: phf::Map<UniCase<&'static str>, PathKind> = phf_map! {
 		UniCase::ascii("math::max_value") => PathKind::Function,
 		UniCase::ascii("math::min_value") => PathKind::Function,
 		//
-		UniCase::ascii("meta::id") => PathKind::Function,
-		UniCase::ascii("meta::table") => PathKind::Function,
-		UniCase::ascii("meta::tb") => PathKind::Function,
-		//
 		UniCase::ascii("not") => PathKind::Function,
 		//
 		UniCase::ascii("parse::email::host") => PathKind::Function,
@@ -252,6 +248,11 @@ pub(crate) static PATHS: phf::Map<UniCase<&'static str>, PathKind> = phf_map! {
 		UniCase::ascii("rand::uuid::v4") => PathKind::Function,
 		UniCase::ascii("rand::uuid::v7") => PathKind::Function,
 		UniCase::ascii("rand::uuid") => PathKind::Function,
+		//
+		UniCase::ascii("record::exists") => PathKind::Function,
+		UniCase::ascii("record::id") => PathKind::Function,
+		UniCase::ascii("record::table") => PathKind::Function,
+		UniCase::ascii("record::tb") => PathKind::Function,
 		//
 		UniCase::ascii("session::db") => PathKind::Function,
 		UniCase::ascii("session::id") => PathKind::Function,
