@@ -27,13 +27,7 @@ use channel::{Receiver, Sender};
 use futures::Future;
 use reblessive::TreeStack;
 use std::fmt;
-#[cfg(any(
-	feature = "kv-mem",
-	feature = "kv-surrealkv",
-	feature = "kv-rocksdb",
-	feature = "kv-fdb",
-	feature = "kv-tikv",
-))]
+#[cfg(storage)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,13 +76,7 @@ pub struct Datastore {
 	#[cfg(feature = "jwks")]
 	// The JWKS object cache
 	jwks_cache: Arc<RwLock<JwksCache>>,
-	#[cfg(any(
-		feature = "kv-mem",
-		feature = "kv-surrealkv",
-		feature = "kv-rocksdb",
-		feature = "kv-fdb",
-		feature = "kv-tikv",
-	))]
+	#[cfg(storage)]
 	// The temporary directory
 	temporary_directory: Option<Arc<PathBuf>>,
 }
@@ -153,6 +141,11 @@ impl TransactionFactory {
 				let tx = v.transaction(write, lock).await?;
 				super::tr::Inner::SurrealKV(tx)
 			}
+			#[cfg(feature = "kv-surrealcs")]
+			DatastoreFlavor::SurrealCS(v) => {
+				let tx = v.transaction(write, lock).await?;
+				super::tr::Inner::SurrealCS(tx)
+			}
 			#[allow(unreachable_patterns)]
 			_ => unreachable!(),
 		};
@@ -179,6 +172,8 @@ pub(super) enum DatastoreFlavor {
 	FoundationDB(super::fdb::Datastore),
 	#[cfg(feature = "kv-surrealkv")]
 	SurrealKV(super::surrealkv::Datastore),
+	#[cfg(feature = "kv-surrealcs")]
+	SurrealCS(super::surrealcs::Datastore),
 }
 
 impl fmt::Display for Datastore {
@@ -197,6 +192,8 @@ impl fmt::Display for Datastore {
 			DatastoreFlavor::FoundationDB(_) => write!(f, "fdb"),
 			#[cfg(feature = "kv-surrealkv")]
 			DatastoreFlavor::SurrealKV(_) => write!(f, "surrealkv"),
+			#[cfg(feature = "kv-surrealcs")]
+			DatastoreFlavor::SurrealCS(_) => write!(f, "surrealcs"),
 			#[allow(unreachable_patterns)]
 			_ => unreachable!(),
 		}
@@ -262,13 +259,7 @@ impl Datastore {
 			index_builder: IndexBuilder::new(self.transaction_factory.clone()),
 			#[cfg(feature = "jwks")]
 			jwks_cache: Arc::new(Default::default()),
-			#[cfg(any(
-				feature = "kv-mem",
-				feature = "kv-surrealkv",
-				feature = "kv-rocksdb",
-				feature = "kv-fdb",
-				feature = "kv-tikv",
-			))]
+			#[cfg(storage)]
 			temporary_directory: self.temporary_directory,
 			transaction_factory: self.transaction_factory,
 		}
@@ -325,6 +316,38 @@ impl Datastore {
 				#[cfg(not(feature = "kv-rocksdb"))]
                 return Err(Error::Ds("Cannot connect to the `rocksdb` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
 			}
+			// Parse and initiate a SurrealKV datastore
+			s if s.starts_with("surrealkv:") => {
+				#[cfg(feature = "kv-surrealkv")]
+				{
+					info!(target: TARGET, "Starting kvs store at {}", path);
+					let s = s.trim_start_matches("surrealkv://");
+					let s = s.trim_start_matches("surrealkv:");
+					let v =
+						super::surrealkv::Datastore::new(s).await.map(DatastoreFlavor::SurrealKV);
+					let c = clock.unwrap_or_else(|| Arc::new(SizedClock::system()));
+					info!(target: TARGET, "Started kvs store at {}", path);
+					Ok((v, c))
+				}
+				#[cfg(not(feature = "kv-surrealkv"))]
+                return Err(Error::Ds("Cannot connect to the `surrealkv` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
+			}
+			// Parse and initiate a SurrealCS datastore
+			s if s.starts_with("surrealcs:") => {
+				#[cfg(feature = "kv-surrealcs")]
+				{
+					info!(target: TARGET, "Starting kvs store at {}", path);
+					let s = s.trim_start_matches("surrealcs://");
+					let s = s.trim_start_matches("surrealcs:");
+					let v =
+						super::surrealcs::Datastore::new(s).await.map(DatastoreFlavor::SurrealCS);
+					let c = clock.unwrap_or_else(|| Arc::new(SizedClock::system()));
+					info!(target: TARGET, "Started kvs store at {}", path);
+					Ok((v, c))
+				}
+				#[cfg(not(feature = "kv-surrealcs"))]
+				return Err(Error::Ds("Cannot connect to the `surrealcs` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
+			}
 			// Parse and initiate an IndxDB database
 			s if s.starts_with("indxdb:") => {
 				#[cfg(feature = "kv-indxdb")]
@@ -370,22 +393,6 @@ impl Datastore {
 				#[cfg(not(feature = "kv-fdb"))]
                 return Err(Error::Ds("Cannot connect to the `foundationdb` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
 			}
-			// Parse and initiate a SurrealKV datastore
-			s if s.starts_with("surrealkv:") => {
-				#[cfg(feature = "kv-surrealkv")]
-				{
-					info!(target: TARGET, "Starting kvs store at {}", path);
-					let s = s.trim_start_matches("surrealkv://");
-					let s = s.trim_start_matches("surrealkv:");
-					let v =
-						super::surrealkv::Datastore::new(s).await.map(DatastoreFlavor::SurrealKV);
-					let c = clock.unwrap_or_else(|| Arc::new(SizedClock::system()));
-					info!(target: TARGET, "Started to kvs store at {}", path);
-					Ok((v, c))
-				}
-				#[cfg(not(feature = "kv-surrealkv"))]
-                return Err(Error::Ds("Cannot connect to the `surrealkv` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
-			}
 			// The datastore path is not valid
 			_ => {
 				info!(target: TARGET, "Unable to load the specified datastore {}", path);
@@ -412,13 +419,7 @@ impl Datastore {
 				index_builder: IndexBuilder::new(tf),
 				#[cfg(feature = "jwks")]
 				jwks_cache: Arc::new(RwLock::new(JwksCache::new())),
-				#[cfg(any(
-					feature = "kv-mem",
-					feature = "kv-surrealkv",
-					feature = "kv-rocksdb",
-					feature = "kv-fdb",
-					feature = "kv-tikv",
-				))]
+				#[cfg(storage)]
 				temporary_directory: None,
 			}
 		})
@@ -466,13 +467,7 @@ impl Datastore {
 		self
 	}
 
-	#[cfg(any(
-		feature = "kv-mem",
-		feature = "kv-surrealkv",
-		feature = "kv-rocksdb",
-		feature = "kv-fdb",
-		feature = "kv-tikv",
-	))]
+	#[cfg(storage)]
 	/// Set a temporary directory for ordering of large result sets
 	pub fn with_temporary_directory(mut self, path: Option<PathBuf>) -> Self {
 		self.temporary_directory = path.map(Arc::new);
@@ -510,12 +505,24 @@ impl Datastore {
 	// Initialise the cluster and run bootstrap utilities
 	#[instrument(err, level = "trace", target = "surrealdb::core::kvs::ds", skip_all)]
 	pub async fn check_version(&self) -> Result<Version, Error> {
+		let version = self.get_version().await?;
+		// Check we are running the latest version
+		if !version.is_latest() {
+			return Err(Error::OutdatedStorageVersion);
+		}
+		// Everything ok
+		Ok(version)
+	}
+
+	// Initialise the cluster and run bootstrap utilities
+	#[instrument(err, level = "trace", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub async fn get_version(&self) -> Result<Version, Error> {
 		// Start a new writeable transaction
 		let txn = self.transaction(Write, Pessimistic).await?.enclose();
 		// Create the key where the version is stored
 		let key = crate::key::version::new();
 		// Check if a version is already set in storage
-		let val = match catch!(txn, txn.get(key.clone(), None)) {
+		let val = match catch!(txn, txn.get(key.clone(), None).await) {
 			// There is a version set in the storage
 			Some(v) => {
 				// Attempt to decode the current stored version
@@ -530,14 +537,19 @@ impl Datastore {
 						return Err(err);
 					}
 					// We could decode the version correctly
-					Ok(val) => val,
+					Ok(val) => {
+						// We didn't write anything, so just rollback
+						txn.cancel().await?;
+						// Return the current version
+						val
+					}
 				}
 			}
 			// There is no version set in the storage
 			None => {
 				// Fetch any keys immediately following the version key
 				let rng = crate::key::version::proceeding();
-				let keys = catch!(txn, txn.keys(rng, 1));
+				let keys = catch!(txn, txn.keys(rng, 1).await);
 				// Check the storage if there are any other keys set
 				let val = if keys.is_empty() {
 					// There are no keys set in storage, so this is a new database
@@ -549,17 +561,13 @@ impl Datastore {
 				// Convert the version to binary
 				let bytes: Vec<u8> = val.into();
 				// Attempt to set the current version in storage
-				catch!(txn, txn.set(key, bytes, None));
+				catch!(txn, txn.set(key, bytes, None).await);
 				// We set the version, so commit the transaction
-				catch!(txn, txn.commit());
+				catch!(txn, txn.commit().await);
 				// Return the current version
 				val
 			}
 		};
-		// Check we are running the latest version
-		if !val.is_latest() {
-			return Err(Error::OutdatedStorageVersion);
-		}
 		// Everything ok
 		Ok(val)
 	}
@@ -570,7 +578,7 @@ impl Datastore {
 		// Start a new writeable transaction
 		let txn = self.transaction(Write, Optimistic).await?.enclose();
 		// Fetch the root users from the storage
-		let users = catch!(txn, txn.all_root_users());
+		let users = catch!(txn, txn.all_root_users().await);
 		// Process credentials, depending on existing users
 		if users.is_empty() {
 			// Display information in the logs
@@ -581,7 +589,7 @@ impl Datastore {
 			let mut ctx = MutableContext::default();
 			ctx.set_transaction(txn.clone());
 			let ctx = ctx.freeze();
-			catch!(txn, stm.compute(&ctx, &opt, None));
+			catch!(txn, stm.compute(&ctx, &opt, None).await);
 			// We added a user, so commit the transaction
 			txn.commit().await
 		} else {
@@ -814,13 +822,7 @@ impl Datastore {
 			self.index_stores.clone(),
 			#[cfg(not(target_arch = "wasm32"))]
 			self.index_builder.clone(),
-			#[cfg(any(
-				feature = "kv-mem",
-				feature = "kv-surrealkv",
-				feature = "kv-rocksdb",
-				feature = "kv-fdb",
-				feature = "kv-tikv",
-			))]
+			#[cfg(storage)]
 			self.temporary_directory.clone(),
 		)?;
 		// Setup the notification channel

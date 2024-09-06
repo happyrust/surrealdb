@@ -7,6 +7,7 @@ use crate::err::Error;
 use crate::fnc::util::string::fuzzy::Fuzzy;
 use crate::sql::id::range::IdRange;
 use crate::sql::kind::Literal;
+use crate::sql::range::OldRange;
 use crate::sql::statements::info::InfoStructure;
 use crate::sql::Closure;
 use crate::sql::{
@@ -82,7 +83,7 @@ impl From<&Tables> for Values {
 	}
 }
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 #[derive(Clone, Debug, Default, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Value")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -123,6 +124,9 @@ pub enum Value {
 	Regex(Regex),
 	Cast(Box<Cast>),
 	Block(Box<Block>),
+	#[revision(end = 2, convert_fn = "convert_old_range", fields_name = "OldValueRangeFields")]
+	Range(OldRange),
+	#[revision(start = 2)]
 	Range(Box<Range>),
 	Edges(Box<Edges>),
 	Future(Box<Future>),
@@ -134,6 +138,21 @@ pub enum Value {
 	Model(Box<Model>),
 	Closure(Box<Closure>),
 	// Add new variants here
+}
+
+impl Value {
+	fn convert_old_range(
+		fields: OldValueRangeFields,
+		_revision: u16,
+	) -> Result<Self, revision::Error> {
+		Ok(Value::Thing(Thing {
+			tb: fields.0.tb,
+			id: Id::Range(Box::new(IdRange {
+				beg: fields.0.beg,
+				end: fields.0.end,
+			})),
+		}))
+	}
 }
 
 impl Eq for Value {}
@@ -477,6 +496,12 @@ impl From<Vec<i32>> for Value {
 
 impl From<Vec<f32>> for Value {
 	fn from(v: Vec<f32>) -> Self {
+		Value::Array(Array::from(v))
+	}
+}
+
+impl From<Vec<usize>> for Value {
+	fn from(v: Vec<usize>) -> Self {
 		Value::Array(Array::from(v))
 	}
 }
@@ -1038,6 +1063,11 @@ impl Value {
 		matches!(self, Value::Thing(_))
 	}
 
+	/// Check if this Value is a Closure
+	pub fn is_closure(&self) -> bool {
+		matches!(self, Value::Closure(_))
+	}
+
 	/// Check if this Value is a Thing, and belongs to a certain table
 	pub fn is_record_of_table(&self, table: String) -> bool {
 		match self {
@@ -1131,6 +1161,14 @@ impl Value {
 			Value::Geometry(Geometry::Collection(_)) => {
 				types.iter().any(|t| matches!(t.as_str(), "feature" | "collection"))
 			}
+			_ => false,
+		}
+	}
+
+	pub fn is_single(&self) -> bool {
+		match self {
+			Value::Object(_) => true,
+			t @ Value::Thing(_) => t.is_thing_single(),
 			_ => false,
 		}
 	}
@@ -2986,6 +3024,23 @@ impl TryDiv for Value {
 	fn try_div(self, other: Self) -> Result<Self, Error> {
 		Ok(match (self, other) {
 			(Self::Number(v), Self::Number(w)) => Self::Number(v.try_div(w)?),
+			(v, w) => return Err(Error::TryDiv(v.to_raw_string(), w.to_raw_string())),
+		})
+	}
+}
+
+// ------------------------------
+
+pub(crate) trait TryFloatDiv<Rhs = Self> {
+	type Output;
+	fn try_float_div(self, v: Self) -> Result<Self::Output, Error>;
+}
+
+impl TryFloatDiv for Value {
+	type Output = Self;
+	fn try_float_div(self, other: Self) -> Result<Self::Output, Error> {
+		Ok(match (self, other) {
+			(Self::Number(v), Self::Number(w)) => Self::Number(v.try_float_div(w)?),
 			(v, w) => return Err(Error::TryDiv(v.to_raw_string(), w.to_raw_string())),
 		})
 	}

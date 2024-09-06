@@ -84,6 +84,10 @@ impl Datastore {
 		} else {
 			TransactionOptions::new_optimistic()
 		};
+		// Use async commit to determine transaction state earlier
+		opt = opt.use_async_commit();
+		// Try to use one-phase commit if writing to only one region
+		opt = opt.try_one_pc();
 		// Set the behaviour when dropping an unfinished transaction
 		opt = opt.drop_check(CheckLevel::Warn);
 		// Set this transaction as read only if possible
@@ -394,7 +398,7 @@ impl super::api::Transaction for Transaction {
 	where
 		K: Into<Key> + Sprintable + Debug,
 	{
-		// TiKV does not support verisoned queries.
+		// TiKV does not support versioned queries.
 		if version.is_some() {
 			return Err(Error::UnsupportedVersionedQueries);
 		}
