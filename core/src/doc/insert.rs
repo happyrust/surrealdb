@@ -58,7 +58,7 @@ impl Document {
 				// the ON DUPLICATE KEY UPDATE statement clause
 				Err(Error::RecordExists {
 					thing,
-				}) => match stm.is_retryable() {
+				}) => match stm.is_retryable() || stm.is_ignore() {
 					// There is an ON DUPLICATE KEY UPDATE clause
 					true => Err(Error::RetryWithId(thing)),
 					// There is no ON DUPLICATE KEY UPDATE clause

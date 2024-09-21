@@ -136,6 +136,11 @@ impl<'a> Statement<'a> {
 	pub fn is_retryable(&self) -> bool {
 		matches!(self, Statement::Insert(_) if self.data().is_some())
 	}
+
+	pub fn is_ignore(&self) -> bool {
+		matches!(self, Statement::Insert(insert) if insert.ignore)
+	}
+
 	/// Returns any query fields if specified
 	pub fn expr(&self) -> Option<&Fields> {
 		match self {
