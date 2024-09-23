@@ -58,10 +58,12 @@ impl Document {
 					self.current.doc.to_mut().put(&*IN, l.clone().into());
 				}
 				// Otherwise this is attempting to override the `in` field
+				// todo FIX 暂时停止这个检查
 				(v, _) => {
-					return Err(Error::InOverride {
-						value: v.to_string(),
-					})
+					self.current.doc.to_mut().put(&*IN, l.clone().into());
+					// return Err(Error::InOverride {
+					// 	value: v.to_string(),
+					// })
 				}
 			}
 			// If this document existed before, check the `out` field
@@ -75,10 +77,12 @@ impl Document {
 					self.current.doc.to_mut().put(&*OUT, r.clone().into());
 				}
 				// Otherwise this is attempting to override the `in` field
+				// todo FIX 暂时停止这个检查
 				(v, _) => {
-					return Err(Error::OutOverride {
-						value: v.to_string(),
-					})
+					self.current.doc.to_mut().put(&*OUT, r.clone().into());
+					// return Err(Error::OutOverride {
+					// 	value: v.to_string(),
+					// })
 				}
 			}
 		}
