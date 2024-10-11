@@ -237,6 +237,9 @@ pub(crate) static PATHS: phf::Map<UniCase<&'static str>, PathKind> = phf_map! {
 		UniCase::ascii("math::max_value") => PathKind::Function,
 		UniCase::ascii("math::min_value") => PathKind::Function,
 		//
+		UniCase::ascii("meta::id") => PathKind::Function,
+		UniCase::ascii("meta::tb") => PathKind::Function,
+		//
 		UniCase::ascii("not") => PathKind::Function,
 		//
 		UniCase::ascii("object::entries") => PathKind::Function,

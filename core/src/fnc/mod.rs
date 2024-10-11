@@ -243,6 +243,9 @@ pub fn synchronous(
 		"math::min_value" => math::min_value,
 
 		//
+		"meta::id" => record::id,
+		"meta::tb" => record::tb,
+		//
 		"not" => not::not,
 		//
 		"object::entries" => object::entries,
