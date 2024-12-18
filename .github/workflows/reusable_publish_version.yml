@@ -71,32 +71,6 @@ jobs:
       name: ${{ steps.outputs.outputs.name }}
       build-metadata: ${{ steps.outputs.outputs.build-metadata }}
     steps:
-      - name: Checkout 2.x sources
-        if: ${{ inputs.git-ref == 'patches/2.1' }}
-        uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Checkout beta sources
-        if: ${{ inputs.git-ref == 'releases/beta' }}
-        uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Create patch branch
-        if: ${{ inputs.git-ref == 'patches/2.1' }}
-        run: |
-          git push origin --delete patches/2.1 || true
-          git checkout -b patches/2.1
-          git push --set-upstream origin patches/2.1
-
-      - name: Create beta branch
-        if: ${{ inputs.git-ref == 'releases/beta' }}
-        run: |
-          git push origin --delete releases/beta || true
-          git checkout -b releases/beta
-          git push --set-upstream origin releases/beta
-
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -135,8 +109,8 @@ jobs:
 
             # Bump the crate version
             sed -i "s#^version = \".*\"#version = \"${version}\"#" Cargo.toml
-            sed -i "s#^version = \".*\"#version = \"${version}\"#" sdk/Cargo.toml
-            sed -i "s#^version = \".*\"#version = \"2.1.0-${version}\"#" core/Cargo.toml
+            sed -i "s#^version = \".*\"#version = \"${version}\"#" crates/sdk/Cargo.toml
+            sed -i "s#^version = \".*\"#version = \"2.1.0-${version}\"#" crates/core/Cargo.toml
 
             # Update dependency versions
             sed -i "s#surrealdb = { version = \"=${currentVersion}\"#surrealdb = { version = \"${major}\"#" Cargo.toml
@@ -174,7 +148,7 @@ jobs:
 
             # Update dependency versions
             sed -i "s#surrealdb = { version = \"=${currentVersion}\"#surrealdb = { version = \"=${betaVersion}\"#" Cargo.toml
-            sed -i "s#surrealdb-core2 = { version = \"=2.1.0-${currentVersion}\"#surrealdb-core2 = { version = \"=2.1.0-${betaVersion}\"#" sdk/Cargo.toml
+            sed -i "s#surrealdb-core2 = { version = \"=2.1.0-${currentVersion}\"#surrealdb-core2 = { version = \"=2.1.0-${betaVersion}\"#" crates/sdk/Cargo.toml
           else
             git checkout -b releases/beta
             major=$(echo $currentVersion | tr "." "\n" | sed -n 1p)
@@ -183,7 +157,7 @@ jobs:
 
             # Update dependency versions
             sed -i "s#surrealdb = { version = \"${major}\"#surrealdb = { version = \"=${betaVersion}\"#" Cargo.toml
-            sed -i "s#surrealdb-core2 = { version = \"=2.1.0-${currentVersion}\"#surrealdb-core2 = { version = \"=2.1.0-${betaVersion}\"#" sdk/Cargo.toml
+            sed -i "s#surrealdb-core2 = { version = \"=2.1.0-${currentVersion}\"#surrealdb-core2 = { version = \"=2.1.0-${betaVersion}\"#" crates/sdk/Cargo.toml
           fi
 
           # Bump the crate version
@@ -640,7 +614,7 @@ jobs:
 
       - name: Install release-plz
         run: |
-          curl -L https://github.com/MarcoIeni/release-plz/releases/download/release-plz-v0.3.30/release-plz-x86_64-unknown-linux-gnu.tar.gz | sudo tar -xz -C /usr/bin
+          curl -L https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.30/release-plz-x86_64-unknown-linux-gnu.tar.gz | sudo tar -xz -C /usr/bin
           sudo chmod +x /usr/bin/release-plz
 
       - name: Install a TOML parser
@@ -721,8 +695,15 @@ jobs:
           sed -i "0,/surrealdb/s//surrealdb-${{ inputs.environment }}/" crates/sdk/Cargo.toml
           sed -i "0,/surrealdb-core/s//surrealdb-core-${{ inputs.environment }}/" crates/core/Cargo.toml
 
+          # Patch binary dependency
+          sed -i "s/surrealdb =/surrealdb-${{ inputs.environment }} =/" Cargo.toml
+          sed -i "s/surrealdb-core =/surrealdb-core-${{ inputs.environment }} =/" Cargo.toml
+
+          # Patch features
+          sed -i "s#\"surrealdb/#\"surrealdb-${{ inputs.environment }}/#" Cargo.toml
+
           # Patch sdk dependency
-          sed -i "s#path = \"\.\./core\", package = \"surrealdb-core\"#path = \"../core\", package = \"surrealdb-core-${{ inputs.environment }}\"#" sdk/Cargo.toml
+          sed -i "s#path = \"\.\./core\", package = \"surrealdb-core\"#path = \"../core\", package = \"surrealdb-core-${{ inputs.environment }}\"#" crates/sdk/Cargo.toml
 
           # Patch the description
           sed -i "s#^description = \".*\"#description = \"A ${{ inputs.environment }} release of the surrealdb crate\"#" crates/sdk/Cargo.toml

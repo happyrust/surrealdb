@@ -156,7 +156,7 @@ impl<'a> KnnConditionRewriter<'a> {
 			| Part::Field(_)
 			| Part::Index(_)
 			| Part::Optional
-			| Part::Recurse(_, None)
+			| Part::Recurse(_, None, _)
 			| Part::Doc
 			| Part::RepeatRecurse => Some(p.clone()),
 			Part::Where(v) => self.eval_value(v).map(Part::Where),
@@ -165,9 +165,9 @@ impl<'a> KnnConditionRewriter<'a> {
 			Part::Start(v) => self.eval_value(v).map(Part::Start),
 			Part::Method(n, p) => self.eval_values(p).map(|v| Part::Method(n.clone(), v)),
 			Part::Destructure(p) => self.eval_destructure_parts(p).map(Part::Destructure),
-			Part::Recurse(r, Some(v)) => {
-				self.eval_idiom(v).map(|v| Part::Recurse(r.to_owned(), Some(v)))
-			}
+			Part::Recurse(r, Some(v), instruction) => self
+				.eval_idiom(v)
+				.map(|v| Part::Recurse(r.to_owned(), Some(v), instruction.to_owned())),
 		}
 	}
 
@@ -236,9 +236,9 @@ impl<'a> KnnConditionRewriter<'a> {
 			Function::Script(s, args) => {
 				self.eval_values(args).map(|args| Function::Script(s.clone(), args))
 			}
-			Function::Anonymous(p, args) => {
-				self.eval_values(args).map(|args| Function::Anonymous(p.clone(), args))
-			}
+			Function::Anonymous(p, args, args_computed) => self
+				.eval_values(args)
+				.map(|args| Function::Anonymous(p.clone(), args, args_computed.to_owned())),
 		}
 	}
 

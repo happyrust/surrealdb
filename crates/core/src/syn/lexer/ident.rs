@@ -10,7 +10,7 @@ use crate::syn::{
 
 use super::unicode::{chars, is_identifier_continue};
 
-impl<'a> Lexer<'a> {
+impl Lexer<'_> {
 	/// Lex a parameter in the form of `$[a-zA-Z0-9_]*`
 	///
 	/// # Lexer State
@@ -122,10 +122,8 @@ impl<'a> Lexer<'a> {
 						let err = syntax_error!("Invalid null byte in source, null bytes are not valid SurrealQL characters",@self.current_span());
 						return Err(err);
 					}
-					b'\\' if is_backtick => {
+					b'\\' => {
 						// handle escape sequences.
-						// This is compliant with the orignal parser which didn't permit
-						// escape sequences in `⟨⟩` surrounded idents.
 						let Some(next) = self.reader.next() else {
 							let end_char = if is_backtick {
 								'`'
@@ -160,17 +158,18 @@ impl<'a> Lexer<'a> {
 							b't' => {
 								self.scratch.push(chars::TAB);
 							}
-							_ => {
-								let char = self.reader.convert_to_char(x)?;
-								let error = if !is_backtick {
-									if char == '⟩' {
-										self.scratch.push(char);
-									}
-									syntax_error!("Invalid escape character `{x}` for identifier, valid characters are `⟩`, `\\`, ```, `/`, `b`, `f`, `n`, `r`, or `t`", @self.current_span())
+							next => {
+								let char = self.reader.convert_to_char(next)?;
+								if !is_backtick && char == '⟩' {
+									self.scratch.push(char);
 								} else {
-									syntax_error!("Invalid escape character `{x}` for identifier, valid characters are `\\`, ```, `/`, `b`, `f`, `n`, `r`, or `t`", @self.current_span())
-								};
-								return Err(error);
+									let error = if !is_backtick {
+										syntax_error!("Invalid escape character `{x}` for identifier, valid characters are `\\`, `⟩`, `/`, `b`, `f`, `n`, `r`, or `t`", @self.current_span())
+									} else {
+										syntax_error!("Invalid escape character `{x}` for identifier, valid characters are `\\`, ```, `/`, `b`, `f`, `n`, `r`, or `t`", @self.current_span())
+									};
+									return Err(error);
+								}
 							}
 						}
 					}

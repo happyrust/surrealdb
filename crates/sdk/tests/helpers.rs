@@ -1,9 +1,9 @@
+use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::thread::Builder;
-
 use surrealdb::dbs::capabilities::Capabilities;
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;
@@ -66,11 +66,12 @@ pub async fn iam_run_case(
 				);
 			}
 
-			let tmp = tmp.unwrap().to_string();
-			if tmp != check_expected_result[i] {
+			let tmp = tmp.unwrap();
+			let expected = value(check_expected_result[i])?;
+			if tmp != expected {
 				return Err(format!(
-					"Check statement failed for test: expected value '{}' doesn't match '{}'",
-					check_expected_result[i], tmp
+					"Check statement failed for test: expected value '{:#}' doesn't match '{:#}'",
+					expected, tmp
 				)
 				.into());
 			}
@@ -241,12 +242,8 @@ impl Debug for Test {
 }
 
 impl Test {
-	/// Creates a new instance of the `Self` struct with the given SQL query.
-	/// Arguments `sql` - A string slice representing the SQL query.
-	/// Panics if an error occurs.
 	#[allow(dead_code)]
-	pub async fn with_ds(ds: Datastore, sql: &str) -> Result<Self, Error> {
-		let session = Session::owner().with_ns("test").with_db("test");
+	pub async fn new_ds_session(ds: Datastore, session: Session, sql: &str) -> Result<Self, Error> {
 		let responses = ds.execute(sql, &session, None).await?;
 		Ok(Self {
 			ds,
@@ -257,8 +254,16 @@ impl Test {
 	}
 
 	#[allow(dead_code)]
+	pub async fn new_ds(ds: Datastore, sql: &str) -> Result<Self, Error> {
+		Self::new_ds_session(ds, Session::owner().with_ns("test").with_db("test"), sql).await
+	}
+
+	/// Creates a new instance of the `Self` struct with the given SQL query.
+	/// Arguments `sql` - A string slice representing the SQL query.
+	/// Panics if an error occurs.#[allow(dead_code)]
+	#[allow(dead_code)]
 	pub async fn new(sql: &str) -> Result<Self, Error> {
-		Self::with_ds(new_ds().await?, sql).await
+		Self::new_ds(new_ds().await?, sql).await
 	}
 
 	/// Simulates restarting the Datastore
@@ -266,7 +271,7 @@ impl Test {
 	/// - Flushing caches (jwks, IndexStore, ...)
 	#[allow(dead_code)]
 	pub async fn restart(self, sql: &str) -> Result<Self, Error> {
-		Self::with_ds(self.ds.restart(), sql).await
+		Self::new_ds(self.ds.restart(), sql).await
 	}
 
 	/// Checks if the number of responses matches the expected size.
@@ -340,6 +345,15 @@ impl Test {
 			assert_eq!(tmp, val, "{info} {tmp:#}");
 		}
 		//
+		Ok(self)
+	}
+
+	#[track_caller]
+	#[allow(dead_code)]
+	pub fn expect_regex(&mut self, regex: &str) -> Result<&mut Self, Error> {
+		let tmp = self.next_value()?.to_string();
+		let regex = Regex::new(regex)?;
+		assert!(regex.is_match(&tmp), "Output '{tmp}' doesn't match regex '{regex}'",);
 		Ok(self)
 	}
 

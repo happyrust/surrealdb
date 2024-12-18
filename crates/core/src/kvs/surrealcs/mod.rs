@@ -4,10 +4,8 @@ mod cnf;
 
 use crate::err::Error;
 use crate::key::debug::Sprintable;
-use crate::kvs::{
-	savepoint::{SaveOperation, SavePointImpl, SavePoints},
-	Check, Key, Val, Version,
-};
+use crate::kvs::savepoint::{SaveOperation, SavePointImpl, SavePoints};
+use crate::kvs::{Check, Key, Val};
 use futures::lock::Mutex;
 use std::fmt::Debug;
 use std::ops::Range;
@@ -22,12 +20,8 @@ use surrealcs::transactions::interface::interface::{
 	Any as AnyState, Transaction as SurrealCSTransaction,
 };
 
-/// The main struct that is used to interact with the database.
-#[derive(Clone)]
-#[non_exhaustive]
 pub struct Datastore {}
 
-#[non_exhaustive]
 pub struct Transaction {
 	/// Is the transaction complete?
 	done: bool,
@@ -46,11 +40,6 @@ pub struct Transaction {
 impl Drop for Transaction {
 	fn drop(&mut self) {
 		if !self.done && self.write {
-			// Check if already panicking
-			if std::thread::panicking() {
-				return;
-			}
-			// Handle the behaviour
 			match self.check {
 				Check::None => {
 					trace!("A transaction was dropped without being committed or cancelled");
@@ -58,15 +47,8 @@ impl Drop for Transaction {
 				Check::Warn => {
 					warn!("A transaction was dropped without being committed or cancelled");
 				}
-				Check::Panic => {
-					#[cfg(debug_assertions)]
-					{
-						let backtrace = std::backtrace::Backtrace::force_capture();
-						if let std::backtrace::BacktraceStatus::Captured = backtrace.status() {
-							println!("{}", backtrace);
-						}
-					}
-					panic!("A transaction was dropped without being committed or cancelled");
+				Check::Error => {
+					error!("A transaction was dropped without being committed or cancelled");
 				}
 			}
 		}
@@ -96,12 +78,19 @@ impl Datastore {
 	/// # Returns
 	/// the transaction
 	pub(crate) async fn transaction(&self, write: bool, _: bool) -> Result<Transaction, Error> {
+		// Create the underlying transaction
 		let transaction = SurrealCSTransaction::new().await;
 		let transaction = transaction.map_err(|e| Error::Tx(e.to_string()))?;
 		let transaction = transaction.into_any();
+		// Specify the check level
+		#[cfg(not(debug_assertions))]
+		let check = Check::Warn;
+		#[cfg(debug_assertions)]
+		let check = Check::Error;
+		// Create a new transaction
 		Ok(Transaction {
 			done: false,
-			check: Check::Warn,
+			check,
 			write,
 			started: false,
 			inner: Arc::new(Mutex::new(transaction)),
@@ -514,24 +503,6 @@ impl super::api::Transaction for Transaction {
 		};
 		// Return result
 		Ok(response.values)
-	}
-
-	/// Retrieve all the versions from a range of keys from the databases
-	/// This is a no-op for surrealcs.
-	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
-	async fn scan_all_versions<K>(
-		&mut self,
-		rng: Range<K>,
-		limit: u32,
-	) -> Result<Vec<(Key, Val, Version, bool)>, Error>
-	where
-		K: Into<Key> + Sprintable + Debug,
-	{
-		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
-		Err(Error::UnsupportedVersionedQueries)
 	}
 }
 

@@ -10,14 +10,13 @@ use crate::exe::try_join_all_buffered;
 use crate::fnc::idiom;
 use crate::sql::edges::Edges;
 use crate::sql::field::{Field, Fields};
-use crate::sql::id::Id;
 use crate::sql::part::{FindRecursionPlan, Next, NextMethod, SplitByRepeatRecurse};
 use crate::sql::part::{Part, Skip};
 use crate::sql::paths::ID;
 use crate::sql::statements::select::SelectStatement;
-use crate::sql::thing::Thing;
 use crate::sql::value::{Value, Values};
 use crate::sql::Function;
+use futures::future::try_join_all;
 use reblessive::tree::Stk;
 
 use super::idiom_recursion::{compute_idiom_recursion, Recursion};
@@ -40,7 +39,7 @@ impl Value {
 		}
 		match path.first() {
 			// The knowledge of the current value is not relevant to Part::Recurse
-			Some(Part::Recurse(recurse, inner_path)) => {
+			Some(Part::Recurse(recurse, inner_path, instruction)) => {
 				// Find the path to recurse and what path to process after the recursion is finished
 				let (path, after) = match inner_path {
 					Some(p) => (p.0.as_slice(), path.next().to_vec()),
@@ -56,12 +55,23 @@ impl Value {
 					// If we do not find a root-level repeat-recurse symbol, we
 					// can scan for a nested one. We only ever allow for a single
 					// repeat recurse symbol, hence the separate check.
-					_ => match path.find_recursion_plan() {
-						Some((path, plan, local_after)) => {
-							(path, Some(plan), [local_after, &after].concat())
+					_ => {
+						// If the user already specified a recursion instruction,
+						// we will not process any recursion plans.
+						if instruction.is_some() {
+							match path.find_recursion_plan() {
+								Some(_) => return Err(Error::RecursionInstructionPlanConflict),
+								_ => (path, None, after),
+							}
+						} else {
+							match path.find_recursion_plan() {
+								Some((path, plan, local_after)) => {
+									(path, Some(plan), [local_after, &after].concat())
+								}
+								_ => (path, None, after),
+							}
 						}
-						_ => (path, None, after),
-					},
+					}
 				};
 
 				// Collect the min & max for the recursion context
@@ -74,6 +84,7 @@ impl Value {
 					current: self,
 					path,
 					plan: plan.as_ref(),
+					instruction: instruction.as_ref(),
 				};
 
 				// Compute the recursion
@@ -127,10 +138,16 @@ impl Value {
 						stk.run(|stk| obj.get(stk, ctx, opt, doc, path)).await
 					}
 					Part::Method(name, args) => {
-						let v = stk
-							.run(|stk| {
-								idiom(stk, ctx, opt, doc, v.clone().into(), name, args.clone())
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
 							})
+							.await?;
+						let v = stk
+							.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
 							.await?;
 						stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 					}
@@ -159,27 +176,6 @@ impl Value {
 				}
 				// Current value at path is an object
 				Value::Object(v) => match p {
-					// If requesting an `id` field, check if it is a complex Record ID
-					Part::Field(f) if f.is_id() && path.len() > 1 => match v.get(f.as_str()) {
-						Some(Value::Thing(Thing {
-							id: Id::Object(v),
-							..
-						})) => {
-							let v = Value::Object(v.clone());
-							stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
-						}
-						Some(Value::Thing(Thing {
-							id: Id::Array(v),
-							..
-						})) => {
-							let v = Value::Array(v.clone());
-							stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
-						}
-						Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
-						None => {
-							stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next())).await
-						}
-					},
 					Part::Graph(_) => match v.rid() {
 						Some(v) => {
 							let v = Value::Thing(v);
@@ -231,6 +227,14 @@ impl Value {
 						stk.run(|stk| obj.get(stk, ctx, opt, doc, path.next())).await
 					}
 					Part::Method(name, args) => {
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
+							})
+							.await?;
 						let res = stk
 							.run(|stk| {
 								idiom(stk, ctx, opt, doc, v.clone().into(), name, args.clone())
@@ -242,7 +246,7 @@ impl Value {
 								..
 							}) => match v.get(name) {
 								Some(v) => {
-									let fnc = Function::Anonymous(v.clone(), args.clone());
+									let fnc = Function::Anonymous(v.clone(), a, true);
 									match stk.run(|stk| fnc.compute(stk, ctx, opt, doc)).await {
 										Ok(v) => Ok(v),
 										Err(Error::InvalidFunction {
@@ -332,10 +336,16 @@ impl Value {
 						_ => stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next())).await,
 					},
 					Part::Method(name, args) => {
-						let v = stk
-							.run(|stk| {
-								idiom(stk, ctx, opt, doc, v.clone().into(), name, args.clone())
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
 							})
+							.await?;
+						let v = stk
+							.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
 							.await?;
 						stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 					}
@@ -445,18 +455,15 @@ impl Value {
 								}
 							}
 							Part::Method(name, args) => {
-								let v = stk
-									.run(|stk| {
-										idiom(
-											stk,
-											ctx,
-											opt,
-											doc,
-											v.clone().into(),
-											name,
-											args.clone(),
-										)
+								let a = stk
+									.scope(|scope| {
+										try_join_all(args.iter().map(|v| {
+											scope.run(|stk| v.compute(stk, ctx, opt, doc))
+										}))
 									})
+									.await?;
+								let v = stk
+									.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
 									.await?;
 								stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 							}
@@ -499,8 +506,17 @@ impl Value {
 							stk.run(|stk| v.get(stk, ctx, opt, None, path.next())).await
 						}
 						Part::Method(name, args) => {
+							let a = stk
+								.scope(|scope| {
+									try_join_all(
+										args.iter().map(|v| {
+											scope.run(|stk| v.compute(stk, ctx, opt, doc))
+										}),
+									)
+								})
+								.await?;
 							let v = stk
-								.run(|stk| idiom(stk, ctx, opt, doc, v.clone(), name, args.clone()))
+								.run(|stk| idiom(stk, ctx, opt, doc, v.clone(), name, a))
 								.await?;
 							stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 						}
@@ -524,6 +540,7 @@ mod tests {
 	use super::*;
 	use crate::dbs::test::mock;
 	use crate::sql::idiom::Idiom;
+	use crate::sql::{Id, Thing};
 	use crate::syn::Parse;
 
 	#[tokio::test]

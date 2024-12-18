@@ -21,7 +21,7 @@ impl Document {
 	/// record belongs to. This functions loops
 	/// through the live queries and processes them
 	/// all within the currently running transaction.
-	pub async fn process_table_lives(
+	pub(super) async fn process_table_lives(
 		&mut self,
 		stk: &mut Stk,
 		ctx: &Context,
@@ -209,7 +209,7 @@ impl Document {
 		doc: &CursorDoc,
 	) -> Result<(), Error> {
 		// Check where condition
-		if let Some(cond) = stm.conds() {
+		if let Some(cond) = stm.cond() {
 			// Check if the expression is truthy
 			if !cond.compute(stk, ctx, opt, Some(doc)).await?.is_truthy() {
 				// Ignore this document
