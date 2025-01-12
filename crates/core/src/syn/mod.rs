@@ -48,6 +48,7 @@ pub fn parse(input: &str) -> Result<Query, Error> {
 	if input.len() > u32::MAX as usize {
 		return Err(Error::QueryTooLarge);
 	}
+	// println!("parse sql is {}", input);
 
 	let mut parser = Parser::new(input.as_bytes())
 		.with_object_recursion_limit(*MAX_OBJECT_PARSING_DEPTH as usize)

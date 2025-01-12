@@ -347,7 +347,7 @@ impl Connection {
 			// Return the required values
 			(id, format, shutdown, canceller, semaphore)
 		};
-		// Calculate the message lenght and format
+		// Calculate the message length and format
 		let (len, fmt) = match msg {
 			Message::Text(ref msg) => match fmt.is_none() {
 				true => {

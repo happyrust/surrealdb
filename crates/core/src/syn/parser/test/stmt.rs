@@ -97,7 +97,7 @@ pub fn parse_continue() {
 fn parse_create() {
 	let res = test_parse!(
 		parse_stmt,
-		"CREATE ONLY foo SET bar = 3, foo +?= baz RETURN VALUE foo AS bar TIMEOUT 1s PARALLEL"
+		"CREATE ONLY foo SET bar = '/ALL', foo +?= baz RETURN VALUE foo AS bar TIMEOUT 1s PARALLEL"
 	)
 	.unwrap();
 	assert_eq!(
