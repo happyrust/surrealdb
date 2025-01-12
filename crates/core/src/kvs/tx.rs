@@ -3,9 +3,11 @@ use super::tr::Check;
 use super::Convert;
 use super::Key;
 use super::Val;
+use super::Version;
 use crate::cnf::NORMAL_FETCH_SIZE;
 use crate::dbs::node::Node;
 use crate::err::Error;
+use crate::idx::trees::store::cache::IndexTreeCaches;
 use crate::kvs::cache;
 use crate::kvs::cache::tx::Cache;
 use crate::kvs::scanner::Scanner;
@@ -42,6 +44,8 @@ pub struct Transaction {
 	tx: Mutex<Transactor>,
 	/// The query cache for this store
 	cache: Cache,
+	/// Cache the index updates
+	index_caches: IndexTreeCaches,
 }
 
 impl Transaction {
@@ -50,6 +54,7 @@ impl Transaction {
 		Transaction {
 			tx: Mutex::new(tx),
 			cache: cache::tx::new(),
+			index_caches: IndexTreeCaches::default(),
 		}
 	}
 
@@ -68,9 +73,9 @@ impl Transaction {
 		self.tx.lock().await
 	}
 
-	/// Check if transaction is finished.
+	/// Check if the transaction is finished.
 	///
-	/// If the transaction has been cancelled or committed,
+	/// If the transaction has been canceled or committed,
 	/// then this function will return [`true`], and any further
 	/// calls to functions on this transaction will result
 	/// in a [`Error::TxFinished`] error.
@@ -301,32 +306,62 @@ impl Transaction {
 		self.lock().await.scan(rng, limit, version).await
 	}
 
+	/// Count the total number of keys within a range in the datastore.
+	///
+	/// This function fetches the total count, in batches, with multiple requests to the underlying datastore.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
+	pub async fn count<K>(&self, rng: Range<K>) -> Result<usize, Error>
+	where
+		K: Into<Key> + Debug,
+	{
+		self.lock().await.count(rng).await
+	}
+
+	/// Retrieve a batched scan over a specific range of keys in the datastore.
+	///
+	/// This function fetches the keys in batches, with multiple requests to the underlying datastore.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
+	pub async fn batch_keys<K>(
+		&self,
+		rng: Range<K>,
+		batch: u32,
+		version: Option<u64>,
+	) -> Result<Batch<Key>, Error>
+	where
+		K: Into<Key> + Debug,
+	{
+		self.lock().await.batch_keys(rng, batch, version).await
+	}
+
 	/// Retrieve a batched scan over a specific range of keys in the datastore.
 	///
 	/// This function fetches the key-value pairs in batches, with multiple requests to the underlying datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
-	pub async fn batch<K>(
+	pub async fn batch_keys_vals<K>(
 		&self,
 		rng: Range<K>,
 		batch: u32,
-		values: bool,
 		version: Option<u64>,
-	) -> Result<Batch, Error>
+	) -> Result<Batch<(Key, Val)>, Error>
 	where
 		K: Into<Key> + Debug,
 	{
-		self.lock().await.batch(rng, batch, values, version).await
+		self.lock().await.batch_keys_vals(rng, batch, version).await
 	}
 
-	/// Retrieve a batched scan to scan all versions over a specific range of keys in the datastore.
+	/// Retrieve a batched scan over a specific range of keys in the datastore.
 	///
-	/// This function fetches the key-value pairs in batches, with multiple requests to the underlying datastore.
+	/// This function fetches the key-value-version pairs in batches, with multiple requests to the underlying datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
-	pub async fn batch_versions<K>(&self, rng: Range<K>, batch: u32) -> Result<Batch, Error>
+	pub async fn batch_keys_vals_versions<K>(
+		&self,
+		rng: Range<K>,
+		batch: u32,
+	) -> Result<Batch<(Key, Val, Version, bool)>, Error>
 	where
 		K: Into<Key> + Debug,
 	{
-		self.lock().await.batch_versions(rng, batch).await
+		self.lock().await.batch_keys_vals_versions(rng, batch).await
 	}
 
 	/// Retrieve a stream over a specific range of keys in the datastore.
@@ -1792,5 +1827,9 @@ impl Transaction {
 			}
 		}
 		.try_into_type()
+	}
+
+	pub(crate) fn index_caches(&self) -> &IndexTreeCaches {
+		&self.index_caches
 	}
 }
