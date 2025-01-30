@@ -1,6 +1,5 @@
 use reblessive::Stk;
 
-use crate::cnf::EXPERIMENTAL_BEARER_ACCESS;
 use crate::sql::access_type::JwtAccessVerify;
 use crate::sql::index::HnswParams;
 use crate::sql::statements::define::config::graphql::{GraphQLConfig, TableConfig};
@@ -374,7 +373,7 @@ impl Parser<'_> {
 									}
 									t!("REFRESH") => {
 										// TODO(gguillemas): Remove this once bearer access is no longer experimental.
-										if !*EXPERIMENTAL_BEARER_ACCESS {
+										if !self.settings.bearer_access_enabled {
 											unexpected!(
 												self,
 												peek,
@@ -398,7 +397,7 @@ impl Parser<'_> {
 						}
 						t!("BEARER") => {
 							// TODO(gguillemas): Remove this once bearer access is no longer experimental.
-							if !*EXPERIMENTAL_BEARER_ACCESS {
+							if !self.settings.bearer_access_enabled {
 								unexpected!(
 									self,
 									peek,
@@ -890,6 +889,10 @@ impl Parser<'_> {
 				}
 				t!("DEFAULT") => {
 					self.pop_peek();
+					if self.eat(t!("ALWAYS")) {
+						res.default_always = true;
+					}
+
 					res.default = Some(ctx.run(|ctx| self.parse_value_field(ctx)).await?);
 				}
 				t!("PERMISSIONS") => {
