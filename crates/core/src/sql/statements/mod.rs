@@ -59,10 +59,10 @@ pub use self::upsert::UpsertStatement;
 pub use self::alter::{AlterStatement, AlterTableStatement};
 
 pub use self::define::{
-	DefineAccessStatement, DefineAnalyzerStatement, DefineDatabaseStatement, DefineEventStatement,
-	DefineFieldStatement, DefineFunctionStatement, DefineIndexStatement, DefineModelStatement,
-	DefineNamespaceStatement, DefineParamStatement, DefineStatement, DefineTableStatement,
-	DefineUserStatement,
+	DefineAccessStatement, DefineAnalyzerStatement, DefineApiStatement, DefineDatabaseStatement,
+	DefineEventStatement, DefineFieldStatement, DefineFunctionStatement, DefineIndexStatement,
+	DefineModelStatement, DefineNamespaceStatement, DefineParamStatement, DefineStatement,
+	DefineTableStatement, DefineUserStatement,
 };
 
 pub use self::rebuild::{RebuildIndexStatement, RebuildStatement};
@@ -73,3 +73,5 @@ pub use self::remove::{
 	RemoveNamespaceStatement, RemoveParamStatement, RemoveStatement, RemoveTableStatement,
 	RemoveUserStatement,
 };
+
+pub use self::define::FindApi;

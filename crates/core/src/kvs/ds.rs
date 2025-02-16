@@ -6,7 +6,9 @@ use crate::cf;
 use crate::ctx::MutableContext;
 #[cfg(feature = "jwks")]
 use crate::dbs::capabilities::NetTarget;
-use crate::dbs::capabilities::{ExperimentalTarget, MethodTarget, RouteTarget};
+use crate::dbs::capabilities::{
+	ArbitraryQueryTarget, ExperimentalTarget, MethodTarget, RouteTarget,
+};
 use crate::dbs::node::Timestamp;
 use crate::dbs::{
 	Attach, Capabilities, Executor, Notification, Options, Response, Session, Variables,
@@ -71,7 +73,7 @@ pub struct Datastore {
 	/// The maximum duration timeout for running multiple statements in a transaction.
 	transaction_timeout: Option<Duration>,
 	/// The security and feature capabilities for this datastore.
-	capabilities: Capabilities,
+	capabilities: Arc<Capabilities>,
 	// Whether this datastore enables live query notifications to subscribers.
 	notification_channel: Option<(Sender<Notification>, Receiver<Notification>)>,
 	// The index store cache
@@ -412,7 +414,7 @@ impl Datastore {
 				query_timeout: None,
 				transaction_timeout: None,
 				notification_channel: None,
-				capabilities: Capabilities::default(),
+				capabilities: Arc::new(Capabilities::default()),
 				index_stores: IndexStores::default(),
 				#[cfg(not(target_family = "wasm"))]
 				index_builder: IndexBuilder::new(tf),
@@ -487,7 +489,7 @@ impl Datastore {
 
 	/// Set specific capabilities for this Datastore
 	pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
-		self.capabilities = caps;
+		self.capabilities = Arc::new(caps);
 		self
 	}
 
@@ -520,6 +522,12 @@ impl Datastore {
 	/// This function needs to be public to allow access from the CLI crate.
 	pub fn allows_http_route(&self, route_target: &RouteTarget) -> bool {
 		self.capabilities.allows_http_route(route_target)
+	}
+
+	/// Does the datastore allow requesting an HTTP route?
+	/// This function needs to be public to allow access from the CLI crate.
+	pub fn allows_query_by_subject(&self, subject: impl Into<ArbitraryQueryTarget>) -> bool {
+		self.capabilities.allows_query(&subject.into())
 	}
 
 	/// Does the datastore allow connections to a network target?
@@ -847,6 +855,9 @@ impl Datastore {
 			bearer_access_enabled: ctx
 				.get_capabilities()
 				.allows_experimental(&ExperimentalTarget::BearerAccess),
+			define_api_enabled: ctx
+				.get_capabilities()
+				.allows_experimental(&ExperimentalTarget::DefineApi),
 			..Default::default()
 		};
 		let mut statements_stream = StatementStream::new_with_settings(parser_settings);
