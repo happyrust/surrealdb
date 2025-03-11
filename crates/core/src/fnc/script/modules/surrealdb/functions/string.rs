@@ -38,5 +38,5 @@ impl_module_def!(
 
 	//e3d functions
 	"e3d_dehash" => run,
-	"e3d_hash" => run,
+	"e3d_hash" => run
 );
