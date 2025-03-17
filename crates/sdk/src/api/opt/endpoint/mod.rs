@@ -41,7 +41,7 @@ impl Endpoint {
 		Self {
 			url,
 			path: String::new(),
-			config: Default::default(),
+			config: Config::default().ast_payload(),
 		}
 	}
 

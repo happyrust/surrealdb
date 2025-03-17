@@ -30,7 +30,7 @@ pub struct Config {
 impl Config {
 	/// Create a default config that can be modified to configure a connection
 	pub fn new() -> Self {
-		Default::default()
+		 Default::default()
 	}
 
 	/// Set the strict value of the config to the supplied value
