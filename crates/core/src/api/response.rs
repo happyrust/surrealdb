@@ -3,7 +3,11 @@ use http::{
 	HeaderMap, StatusCode,
 };
 
-use crate::{err::Error, rpc::format::Format, sql::Value};
+use crate::{
+	err::Error,
+	rpc::format::Format,
+	sql::{Object, Value},
+};
 
 use super::{err::ApiError, invocation::ApiInvocation};
 
@@ -19,12 +23,12 @@ impl TryFrom<Value> for ApiResponse {
 	type Error = Error;
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		if let Value::Object(mut opts) = value {
-			let raw = opts.remove("raw").map(|v| v.convert_to_bool()).transpose()?;
+			let raw = opts.remove("raw").map(|v| v.cast_to()).transpose()?;
 			let status = opts
 				.remove("status")
 				.map(|v| -> Result<StatusCode, Error> {
 					// Convert to int
-					let v: i64 = v.coerce_to_int()?.as_int();
+					let v: i64 = v.coerce_to()?;
 
 					// Convert to u16
 					let v: u16 = v
@@ -42,13 +46,13 @@ impl TryFrom<Value> for ApiResponse {
 
 			let headers = opts
 				.remove("headers")
-				.map(|v| v.coerce_to_object()?.try_into())
+				.map(|v| v.coerce_to::<Object>()?.try_into())
 				.transpose()?
 				.unwrap_or_default();
 
 			let body = opts.remove("body");
 
-			if opts.len() > 0 {
+			if !opts.is_empty() {
 				Err(ApiError::InvalidApiResponse("Contains invalid properties".into()).into())
 			} else {
 				Ok(Self {
@@ -96,7 +100,6 @@ impl ResponseInstruction {
 		let format = match mime {
 			Some("application/json") => Format::Json,
 			Some("application/cbor") => Format::Cbor,
-			Some("application/pack") => Format::Msgpack,
 			Some("application/surrealdb") => Format::Revision,
 			Some(_) => return Err(Error::ApiError(ApiError::InvalidFormat)),
 			_ => return Err(Error::ApiError(ApiError::MissingFormat)),

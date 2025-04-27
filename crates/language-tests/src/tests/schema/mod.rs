@@ -4,11 +4,13 @@ mod bytes_hack;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
-use camino::Utf8PathBuf;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use surrealdb_core::{
-	dbs::capabilities::{ExperimentalTarget, FuncTarget, MethodTarget, NetTarget, RouteTarget},
-	sql::Value as CoreValue,
+	dbs::capabilities::{
+		Capabilities as CoreCapabilities, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget,
+		RouteTarget, Targets,
+	},
+	sql::{Thing, Value as CoreValue},
 	syn,
 };
 
@@ -24,16 +26,6 @@ pub struct TestConfig {
 }
 
 impl TestConfig {
-	/// Returns the namespace if the environement specifies one, none otherwise
-	pub fn namespace(&self) -> Option<&str> {
-		self.env.as_ref().map(|x| x.namespace()).unwrap_or(Some("test"))
-	}
-
-	/// Returns the namespace if the environement specifies one, none otherwise
-	pub fn database(&self) -> Option<&str> {
-		self.env.as_ref().map(|x| x.database()).unwrap_or(Some("test"))
-	}
-
 	/// Returns true if the test should be run.
 	/// returns false if the test is configured to be skipped.
 	pub fn should_run(&self) -> bool {
@@ -49,7 +41,7 @@ impl TestConfig {
 	}
 
 	/// Returns the imports for this file, empty if no imports are defined.
-	pub fn imports(&self) -> &[Utf8PathBuf] {
+	pub fn imports(&self) -> &[String] {
 		self.env.as_ref().and_then(|x| x.imports.as_ref()).map(|x| x.as_slice()).unwrap_or(&[])
 	}
 
@@ -86,9 +78,16 @@ pub struct TestEnv {
 	pub sequential: bool,
 	#[serde(default)]
 	pub clean: bool,
+
+	#[serde(default)]
+	pub auth: bool,
+
 	pub namespace: Option<BoolOr<String>>,
 	pub database: Option<BoolOr<String>>,
-	pub imports: Option<Vec<Utf8PathBuf>>,
+
+	pub login: Option<TestLogin>,
+
+	pub imports: Option<Vec<String>>,
 	pub timeout: Option<BoolOr<u64>>,
 	pub capabilities: Option<BoolOr<Capabilities>>,
 
@@ -162,8 +161,11 @@ pub struct ErrorTestResult {
 #[serde(rename_all = "kebab-case")]
 pub struct ValueTestResult {
 	pub value: SurrealValue,
+	#[serde(default)]
 	pub skip_datetime: Option<bool>,
+	#[serde(default)]
 	pub skip_record_id_key: Option<bool>,
+	#[serde(default)]
 	pub skip_uuid: Option<bool>,
 }
 
@@ -172,6 +174,7 @@ pub struct ValueTestResult {
 pub struct MatchTestResult {
 	#[serde(rename = "match")]
 	pub _match: SurrealValue,
+	#[serde(default)]
 	pub error: Option<bool>,
 }
 
@@ -221,6 +224,30 @@ impl<T> BoolOr<T> {
 	}
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct Version(semver::VersionReq);
+
+impl<'de> Deserialize<'de> for Version {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let str = String::deserialize(deserializer)?;
+		let version = semver::VersionReq::parse(&str).map_err(<D::Error as de::Error>::custom)?;
+		Ok(Version(version))
+	}
+}
+
+impl Serialize for Version {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let str = self.0.to_string();
+		str.serialize(serializer)
+	}
+}
+
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TestDetails {
@@ -230,6 +257,11 @@ pub struct TestDetails {
 	issue: Option<u64>,
 	wip: Option<bool>,
 	pub fuzzing_reproduction: Option<String>,
+
+	#[serde(default)]
+	pub is_upgrade: bool,
+
+	pub version: Option<Version>,
 
 	#[serde(skip_serializing)]
 	#[serde(flatten)]
@@ -303,10 +335,90 @@ impl<'de> Deserialize<'de> for SurrealValue {
 		D: serde::Deserializer<'de>,
 	{
 		let source = String::deserialize(deserializer)?;
-		let mut v = syn::value(&source).map_err(<D::Error as serde::de::Error>::custom)?;
+		let capabilities = CoreCapabilities::all().with_experimental(Targets::All);
+		let mut v = syn::value_with_capabilities(&source, &capabilities)
+			.map_err(<D::Error as serde::de::Error>::custom)?;
 		bytes_hack::compute_bytes_inplace(&mut v);
 		Ok(SurrealValue(v))
 	}
+}
+
+#[derive(Clone, Debug)]
+pub struct SurrealRecordId(pub Thing);
+
+impl Serialize for SurrealRecordId {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let v = self.0.to_string();
+		v.serialize(serializer)
+	}
+}
+
+impl<'de> Deserialize<'de> for SurrealRecordId {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let source = String::deserialize(deserializer)?;
+		let capabilities = CoreCapabilities::all().with_experimental(Targets::All);
+		let v = syn::value_with_capabilities(&source, &capabilities)
+			.map_err(<D::Error as serde::de::Error>::custom)?;
+		if let CoreValue::Thing(x) = v {
+			Ok(SurrealRecordId(x))
+		} else {
+			Err(<D::Error as serde::de::Error>::custom(format_args!(
+				"Expected a record-id, found '{source}'"
+			)))
+		}
+	}
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+#[serde(rename_all = "kebab-case")]
+pub enum TestLogin {
+	Leveled(TestLeveledLogin),
+	Record(TestRecordLogin),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TestLeveledLogin {
+	pub level: TestLevel,
+	pub role: Option<TestRole>,
+
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TestRole {
+	Viewer,
+	Editor,
+	Owner,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TestLevel {
+	Root,
+	Namespace,
+	Database,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TestRecordLogin {
+	pub access: String,
+	pub rid: SurrealRecordId,
+
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

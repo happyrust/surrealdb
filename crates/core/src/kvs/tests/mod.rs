@@ -5,7 +5,6 @@
 	feature = "kv-tikv",
 	feature = "kv-fdb",
 	feature = "kv-surrealkv",
-	feature = "kv-surrealcs",
 ))]
 
 use super::Datastore;
@@ -26,25 +25,27 @@ mod multiwriter_different_keys;
 mod multiwriter_same_keys_allow;
 mod multiwriter_same_keys_conflict;
 mod raw;
+#[cfg(any(feature = "kv-rocksdb", feature = "kv-tikv"))]
+mod reverse_iterator;
 mod snapshot;
 mod timestamp_to_versionstamp;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Kvs {
-	#[allow(dead_code)]
+	#[cfg_attr(not(feature = "kv-mem"), expect(dead_code))]
 	Mem,
-	#[allow(dead_code)]
+	#[cfg_attr(not(feature = "kv-rocksdb"), expect(dead_code))]
 	Rocksdb,
-	#[allow(dead_code)]
+	#[cfg_attr(not(feature = "kv-tikv"), expect(dead_code))]
 	Tikv,
-	#[allow(dead_code)]
+	#[cfg_attr(not(feature = "kv-fdb"), expect(dead_code))]
 	Fdb,
-	#[allow(dead_code)]
+	#[cfg_attr(not(feature = "kv-surrealkv"), expect(dead_code))]
 	SurrealKV,
 }
 
 // This type is unsused when no store is enabled.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 type ClockType = Arc<SizedClock>;
 
 trait CreateDs {
@@ -97,7 +98,7 @@ mod rocksdb {
 		(ds, Kvs::Rocksdb)
 	}
 
-	include_tests!(new_ds => raw,snapshot,multireader,multiwriter_different_keys,multiwriter_same_keys_conflict,timestamp_to_versionstamp);
+	include_tests!(new_ds => raw,snapshot,multireader,multiwriter_different_keys,multiwriter_same_keys_conflict,timestamp_to_versionstamp,reverse_iterator);
 }
 
 #[cfg(feature = "kv-surrealkv")]
@@ -140,7 +141,7 @@ mod tikv {
 		(ds, Kvs::Tikv)
 	}
 
-	include_tests!(new_ds => raw,snapshot,multireader,multiwriter_different_keys,multiwriter_same_keys_allow,timestamp_to_versionstamp);
+	include_tests!(new_ds => raw,snapshot,multireader,multiwriter_different_keys,multiwriter_same_keys_allow,timestamp_to_versionstamp,reverse_iterator);
 }
 
 #[cfg(feature = "kv-fdb")]

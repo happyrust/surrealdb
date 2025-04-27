@@ -5,7 +5,7 @@ use crate::err::Error;
 use crate::iam::{Action, ResourceKind};
 use crate::sql::statements::info::InfoStructure;
 use crate::sql::{
-	escape::quote_str, fmt::Fmt, user::UserDuration, Base, Duration, Ident, Strand, Value,
+	escape::QuoteStr, fmt::Fmt, user::UserDuration, Base, Duration, Ident, Strand, Value,
 };
 use argon2::{
 	password_hash::{PasswordHasher, SaltString},
@@ -36,6 +36,7 @@ pub struct DefineUserStatement {
 	pub overwrite: bool,
 }
 
+#[expect(clippy::fallible_impl_from)]
 impl From<(Base, &str, &str, &str)> for DefineUserStatement {
 	fn from((base, user, pass, role): (Base, &str, &str, &str)) -> Self {
 		DefineUserStatement {
@@ -230,7 +231,7 @@ impl Display for DefineUserStatement {
 			" {} ON {} PASSHASH {} ROLES {}",
 			self.name,
 			self.base,
-			quote_str(&self.hash),
+			QuoteStr(&self.hash),
 			Fmt::comma_separated(
 				&self.roles.iter().map(|r| r.to_string().to_uppercase()).collect::<Vec<String>>()
 			),

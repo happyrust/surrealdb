@@ -10,6 +10,8 @@ use rand::prelude::IteratorRandom;
 use rand::Rng;
 use ulid::Ulid;
 
+use super::args::{Any, Args, Arity, FromArg, Optional};
+
 pub fn rand(_: ()) -> Result<Value, Error> {
 	Ok(rand::random::<f64>().into())
 }
@@ -18,7 +20,7 @@ pub fn bool(_: ()) -> Result<Value, Error> {
 	Ok(rand::random::<bool>().into())
 }
 
-pub fn r#enum(mut args: Vec<Value>) -> Result<Value, Error> {
+pub fn r#enum(Any(mut args): Any) -> Result<Value, Error> {
 	Ok(match args.len() {
 		0 => Value::None,
 		1 => match args.remove(0) {
@@ -29,8 +31,45 @@ pub fn r#enum(mut args: Vec<Value>) -> Result<Value, Error> {
 	})
 }
 
-pub fn float((range,): (Option<(f64, f64)>,)) -> Result<Value, Error> {
-	Ok(if let Some((min, max)) = range {
+pub struct NoneOrRange<T>(Option<(T, T)>);
+
+impl<T: FromArg> FromArg for NoneOrRange<T> {
+	fn arity() -> Arity {
+		Arity {
+			lower: 0,
+			upper: Some(2),
+		}
+	}
+
+	fn from_arg(name: &str, args: &mut Args) -> Result<Self, Error> {
+		if !args.has_next() {
+			return Ok(NoneOrRange(None));
+		}
+
+		let a = T::from_arg(name, args)?;
+
+		if !args.has_next() {
+			return Err(Error::InvalidArguments {
+				name: name.to_owned(),
+				message: "Expected 0 or 2 arguments".to_string(),
+			});
+		}
+
+		let b = T::from_arg(name, args)?;
+
+		Ok(NoneOrRange(Some((a, b))))
+	}
+}
+
+// TODO (Delskayn): Don't agree with the inclusive ranges in the functions here,
+// seems inconsistent with general use of ranges not including the upperbound.
+// These should probably all be exclusive.
+//
+// TODO (Delskayn): Switching of min and max if min > max is also inconsistent with rest of
+// functions and the range type. The functions should either return NONE or an error if the lowerbound
+// of the ranges here are larger then the upperbound.
+pub fn float((NoneOrRange(range),): (NoneOrRange<f64>,)) -> Result<Value, Error> {
+	let v = if let Some((min, max)) = range {
 		if max < min {
 			rand::thread_rng().gen_range(max..=min)
 		} else {
@@ -38,46 +77,49 @@ pub fn float((range,): (Option<(f64, f64)>,)) -> Result<Value, Error> {
 		}
 	} else {
 		rand::random::<f64>()
-	}
-	.into())
+	};
+	Ok(Value::from(v))
 }
 
-pub fn guid((arg1, arg2): (Option<i64>, Option<i64>)) -> Result<Value, Error> {
+pub fn guid(
+	(Optional(arg1), Optional(arg2)): (Optional<i64>, Optional<i64>),
+) -> Result<Value, Error> {
 	// Set a reasonable maximum length
 	const LIMIT: i64 = 64;
-	// Check the function input arguments
-	let val = if let Some((min, max)) = arg1.zip(arg2) {
-		match min {
-			min if (1..=LIMIT).contains(&min) => match max {
-				max if min <= max && max <= LIMIT => rand::thread_rng().gen_range(min as usize..=max as usize),
-				max if max >= 1 && max <= min => rand::thread_rng().gen_range(max as usize..=min as usize),
-				_ => return Err(Error::InvalidArguments {
-					name: String::from("rand::guid"),
-					message: format!("To generate a guid of between X and Y characters in length, the 2 arguments must be positive numbers and no higher than {LIMIT}."),
-				}),
-			},
-			_ => return Err(Error::InvalidArguments {
+
+	// rand::guid(NULL,10) is not allowed by the calling infrastructure.
+	let lower = arg1.unwrap_or(20);
+	let len = if let Some(upper) = arg2 {
+		if lower > upper {
+			return Err(Error::InvalidArguments {
 				name: String::from("rand::guid"),
-				message: format!("To generate a string of between X and Y characters in length, the 2 arguments must be positive numbers and no higher than {LIMIT}."),
-			}),
+				message: "Lowerbound of number of characters must be less then the upperbound."
+					.to_string(),
+			});
 		}
-	} else if let Some(len) = arg1 {
-		if (1..=LIMIT).contains(&len) {
-			len as usize
-		} else {
+		if upper > LIMIT {
 			return Err(Error::InvalidArguments {
 				name: String::from("rand::guid"),
 				message: format!("To generate a string of X characters in length, the argument must be a positive number and no higher than {LIMIT}."),
 			});
 		}
+
+		rand::thread_rng().gen_range((lower as usize)..=(upper as usize))
 	} else {
-		20
+		if lower > LIMIT {
+			return Err(Error::InvalidArguments {
+			name: String::from("rand::guid"),
+			message: format!("To generate a string of X characters in length, the argument must be a positive number and no higher than {LIMIT}."),
+		});
+		}
+		lower as usize
 	};
+
 	// Generate the random guid
-	Ok(nanoid!(val, &ID_CHARS).into())
+	Ok(nanoid!(len, &ID_CHARS).into())
 }
 
-pub fn int((range,): (Option<(i64, i64)>,)) -> Result<Value, Error> {
+pub fn int((NoneOrRange(range),): (NoneOrRange<i64>,)) -> Result<Value, Error> {
 	Ok(if let Some((min, max)) = range {
 		if max < min {
 			rand::thread_rng().gen_range(max..=min)
@@ -90,42 +132,43 @@ pub fn int((range,): (Option<(i64, i64)>,)) -> Result<Value, Error> {
 	.into())
 }
 
-pub fn string((arg1, arg2): (Option<i64>, Option<i64>)) -> Result<Value, Error> {
+pub fn string(
+	(Optional(arg1), Optional(arg2)): (Optional<i64>, Optional<i64>),
+) -> Result<Value, Error> {
 	// Set a reasonable maximum length
 	const LIMIT: i64 = 65536;
-	// Check the function input arguments
-	let val = if let Some((min, max)) = arg1.zip(arg2) {
-		match min {
-			min if (1..=LIMIT).contains(&min) => match max {
-				max if min <= max && max <= LIMIT => rand::thread_rng().gen_range(min as usize..=max as usize),
-				max if max >= 1 && max <= min => rand::thread_rng().gen_range(max as usize..=min as usize),
-				_ => return Err(Error::InvalidArguments {
-					name: String::from("rand::string"),
-					message: format!("To generate a string of between X and Y characters in length, the 2 arguments must be positive numbers and no higher than {LIMIT}."),
-				}),
-			},
-			_ => return Err(Error::InvalidArguments {
-				name: String::from("rand::string"),
-				message: format!("To generate a string of between X and Y characters in length, the 2 arguments must be positive numbers and no higher than {LIMIT}."),
-			}),
-		}
-	} else if let Some(len) = arg1 {
-		if (1..=LIMIT).contains(&len) {
-			len as usize
-		} else {
+	// rand::guid(NULL,10) is not allowed by the calling infrastructure.
+	let lower = arg1.unwrap_or(32);
+	let len = if let Some(upper) = arg2 {
+		if lower > upper {
 			return Err(Error::InvalidArguments {
-				name: String::from("rand::string"),
+				name: String::from("rand::guid"),
+				message: "Lowerbound of number of characters must be less then the upperbound."
+					.to_string(),
+			});
+		}
+		if upper > LIMIT {
+			return Err(Error::InvalidArguments {
+				name: String::from("rand::guid"),
 				message: format!("To generate a string of X characters in length, the argument must be a positive number and no higher than {LIMIT}."),
 			});
 		}
+
+		rand::thread_rng().gen_range((lower as usize)..=(upper as usize))
 	} else {
-		32
+		if lower > LIMIT {
+			return Err(Error::InvalidArguments {
+			name: String::from("rand::guid"),
+			message: format!("To generate a string of X characters in length, the argument must be a positive number and no higher than {LIMIT}."),
+		});
+		}
+		lower as usize
 	};
 	// Generate the random string
-	Ok(Alphanumeric.sample_string(&mut rand::thread_rng(), val).into())
+	Ok(Alphanumeric.sample_string(&mut rand::thread_rng(), len).into())
 }
 
-pub fn time((range,): (Option<(Value, Value)>,)) -> Result<Value, Error> {
+pub fn time((NoneOrRange(range),): (NoneOrRange<Value>,)) -> Result<Value, Error> {
 	// Process the arguments
 	let range = match range {
 		None => None,
@@ -182,7 +225,7 @@ pub fn time((range,): (Option<(Value, Value)>,)) -> Result<Value, Error> {
 	Err(fail!("Expected a valid datetime, but were unable to generate one"))
 }
 
-pub fn ulid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
+pub fn ulid((Optional(timestamp),): (Optional<Datetime>,)) -> Result<Value, Error> {
 	let ulid = match timestamp {
 		Some(timestamp) => {
 			#[cfg(target_family = "wasm")]
@@ -203,7 +246,7 @@ pub fn ulid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
 	Ok(ulid.to_string().into())
 }
 
-pub fn uuid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
+pub fn uuid((Optional(timestamp),): (Optional<Datetime>,)) -> Result<Value, Error> {
 	let uuid = match timestamp {
 		Some(timestamp) => {
 			#[cfg(target_family = "wasm")]
@@ -226,6 +269,7 @@ pub fn uuid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
 pub mod uuid {
 
 	use crate::err::Error;
+	use crate::fnc::args::Optional;
 	use crate::sql::uuid::Uuid;
 	use crate::sql::value::Value;
 	use crate::sql::Datetime;
@@ -234,7 +278,7 @@ pub mod uuid {
 		Ok(Uuid::new_v4().into())
 	}
 
-	pub fn v7((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
+	pub fn v7((Optional(timestamp),): (Optional<Datetime>,)) -> Result<Value, Error> {
 		let uuid = match timestamp {
 			Some(timestamp) => {
 				#[cfg(target_family = "wasm")]

@@ -9,6 +9,7 @@ use crate::idx::planner::StatementContext;
 use crate::kvs::Transaction;
 use crate::sql::index::Index;
 use crate::sql::statements::{DefineFieldStatement, DefineIndexStatement};
+use crate::sql::FlowResultExt as _;
 use crate::sql::{
 	order::{OrderList, Ordering},
 	Array, Cond, Expression, Idiom, Kind, Number, Operator, Order, Part, Subquery, Table, Value,
@@ -144,18 +145,16 @@ impl<'a> TreeBuilder<'a> {
 
 	async fn eval_order(&mut self) -> Result<(), Error> {
 		if let Some(o) = self.first_order {
-			if o.direction {
-				if let Node::IndexedField(id, irf) = self.resolve_idiom(&o.value).await? {
-					for (ixr, id_col) in &irf {
-						if *id_col == 0 {
-							self.index_map.order_limit = Some(IndexOption::new(
-								ixr.clone(),
-								Some(id),
-								IdiomPosition::None,
-								IndexOperator::Order,
-							));
-							break;
-						}
+			if let Node::IndexedField(id, irf) = self.resolve_idiom(&o.value).await? {
+				for (ixr, id_col) in &irf {
+					if *id_col == 0 {
+						self.index_map.order_limit = Some(IndexOption::new(
+							ixr.clone(),
+							Some(id),
+							IdiomPosition::None,
+							IndexOperator::Order(!o.direction),
+						));
+						break;
 					}
 				}
 			}
@@ -219,7 +218,11 @@ impl<'a> TreeBuilder<'a> {
 		self.leaf_nodes_count += 1;
 		let mut values = Vec::with_capacity(a.len());
 		for v in &a.0 {
-			values.push(stk.run(|stk| v.compute(stk, self.ctx.ctx, self.ctx.opt, None)).await?);
+			values.push(
+				stk.run(|stk| v.compute(stk, self.ctx.ctx, self.ctx.opt, None))
+					.await
+					.catch_return()?,
+			);
 		}
 		Ok(Node::Computed(Arc::new(Value::Array(Array::from(values)))))
 	}
@@ -234,7 +237,10 @@ impl<'a> TreeBuilder<'a> {
 		// Compute the idiom value if it is a param
 		if let Some(Part::Start(x)) = i.0.first() {
 			if x.is_param() {
-				let v = stk.run(|stk| i.compute(stk, self.ctx.ctx, self.ctx.opt, None)).await?;
+				let v = stk
+					.run(|stk| i.compute(stk, self.ctx.ctx, self.ctx.opt, None))
+					.await
+					.catch_return()?;
 				return stk.run(|stk| self.eval_value(stk, gr, &v)).await;
 			}
 		}
@@ -450,7 +456,7 @@ impl<'a> TreeBuilder<'a> {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
+	#[expect(clippy::too_many_arguments)]
 	fn lookup_index_options(
 		&mut self,
 		o: &Operator,
@@ -540,7 +546,7 @@ impl<'a> TreeBuilder<'a> {
 	) -> Result<Option<IndexOperator>, Error> {
 		if let Operator::Knn(k, None) = op {
 			if let Node::Computed(v) = n {
-				let vec: Arc<Vec<Number>> = Arc::new(v.as_ref().try_into()?);
+				let vec: Arc<Vec<Number>> = Arc::new(v.as_ref().clone().coerce_to()?);
 				self.knn_expressions.insert(exp.clone());
 				return Ok(Some(IndexOperator::Knn(vec, *k)));
 			}
@@ -556,7 +562,7 @@ impl<'a> TreeBuilder<'a> {
 	) -> Result<Option<IndexOperator>, Error> {
 		if let Operator::Ann(k, ef) = op {
 			if let Node::Computed(v) = n {
-				let vec: Arc<Vec<Number>> = Arc::new(v.as_ref().try_into()?);
+				let vec: Arc<Vec<Number>> = Arc::new(v.as_ref().clone().coerce_to()?);
 				self.knn_expressions.insert(exp.clone());
 				return Ok(Some(IndexOperator::Ann(vec, *k, *ef)));
 			}
@@ -572,7 +578,7 @@ impl<'a> TreeBuilder<'a> {
 	) -> Result<(), Error> {
 		if let Operator::Knn(k, Some(d)) = exp.operator() {
 			if let Node::Computed(v) = val {
-				let vec: Arc<Vec<Number>> = Arc::new(v.as_ref().try_into()?);
+				let vec: Arc<Vec<Number>> = Arc::new(v.as_ref().clone().coerce_to()?);
 				self.knn_expressions.insert(exp.clone());
 				self.knn_brute_force_expressions.insert(
 					exp.clone(),
@@ -664,7 +670,9 @@ impl IndexesMap {
 	pub(crate) fn check_compound(&mut self, ixr: &IndexReference, col: usize, val: &Arc<Value>) {
 		let cols = ixr.cols.len();
 		let values = self.compound_indexes.entry(ixr.clone()).or_insert(vec![vec![]; cols]);
-		values[col].push(val.clone());
+		if let Some(a) = values.get_mut(col) {
+			a.push(val.clone());
+		}
 	}
 
 	pub(crate) fn check_compound_array(&mut self, ixr: &IndexReference, col: usize, a: &Array) {

@@ -1,7 +1,6 @@
 use crate::ctx::{Context, MutableContext};
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
-use crate::err::Error;
 use crate::sql::statements::rebuild::RebuildStatement;
 use crate::sql::statements::{
 	AlterStatement, CreateStatement, DefineStatement, DeleteStatement, IfelseStatement,
@@ -15,9 +14,12 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
 
+use super::statements::InfoStatement;
+use super::FlowResult;
+
 pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Subquery";
 
-#[revisioned(revision = 4)]
+#[revisioned(revision = 5)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Subquery")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -40,6 +42,8 @@ pub enum Subquery {
 	Upsert(UpsertStatement),
 	#[revision(start = 4)]
 	Alter(AlterStatement),
+	#[revision(start = 5)]
+	Info(InfoStatement),
 }
 
 impl PartialOrd for Subquery {
@@ -67,31 +71,18 @@ impl Subquery {
 			Self::Remove(v) => v.writeable(),
 			Self::Rebuild(v) => v.writeable(),
 			Self::Alter(v) => v.writeable(),
+			Self::Info(v) => v.writeable(),
 		}
 	}
-	/// Process this type returning a computed simple Value
+
+	/// Process this type returning a computed simple Value, without catching errors
 	pub(crate) async fn compute(
 		&self,
 		stk: &mut Stk,
 		ctx: &Context,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		match self.compute_unbordered(stk, ctx, opt, doc).await {
-			Err(Error::Return {
-				value,
-			}) => Ok(value),
-			res => res,
-		}
-	}
-	/// Process this type returning a computed simple Value, without catching errors
-	pub(crate) async fn compute_unbordered(
-		&self,
-		stk: &mut Stk,
-		ctx: &Context,
-		opt: &Options,
-		doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
+	) -> FlowResult<Value> {
 		// Duplicate context
 		let mut ctx = MutableContext::new(ctx);
 		// Add parent document
@@ -100,22 +91,25 @@ impl Subquery {
 		}
 		let ctx = ctx.freeze();
 		// Process the subquery
-		match self {
-			Self::Value(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Ifelse(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Output(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Define(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Rebuild(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Remove(ref v) => v.compute(&ctx, opt, doc).await,
-			Self::Select(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Create(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Upsert(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Update(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Delete(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Relate(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Insert(ref v) => v.compute(stk, &ctx, opt, doc).await,
-			Self::Alter(ref v) => v.compute(stk, &ctx, opt, doc).await,
-		}
+		let res = match self {
+			Self::Value(ref v) => return v.compute(stk, &ctx, opt, doc).await,
+			Self::Ifelse(ref v) => return v.compute(stk, &ctx, opt, doc).await,
+			Self::Output(ref v) => return v.compute(stk, &ctx, opt, doc).await,
+			Self::Define(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Rebuild(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Remove(ref v) => v.compute(&ctx, opt, doc).await?,
+			Self::Select(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Create(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Upsert(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Update(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Delete(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Relate(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Insert(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Alter(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+			Self::Info(ref v) => v.compute(stk, &ctx, opt, doc).await?,
+		};
+
+		Ok(res)
 	}
 }
 
@@ -135,6 +129,7 @@ impl Display for Subquery {
 			Self::Remove(v) => write!(f, "({v})"),
 			Self::Rebuild(v) => write!(f, "({v})"),
 			Self::Alter(v) => write!(f, "({v})"),
+			Self::Info(v) => write!(f, "({v})"),
 			Self::Ifelse(v) => Display::fmt(v, f),
 		}
 	}

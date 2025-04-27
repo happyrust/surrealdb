@@ -1,5 +1,7 @@
 #![cfg(feature = "kv-tikv")]
 
+mod cnf;
+
 use crate::err::Error;
 use crate::key::debug::Sprintable;
 use crate::kvs::savepoint::{SaveOperation, SavePointImpl, SavePoints, SavePrepare};
@@ -12,12 +14,15 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tikv::CheckLevel;
+use std::time::Duration;
 use tikv::TimestampExt;
 use tikv::TransactionOptions;
+use tikv::{CheckLevel, Config, TransactionClient};
+
+const TARGET: &str = "surrealdb::core::kvs::tikv";
 
 pub struct Datastore {
-	db: Pin<Arc<tikv::TransactionClient>>,
+	db: Pin<Arc<TransactionClient>>,
 }
 
 pub struct Transaction {
@@ -35,7 +40,7 @@ pub struct Transaction {
 	// actually points here, so we need to ensure
 	// the memory is kept alive. This pointer must
 	// be declared last, so that it is dropped last.
-	db: Pin<Arc<tikv::TransactionClient>>,
+	db: Pin<Arc<TransactionClient>>,
 }
 
 impl Drop for Transaction {
@@ -59,18 +64,43 @@ impl Drop for Transaction {
 impl Datastore {
 	/// Open a new database
 	pub(crate) async fn new(path: &str) -> Result<Datastore, Error> {
-		match tikv::TransactionClient::new(vec![path]).await {
+		// Configure the client and keyspace
+		let config = match *cnf::TIKV_API_VERSION {
+			2 => match *cnf::TIKV_KEYSPACE {
+				Some(ref keyspace) => {
+					info!(target: TARGET, "Connecting to keyspace with cluster API V2: {keyspace}");
+					Config::default().with_keyspace(keyspace)
+				}
+				None => {
+					info!(target: TARGET, "Connecting to default keyspace with cluster API V2");
+					Config::default().with_default_keyspace()
+				}
+			},
+			1 => {
+				info!(target: TARGET, "Connecting with cluster API V1");
+				Config::default()
+			}
+			_ => return Err(Error::Ds("Invalid TiKV API version".into())),
+		};
+		// Set the default request timeout
+		let config = config.with_timeout(Duration::from_secs(*cnf::TIKV_REQUEST_TIMEOUT));
+		// Create the client with the config
+		let client = TransactionClient::new_with_config(vec![path], config);
+		// Check for errors with the client
+		match client.await {
 			Ok(db) => Ok(Datastore {
 				db: Arc::pin(db),
 			}),
 			Err(e) => Err(Error::Ds(e.to_string())),
 		}
 	}
+
 	/// Shutdown the database
 	pub(crate) async fn shutdown(&self) -> Result<(), Error> {
 		// Nothing to do here
 		Ok(())
 	}
+
 	/// Start a new transaction
 	pub(crate) async fn transaction(&self, write: bool, lock: bool) -> Result<Transaction, Error> {
 		// Set whether this should be an optimistic or pessimistic transaction
@@ -80,9 +110,15 @@ impl Datastore {
 			TransactionOptions::new_optimistic()
 		};
 		// Use async commit to determine transaction state earlier
-		opt = opt.use_async_commit();
+		opt = match *cnf::TIKV_ASYNC_COMMIT {
+			true => opt.use_async_commit(),
+			_ => opt,
+		};
 		// Try to use one-phase commit if writing to only one region
-		opt = opt.try_one_pc();
+		opt = match *cnf::TIKV_ONE_PHASE_COMMIT {
+			true => opt.try_one_pc(),
+			_ => opt,
+		};
 		// Set the behaviour when dropping an unfinished transaction
 		opt = opt.drop_check(CheckLevel::Warn);
 		// Set this transaction as read only if possible
@@ -438,7 +474,7 @@ impl super::api::Transaction for Transaction {
 		Ok(())
 	}
 
-	/// Delete a range of keys from the database
+	/// Retrieve a range of keys from the database
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
 	async fn keys<K>(
 		&mut self,
@@ -449,21 +485,27 @@ impl super::api::Transaction for Transaction {
 	where
 		K: KeyEncode + Sprintable + Debug,
 	{
-		// TiKV does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
-		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
-		// Convert the range to bytes
-		let rng: Range<Key> = Range {
-			start: rng.start.encode_owned()?,
-			end: rng.end.encode_owned()?,
-		};
+		let rng = self.prepare_scan(rng, version)?;
 		// Scan the keys
 		let res = self.inner.scan_keys(rng, limit).await?.map(Key::from).collect();
+		// Return result
+		Ok(res)
+	}
+
+	/// Retrieve a range of keys from the database
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
+	async fn keysr<K>(
+		&mut self,
+		rng: Range<K>,
+		limit: u32,
+		version: Option<u64>,
+	) -> Result<Vec<Key>, Error>
+	where
+		K: KeyEncode + Sprintable + Debug,
+	{
+		let rng = self.prepare_scan(rng, version)?;
+		// Scan the keys
+		let res = self.inner.scan_keys_reverse(rng, limit).await?.map(Key::from).collect();
 		// Return result
 		Ok(res)
 	}
@@ -479,21 +521,28 @@ impl super::api::Transaction for Transaction {
 	where
 		K: KeyEncode + Sprintable + Debug,
 	{
-		// TiKV does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
-		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
-		// Convert the range to bytes
-		let rng: Range<Key> = Range {
-			start: rng.start.encode_owned()?,
-			end: rng.end.encode_owned()?,
-		};
+		let rng = self.prepare_scan(rng, version)?;
 		// Scan the keys
 		let res = self.inner.scan(rng, limit).await?.map(|kv| (Key::from(kv.0), kv.1)).collect();
+		// Return result
+		Ok(res)
+	}
+
+	/// Retrieve a range of keys from the database in reverse order
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
+	async fn scanr<K>(
+		&mut self,
+		rng: Range<K>,
+		limit: u32,
+		version: Option<u64>,
+	) -> Result<Vec<(Key, Val)>, Error>
+	where
+		K: KeyEncode + Sprintable + Debug,
+	{
+		let rng = self.prepare_scan(rng, version)?;
+		// Scan the keys
+		let res =
+			self.inner.scan_reverse(rng, limit).await?.map(|kv| (Key::from(kv.0), kv.1)).collect();
 		// Return result
 		Ok(res)
 	}
@@ -531,5 +580,27 @@ impl super::api::Transaction for Transaction {
 impl SavePointImpl for Transaction {
 	fn get_save_points(&mut self) -> &mut SavePoints {
 		&mut self.save_points
+	}
+}
+
+impl Transaction {
+	fn prepare_scan<K>(&self, rng: Range<K>, version: Option<u64>) -> Result<Range<Key>, Error>
+	where
+		K: KeyEncode + Sprintable + Debug,
+	{
+		// TiKV does not support versioned queries.
+		if version.is_some() {
+			return Err(Error::UnsupportedVersionedQueries);
+		}
+		// Check to see if transaction is closed
+		if self.done {
+			return Err(Error::TxFinished);
+		}
+		// Convert the range to bytes
+		let rng: Range<Key> = Range {
+			start: rng.start.encode_owned()?,
+			end: rng.end.encode_owned()?,
+		};
+		Ok(rng)
 	}
 }

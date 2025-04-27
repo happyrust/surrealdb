@@ -4,7 +4,7 @@ use crate::dbs::distinct::SyncDistinct;
 use crate::dbs::{Iterable, Iterator, Operable, Options, Processed, Statement};
 use crate::err::Error;
 use crate::idx::planner::iterators::{IndexItemRecord, IteratorRef, ThingIterator};
-use crate::idx::planner::{IterationStage, RecordStrategy};
+use crate::idx::planner::{IterationStage, RecordStrategy, ScanDirection};
 use crate::key::{graph, thing};
 use crate::kvs::{Key, KeyDecode, KeyEncode, Transaction, Val};
 use crate::sql::dir::Dir;
@@ -52,7 +52,7 @@ impl Iterable {
 
 	fn iteration_stage_check(&self, ctx: &Context) -> bool {
 		match self {
-			Iterable::Table(tb, _) | Iterable::Index(tb, _, _) => {
+			Iterable::Table(tb, _, _) | Iterable::Index(tb, _, _) => {
 				if let Some(IterationStage::BuildKnn) = ctx.get_iteration_stage() {
 					if let Some(qp) = ctx.get_query_planner() {
 						if let Some(exe) = qp.get_query_executor(tb) {
@@ -322,8 +322,10 @@ impl Collected {
 
 	fn process_key_val(key: Key, val: Val) -> Result<Processed, Error> {
 		let key = thing::Thing::decode(&key)?;
-		let val: Value = revision::from_slice(&val)?;
+		let mut val: Value = revision::from_slice(&val)?;
 		let rid = Thing::from((key.tb, key.id));
+		// Inject the id field into the document
+		val.def(&rid);
 		// Create a new operable value
 		let val = Operable::Value(val.into());
 		// Process the record
@@ -462,7 +464,7 @@ pub(super) trait Collector {
 		opt: &Options,
 		iterable: Iterable,
 	) -> Result<(), Error> {
-		if ctx.is_ok(true) {
+		if ctx.is_ok(true).await? {
 			match iterable {
 				Iterable::Value(v) => {
 					if v.is_some() {
@@ -473,17 +475,25 @@ pub(super) trait Collector {
 				Iterable::Thing(v) => self.collect(Collected::Thing(v)).await?,
 				Iterable::Defer(v) => self.collect(Collected::Defer(v)).await?,
 				Iterable::Edges(e) => self.collect_edges(ctx, opt, e).await?,
-				Iterable::Range(tb, v, rs) => match rs {
+				Iterable::Range(tb, v, rs, sc) => match rs {
 					RecordStrategy::Count => self.collect_range_count(ctx, opt, &tb, v).await?,
-					RecordStrategy::KeysOnly => self.collect_range_keys(ctx, opt, &tb, v).await?,
-					RecordStrategy::KeysAndValues => self.collect_range(ctx, opt, &tb, v).await?,
+					RecordStrategy::KeysOnly => {
+						self.collect_range_keys(ctx, opt, &tb, v, sc).await?
+					}
+					RecordStrategy::KeysAndValues => {
+						self.collect_range(ctx, opt, &tb, v, sc).await?
+					}
 				},
-				Iterable::Table(v, rs) => {
+				Iterable::Table(v, rs, sc) => {
 					let ctx = Self::check_query_planner_context(ctx, &v);
 					match rs {
 						RecordStrategy::Count => self.collect_table_count(&ctx, opt, &v).await?,
-						RecordStrategy::KeysOnly => self.collect_table_keys(&ctx, opt, &v).await?,
-						RecordStrategy::KeysAndValues => self.collect_table(&ctx, opt, &v).await?,
+						RecordStrategy::KeysOnly => {
+							self.collect_table_keys(&ctx, opt, &v, sc).await?
+						}
+						RecordStrategy::KeysAndValues => {
+							self.collect_table(&ctx, opt, &v, sc).await?
+						}
 					}
 				}
 				Iterable::Index(v, irf, rs) => {
@@ -519,6 +529,7 @@ pub(super) trait Collector {
 		ctx: &Context,
 		txn: &Transaction,
 		mut rng: Range<Key>,
+		sc: ScanDirection,
 	) -> Result<Option<Range<Key>>, Error> {
 		let ite = self.iterator();
 		let skippable = ite.skippable();
@@ -527,25 +538,33 @@ pub(super) trait Collector {
 			return Ok(Some(rng));
 		}
 		// We only need to iterate over keys.
-		let mut stream = txn.stream_keys(rng.clone(), Some(skippable));
+		let mut stream = txn.stream_keys(rng.clone(), Some(skippable), sc);
 		let mut skipped = 0;
 		let mut last_key = vec![];
 		while let Some(res) = stream.next().await {
-			if ctx.is_done(skipped % 100 == 0) {
+			if ctx.is_done(skipped % 100 == 0).await? {
 				break;
 			}
 			last_key = res?;
 			skipped += 1;
 		}
-		// Update the iterator about the number of skipped keys
-		ite.skipped(skipped);
-		// If we don't have a last key we're done
+		// If we don't have a last key, we're done
 		if last_key.is_empty() {
 			return Ok(None);
 		}
+		// Update the iterator about the number of skipped keys
+		ite.skipped(skipped);
 		// We set the range for the next iteration
-		last_key.push(0xFF);
-		rng.start = last_key;
+		match sc {
+			ScanDirection::Forward => {
+				last_key.push(0xFF);
+				rng.start = last_key;
+			}
+			#[cfg(any(feature = "kv-rocksdb", feature = "kv-tikv"))]
+			ScanDirection::Backward => {
+				rng.end = last_key;
+			}
+		}
 		Ok(Some(rng))
 	}
 
@@ -554,6 +573,7 @@ pub(super) trait Collector {
 		ctx: &Context,
 		opt: &Options,
 		v: &Table,
+		sc: ScanDirection,
 	) -> Result<(), Error> {
 		// Get the transaction
 		let txn = ctx.tx();
@@ -564,19 +584,19 @@ pub(super) trait Collector {
 		let beg = thing::prefix(ns, db, v)?;
 		let end = thing::suffix(ns, db, v)?;
 		// Optionally skip keys
-		let rng = if let Some(r) = self.start_skip(ctx, &txn, beg..end).await? {
+		let rng = if let Some(r) = self.start_skip(ctx, &txn, beg..end, sc).await? {
 			r
 		} else {
 			return Ok(());
 		};
 		// Create a new iterable range
-		let mut stream = txn.stream(rng, opt.version, None);
+		let mut stream = txn.stream(rng, opt.version, None, sc);
 
 		// Loop until no more entries
 		let mut count = 0;
 		while let Some(res) = stream.next().await {
 			// Check if the context is finished
-			if ctx.is_done(count % 100 == 0) {
+			if ctx.is_done(count % 100 == 0).await? {
 				break;
 			}
 			// Parse the data from the store
@@ -593,6 +613,7 @@ pub(super) trait Collector {
 		ctx: &Context,
 		opt: &Options,
 		v: &Table,
+		sc: ScanDirection,
 	) -> Result<(), Error> {
 		// Get the transaction
 		let txn = ctx.tx();
@@ -603,7 +624,7 @@ pub(super) trait Collector {
 		let beg = thing::prefix(ns, db, v)?;
 		let end = thing::suffix(ns, db, v)?;
 		// Optionally skip keys
-		let rng = if let Some(rng) = self.start_skip(ctx, &txn, beg..end).await? {
+		let rng = if let Some(rng) = self.start_skip(ctx, &txn, beg..end, sc).await? {
 			// Returns the next range of keys
 			rng
 		} else {
@@ -611,12 +632,12 @@ pub(super) trait Collector {
 			return Ok(());
 		};
 		// Create a new iterable range
-		let mut stream = txn.stream_keys(rng, None);
+		let mut stream = txn.stream_keys(rng, None, sc);
 		// Loop until no more entries
 		let mut count = 0;
 		while let Some(res) = stream.next().await {
 			// Check if the context is finished
-			if ctx.is_done(count % 100 == 0) {
+			if ctx.is_done(count % 100 == 0).await? {
 				break;
 			}
 			// Parse the data from the store
@@ -689,13 +710,14 @@ pub(super) trait Collector {
 		opt: &Options,
 		tb: &str,
 		r: IdRange,
+		sc: ScanDirection,
 	) -> Result<(), Error> {
 		// Get the transaction
 		let txn = ctx.tx();
 		// Prepare
 		let (beg, end) = Self::range_prepare(&txn, opt, tb, r).await?;
 		// Optionally skip keys
-		let rng = if let Some(rng) = self.start_skip(ctx, &txn, beg..end).await? {
+		let rng = if let Some(rng) = self.start_skip(ctx, &txn, beg..end, sc).await? {
 			// Returns the next range of keys
 			rng
 		} else {
@@ -703,12 +725,12 @@ pub(super) trait Collector {
 			return Ok(());
 		};
 		// Create a new iterable range
-		let mut stream = txn.stream(rng, None, None);
+		let mut stream = txn.stream(rng, None, None, sc);
 		// Loop until no more entries
 		let mut count = 0;
 		while let Some(res) = stream.next().await {
 			// Check if the context is finished
-			if ctx.is_done(count % 100 == 0) {
+			if ctx.is_done(count % 100 == 0).await? {
 				break;
 			}
 			// Parse the data from the store
@@ -727,13 +749,14 @@ pub(super) trait Collector {
 		opt: &Options,
 		tb: &str,
 		r: IdRange,
+		sc: ScanDirection,
 	) -> Result<(), Error> {
 		// Get the transaction
 		let txn = ctx.tx();
 		// Prepare
 		let (beg, end) = Self::range_prepare(&txn, opt, tb, r).await?;
 		// Optionally skip keys
-		let rng = if let Some(rng) = self.start_skip(ctx, &txn, beg..end).await? {
+		let rng = if let Some(rng) = self.start_skip(ctx, &txn, beg..end, sc).await? {
 			// Returns the next range of keys
 			rng
 		} else {
@@ -741,12 +764,12 @@ pub(super) trait Collector {
 			return Ok(());
 		};
 		// Create a new iterable range
-		let mut stream = txn.stream_keys(rng, None);
+		let mut stream = txn.stream_keys(rng, None, sc);
 		// Loop until no more entries
 		let mut count = 0;
 		while let Some(res) = stream.next().await {
 			// Check if the context is finished
-			if ctx.is_done(count % 100 == 0) {
+			if ctx.is_done(count % 100 == 0).await? {
 				break;
 			}
 			// Parse the data from the store
@@ -805,7 +828,7 @@ pub(super) trait Collector {
 				Dir::In => e
 					.what
 					.iter()
-					.map(|v| v.0.to_owned())
+					.map(|v| v.0.clone())
 					.map(|v| {
 						(
 							graph::ftprefix(ns, db, tb, id, &e.dir, &v),
@@ -817,7 +840,7 @@ pub(super) trait Collector {
 				Dir::Out => e
 					.what
 					.iter()
-					.map(|v| v.0.to_owned())
+					.map(|v| v.0.clone())
 					.map(|v| {
 						(
 							graph::ftprefix(ns, db, tb, id, &e.dir, &v),
@@ -829,7 +852,7 @@ pub(super) trait Collector {
 				Dir::Both => e
 					.what
 					.iter()
-					.map(|v| v.0.to_owned())
+					.map(|v| v.0.clone())
 					.flat_map(|v| {
 						[
 							(
@@ -852,12 +875,12 @@ pub(super) trait Collector {
 		// Loop over the chosen edge types
 		for (beg, end) in keys.into_iter() {
 			// Create a new iterable range
-			let mut stream = txn.stream(beg?..end?, None, None);
+			let mut stream = txn.stream(beg?..end?, None, None, ScanDirection::Forward);
 			// Loop until no more entries
 			let mut count = 0;
 			while let Some(res) = stream.next().await {
 				// Check if the context is finished
-				if ctx.is_done(count % 100 == 0) {
+				if ctx.is_done(count % 100 == 0).await? {
 					break;
 				}
 				// Parse the key from the result
@@ -915,14 +938,14 @@ pub(super) trait Collector {
 		txn: &Transaction,
 		mut iterator: ThingIterator,
 	) -> Result<(), Error> {
-		while !ctx.is_done(true) {
+		while !ctx.is_done(true).await? {
 			let records: Vec<IndexItemRecord> =
 				iterator.next_batch(ctx, txn, *NORMAL_FETCH_SIZE).await?;
 			if records.is_empty() {
 				break;
 			}
 			for (c, r) in records.into_iter().enumerate() {
-				if ctx.is_done(c % 100 == 0) {
+				if ctx.is_done(c % 100 == 0).await? {
 					break;
 				}
 				self.collect(Collected::IndexItemKey(r)).await?;
@@ -937,14 +960,14 @@ pub(super) trait Collector {
 		txn: &Transaction,
 		mut iterator: ThingIterator,
 	) -> Result<(), Error> {
-		while !ctx.is_done(true) {
+		while !ctx.is_done(true).await? {
 			let records: Vec<IndexItemRecord> =
 				iterator.next_batch(ctx, txn, *NORMAL_FETCH_SIZE).await?;
 			if records.is_empty() {
 				break;
 			}
 			for (c, r) in records.into_iter().enumerate() {
-				if ctx.is_done(c % 100 == 0) {
+				if ctx.is_done(c % 100 == 0).await? {
 					break;
 				}
 				self.collect(Collected::IndexItem(r)).await?;
@@ -960,7 +983,7 @@ pub(super) trait Collector {
 		mut iterator: ThingIterator,
 	) -> Result<(), Error> {
 		let mut total_count = 0;
-		while !ctx.is_done(true) {
+		while !ctx.is_done(true).await? {
 			let count = iterator.next_count(ctx, txn, *NORMAL_FETCH_SIZE).await?;
 			if count == 0 {
 				break;

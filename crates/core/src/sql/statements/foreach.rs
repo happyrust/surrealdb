@@ -2,13 +2,14 @@ use crate::ctx::{Context, MutableContext};
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
+use crate::sql::range::TypedRange;
 use crate::sql::{block::Entry, Block, Param, Value};
+use crate::sql::{ControlFlow, FlowResult};
 
 use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
-use std::ops::Deref;
 
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
@@ -22,7 +23,7 @@ pub struct ForeachStatement {
 
 enum ForeachIter {
 	Array(std::vec::IntoIter<Value>),
-	Range(std::iter::Map<std::ops::Range<i64>, fn(i64) -> Value>),
+	Range(std::iter::Map<TypedRange<i64>, fn(i64) -> Value>),
 }
 
 impl Iterator for ForeachIter {
@@ -50,25 +51,28 @@ impl ForeachStatement {
 		ctx: &Context,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
+	) -> FlowResult<Value> {
 		// Check the loop data
 		let data = self.range.compute(stk, ctx, opt, doc).await?;
 		let iter = match data {
 			Value::Array(arr) => ForeachIter::Array(arr.into_iter()),
 			Value::Range(r) => {
-				let r: std::ops::Range<i64> = r.deref().to_owned().try_into()?;
+				let r = r.coerce_to_typed::<i64>().map_err(Error::from)?;
 				ForeachIter::Range(r.map(Value::from))
 			}
 
 			v => {
-				return Err(Error::InvalidStatementTarget {
+				return Err(ControlFlow::from(Error::InvalidStatementTarget {
 					value: v.to_string(),
-				})
+				}))
 			}
 		};
 
 		// Loop over the values
-		'foreach: for v in iter {
+		for v in iter {
+			if ctx.is_timedout().await? {
+				return Err(ControlFlow::from(Error::QueryTimedout));
+			}
 			// Duplicate context
 			let ctx = MutableContext::new(ctx).freeze();
 			// Set the current parameter
@@ -84,7 +88,7 @@ impl ForeachStatement {
 					Entry::Set(v) => {
 						let val = stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?;
 						let mut c = MutableContext::unfreeze(ctx)?;
-						c.add_value(v.name.to_owned(), val.into());
+						c.add_value(v.name.clone(), val.into());
 						ctx = c.freeze();
 						Ok(Value::None)
 					}
@@ -93,32 +97,33 @@ impl ForeachStatement {
 					Entry::Continue(v) => v.compute(&ctx, opt, doc).await,
 					Entry::Foreach(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
 					Entry::Ifelse(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Select(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Create(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Upsert(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Update(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Delete(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Relate(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Insert(v) => stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
-					Entry::Define(v) => v.compute(stk, &ctx, opt, doc).await,
-					Entry::Alter(v) => v.compute(stk, &ctx, opt, doc).await,
-					Entry::Rebuild(v) => v.compute(stk, &ctx, opt, doc).await,
-					Entry::Remove(v) => v.compute(&ctx, opt, doc).await,
+					Entry::Select(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Create(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Upsert(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Update(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Delete(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Relate(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Insert(v) => Ok(stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await?),
+					Entry::Define(v) => Ok(v.compute(stk, &ctx, opt, doc).await?),
+					Entry::Alter(v) => Ok(v.compute(stk, &ctx, opt, doc).await?),
+					Entry::Rebuild(v) => Ok(v.compute(stk, &ctx, opt, doc).await?),
+					Entry::Remove(v) => Ok(v.compute(&ctx, opt, doc).await?),
+					Entry::Info(v) => Ok(v.compute(stk, &ctx, opt, doc).await?),
 					Entry::Output(v) => {
 						return stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await;
 					}
-					Entry::Throw(v) => {
-						return stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await;
-					}
+					Entry::Throw(v) => return stk.run(|stk| v.compute(stk, &ctx, opt, doc)).await,
 				};
 				// Catch any special errors
 				match res {
-					Err(Error::Continue) => continue 'foreach,
-					Err(Error::Break) => return Ok(Value::None),
+					Err(ControlFlow::Continue) => break,
+					Err(ControlFlow::Break) => return Ok(Value::None),
 					Err(err) => return Err(err),
 					_ => (),
 				};
 			}
+			// Cooperatively yield if the task has been running for too long.
+			yield_now!();
 		}
 		// Ok all good
 		Ok(Value::None)

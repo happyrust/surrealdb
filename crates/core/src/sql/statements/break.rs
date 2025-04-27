@@ -1,8 +1,8 @@
-use crate::ctx::Context;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
-use crate::err::Error;
 use crate::sql::value::Value;
+use crate::sql::ControlFlow;
+use crate::{ctx::Context, sql::FlowResult};
 
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
@@ -19,14 +19,15 @@ impl BreakStatement {
 	pub(crate) fn writeable(&self) -> bool {
 		false
 	}
+
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(
 		&self,
 		_ctx: &Context,
 		_opt: &Options,
 		_doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		Err(Error::Break)
+	) -> FlowResult<Value> {
+		Err(ControlFlow::Break)
 	}
 }
 

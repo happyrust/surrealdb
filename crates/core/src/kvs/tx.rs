@@ -8,12 +8,14 @@ use super::Version;
 use crate::cnf::NORMAL_FETCH_SIZE;
 use crate::dbs::node::Node;
 use crate::err::Error;
+use crate::idx::planner::ScanDirection;
 use crate::idx::trees::store::cache::IndexTreeCaches;
 use crate::kvs::cache;
 use crate::kvs::cache::tx::TransactionCache;
 use crate::kvs::scanner::Scanner;
 use crate::kvs::Transactor;
 use crate::sql::statements::define::ApiDefinition;
+use crate::sql::statements::define::BucketDefinition;
 use crate::sql::statements::define::DefineConfigStatement;
 use crate::sql::statements::AccessGrant;
 use crate::sql::statements::DefineAccessStatement;
@@ -50,16 +52,19 @@ pub struct Transaction {
 	cache: TransactionCache,
 	/// Cache the index updates
 	index_caches: IndexTreeCaches,
+	/// Does this supports reverse scan
+	reverse_scan: bool,
 }
 
 impl Transaction {
 	/// Create a new query store
-	pub fn new(local: bool, tx: Transactor) -> Transaction {
+	pub fn new(local: bool, reverse_scan: bool, tx: Transactor) -> Transaction {
 		Transaction {
 			local,
 			tx: Mutex::new(tx),
 			cache: TransactionCache::new(),
 			index_caches: IndexTreeCaches::default(),
+			reverse_scan,
 		}
 	}
 
@@ -78,9 +83,14 @@ impl Transaction {
 		self.tx.lock().await
 	}
 
-	/// Check if the transaction is local or distributed
+	/// Check if the transaction is local or remote
 	pub fn local(&self) -> bool {
 		self.local
+	}
+
+	/// Check if the transaction supports reverse scan
+	pub fn reverse_scan(&self) -> bool {
+		self.reverse_scan
 	}
 
 	/// Check if the transaction is finished.
@@ -302,6 +312,22 @@ impl Transaction {
 
 	/// Retrieve a specific range of keys from the datastore.
 	///
+	/// This function fetches the full range of keys, in a single request to the underlying datastore.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
+	pub async fn keysr<K>(
+		&self,
+		rng: Range<K>,
+		limit: u32,
+		version: Option<u64>,
+	) -> Result<Vec<Key>, Error>
+	where
+		K: KeyEncode + Debug,
+	{
+		self.lock().await.keysr(rng, limit, version).await
+	}
+
+	/// Retrieve a specific range of keys from the datastore.
+	///
 	/// This function fetches the full range of key-value pairs, in a single request to the underlying datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
 	pub async fn scan<K>(
@@ -314,6 +340,19 @@ impl Transaction {
 		K: KeyEncode + Debug,
 	{
 		self.lock().await.scan(rng, limit, version).await
+	}
+
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
+	pub async fn scanr<K>(
+		&self,
+		rng: Range<K>,
+		limit: u32,
+		version: Option<u64>,
+	) -> Result<Vec<(Key, Val)>, Error>
+	where
+		K: Into<Key> + Debug,
+	{
+		self.lock().await.scanr(rng, limit, version).await
 	}
 
 	/// Count the total number of keys within a range in the datastore.
@@ -383,8 +422,9 @@ impl Transaction {
 		rng: Range<Vec<u8>>,
 		version: Option<u64>,
 		limit: Option<usize>,
+		sc: ScanDirection,
 	) -> impl Stream<Item = Result<(Key, Val), Error>> + '_ {
-		Scanner::<(Key, Val)>::new(self, *NORMAL_FETCH_SIZE, rng, version, limit)
+		Scanner::<(Key, Val)>::new(self, *NORMAL_FETCH_SIZE, rng, version, limit, sc)
 	}
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
@@ -392,8 +432,9 @@ impl Transaction {
 		&self,
 		rng: Range<Vec<u8>>,
 		limit: Option<usize>,
+		sc: ScanDirection,
 	) -> impl Stream<Item = Result<Key, Error>> + '_ {
-		Scanner::<Key>::new(self, *NORMAL_FETCH_SIZE, rng, None, limit)
+		Scanner::<Key>::new(self, *NORMAL_FETCH_SIZE, rng, None, limit, sc)
 	}
 
 	// --------------------------------------------------
@@ -690,6 +731,28 @@ impl Transaction {
 				let val = self.getr(beg..end, None).await?;
 				let val = util::deserialize_cache(val.iter().map(|x| x.1.as_slice()))?;
 				let entry = cache::tx::Entry::Azs(val.clone());
+				self.cache.insert(qey, entry);
+				Ok(val)
+			}
+		}
+	}
+
+	/// Retrieve all analyzer definitions for a specific database.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip(self))]
+	pub async fn all_db_buckets(
+		&self,
+		ns: &str,
+		db: &str,
+	) -> Result<Arc<[BucketDefinition]>, Error> {
+		let qey = cache::tx::Lookup::Bus(ns, db);
+		match self.cache.get(&qey) {
+			Some(val) => val.try_into_bus(),
+			None => {
+				let beg = crate::key::database::bu::prefix(ns, db)?;
+				let end = crate::key::database::bu::suffix(ns, db)?;
+				let val = self.getr(beg..end, None).await?;
+				let val = util::deserialize_cache(val.iter().map(|x| x.1.as_slice()))?;
+				let entry = cache::tx::Entry::Bus(val.clone());
 				self.cache.insert(qey, entry);
 				Ok(val)
 			}
@@ -1258,6 +1321,31 @@ impl Transaction {
 		.try_into_type()
 	}
 
+	/// Retrieve a specific api definition.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip(self))]
+	pub async fn get_db_bucket(
+		&self,
+		ns: &str,
+		db: &str,
+		bu: &str,
+	) -> Result<Arc<BucketDefinition>, Error> {
+		let qey = cache::tx::Lookup::Bu(ns, db, bu);
+		match self.cache.get(&qey) {
+			Some(val) => val,
+			None => {
+				let key = crate::key::database::bu::new(ns, db, bu).encode()?;
+				let val = self.get(key, None).await?.ok_or_else(|| Error::BuNotFound {
+					value: bu.to_owned(),
+				})?;
+				let val: BucketDefinition = revision::from_slice(&val)?;
+				let val = cache::tx::Entry::Any(Arc::new(val));
+				self.cache.insert(qey, val.clone());
+				val
+			}
+		}
+		.try_into_type()
+	}
+
 	/// Retrieve a specific analyzer definition.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip(self))]
 	pub async fn get_db_analyzer(
@@ -1496,7 +1584,11 @@ impl Transaction {
 			match self.get(key, version).await? {
 				// The value exists in the datastore
 				Some(val) => {
-					let val = cache::tx::Entry::Val(Arc::new(revision::from_slice(&val)?));
+					let mut val: Value = revision::from_slice(&val)?;
+					// Inject the id field into the document
+					let rid = crate::sql::Thing::from((tb, id.clone()));
+					val.def(&rid);
+					let val = cache::tx::Entry::Val(Arc::new(val));
 					val.try_into_val()
 				}
 				// The value is not in the datastore
@@ -1514,7 +1606,11 @@ impl Transaction {
 					match self.get(key, None).await? {
 						// The value exists in the datastore
 						Some(val) => {
-							let val = cache::tx::Entry::Val(Arc::new(revision::from_slice(&val)?));
+							let mut val: Value = revision::from_slice(&val)?;
+							// Inject the id field into the document
+							let rid = crate::sql::Thing::from((tb, id.clone()));
+							val.def(&rid);
+							let val = cache::tx::Entry::Val(Arc::new(val));
 							self.cache.insert(qey, val.clone());
 							val.try_into_val()
 						}

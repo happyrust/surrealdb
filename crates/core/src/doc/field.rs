@@ -13,8 +13,9 @@ use crate::sql::permission::Permission;
 use crate::sql::reference::Refs;
 use crate::sql::statements::DefineFieldStatement;
 use crate::sql::thing::Thing;
-use crate::sql::value::Value;
-use crate::sql::Part;
+use crate::sql::value::every::ArrayBehaviour;
+use crate::sql::value::{CoerceError, Value};
+use crate::sql::{FlowResultExt as _, Part};
 use reblessive::tree::Stk;
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ impl Document {
 			// Loop through all field statements
 			for fd in self.fd(ctx, opt).await?.iter() {
 				// Is this a schemaless field?
-				match fd.flex || fd.kind.as_ref().is_some_and(Kind::is_literal_nested) {
+				match fd.flex || fd.kind.as_ref().is_some_and(Kind::contains_literal) {
 					false => {
 						// Loop over this field in the document
 						for k in self.current.doc.each(&fd.name).into_iter() {
@@ -73,18 +74,14 @@ impl Document {
 						},
 					}
 				}
-				// NONE values should never be stored
-				if self.current.doc.pick(fd).is_none() {
-					self.current.doc.to_mut().cut(fd);
-				}
 			}
-		} else {
-			// Loop over every field in the document
-			for fd in self.current.doc.every(None, true, true).iter() {
-				// NONE values should never be stored
-				if self.current.doc.pick(fd).is_none() {
-					self.current.doc.to_mut().cut(fd);
-				}
+		}
+
+		// Loop over every field in the document
+		for fd in self.current.doc.every(None, true, ArrayBehaviour::Nested).iter() {
+			// NONE values should never be stored
+			if self.current.doc.pick(fd).is_none() {
+				self.current.doc.to_mut().cut(fd);
 			}
 		}
 		// Carry on
@@ -130,6 +127,7 @@ impl Document {
 				}
 				None => false,
 			};
+
 			// Loop over each field in document
 			for (k, mut val) in self.current.doc.as_ref().walk(&fd.name).into_iter() {
 				// Get the initial value
@@ -238,10 +236,7 @@ impl Document {
 						skip = Some(&fd.name);
 					}
 					// Set the new value of the field, or delete it if empty
-					match val.is_none() {
-						false => self.current.doc.to_mut().put(&k, val),
-						true => self.current.doc.to_mut().cut(&k),
-					};
+					self.current.doc.to_mut().put(&k, val);
 				}
 			}
 		}
@@ -340,50 +335,35 @@ impl FieldEditContext<'_> {
 					if !kind.is_record() {
 						// Get the value of the ID only
 						let inner = Value::from(id.id.clone());
+
 						// Check the type of the ID part
-						inner.coerce_to(kind).map_err(|e| match e {
-							// There was a conversion error
-							Error::CoerceTo {
-								from,
-								..
-							} => Error::FieldCheck {
-								thing: self.rid.to_string(),
-								field: self.def.name.clone(),
-								check: kind.to_string(),
-								value: from.to_string(),
-							},
-							// There was a different error
-							e => e,
+						inner.coerce_to_kind(kind).map_err(|e| Error::FieldCoerce {
+							thing: self.rid.to_string(),
+							field_name: self.def.name.to_string(),
+							error: Box::new(e),
 						})?;
 					}
 				}
 				// The outer value should be a record
 				else {
 					// There was a field check error
-					return Err(Error::FieldCheck {
+					return Err(Error::FieldCoerce {
 						thing: self.rid.to_string(),
-						field: self.def.name.clone(),
-						check: kind.to_string(),
-						value: val.to_string(),
+						field_name: "id".to_string(),
+						error: Box::new(CoerceError::InvalidKind {
+							from: val,
+							into: "record".to_string(),
+						}),
 					});
 				}
 			}
 			// This is not the `id` field
 			else {
 				// Check the type of the field value
-				let val = val.coerce_to(kind).map_err(|e| match e {
-					// There was a conversion error
-					Error::CoerceTo {
-						from,
-						..
-					} => Error::FieldCheck {
-						thing: self.rid.to_string(),
-						field: self.def.name.clone(),
-						check: kind.to_string(),
-						value: from.to_string(),
-					},
-					// There was a different error
-					e => e,
+				let val = val.coerce_to_kind(kind).map_err(|e| Error::FieldCoerce {
+					thing: self.rid.to_string(),
+					field_name: self.def.name.to_string(),
+					error: Box::new(e),
 				})?;
 				// Return the modified value
 				return Ok(val);
@@ -436,7 +416,7 @@ impl FieldEditContext<'_> {
 			// Freeze the new context
 			let ctx = ctx.freeze();
 			// Process the VALUE clause
-			let val = expr.compute(self.stk, &ctx, self.opt, doc).await?;
+			let val = expr.compute(self.stk, &ctx, self.opt, doc).await.catch_return()?;
 			// Unfreeze the new context
 			self.context = Some(MutableContext::unfreeze(ctx)?);
 			// Return the modified value
@@ -472,7 +452,7 @@ impl FieldEditContext<'_> {
 			// Freeze the new context
 			let ctx = ctx.freeze();
 			// Process the VALUE clause
-			let val = expr.compute(self.stk, &ctx, self.opt, doc).await?;
+			let val = expr.compute(self.stk, &ctx, self.opt, doc).await.catch_return()?;
 			// Unfreeze the new context
 			self.context = Some(MutableContext::unfreeze(ctx)?);
 			// Return the modified value
@@ -514,7 +494,7 @@ impl FieldEditContext<'_> {
 			// Freeze the new context
 			let ctx = ctx.freeze();
 			// Process the ASSERT clause
-			let res = expr.compute(self.stk, &ctx, self.opt, doc).await?;
+			let res = expr.compute(self.stk, &ctx, self.opt, doc).await.catch_return()?;
 			// Unfreeze the new context
 			self.context = Some(MutableContext::unfreeze(ctx)?);
 			// Check the ASSERT clause result
@@ -584,7 +564,7 @@ impl FieldEditContext<'_> {
 					// Freeze the new context
 					let ctx = ctx.freeze();
 					// Process the PERMISSION clause
-					let res = expr.compute(self.stk, &ctx, opt, doc).await?;
+					let res = expr.compute(self.stk, &ctx, opt, doc).await.catch_return()?;
 					// Unfreeze the new context
 					self.context = Some(MutableContext::unfreeze(ctx)?);
 					// If the specific permissions
@@ -629,7 +609,8 @@ impl FieldEditContext<'_> {
 					.current
 					.doc
 					.get(self.stk, self.ctx, self.opt, doc, &self.def.name)
-					.await?;
+					.await
+					.catch_return()?;
 				// If the reference is contained in an array, we only delete it from the array
 				// if there is no other reference to the same record id in the array
 				if let Value::Array(arr) = others {
@@ -673,7 +654,7 @@ impl FieldEditContext<'_> {
 						.collect()
 				};
 
-				RefAction::Delete(removed, self.def.name.to_owned().push(Part::All).to_string())
+				RefAction::Delete(removed, self.def.name.clone().push(Part::All).to_string())
 			// We found a new reference, let's create the link
 			} else if let Value::Thing(thing) = val {
 				RefAction::Set(thing)
@@ -732,6 +713,7 @@ impl FieldEditContext<'_> {
 			Ok(())
 		}
 	}
+
 	/// Process any `TYPE reference` clause for the field definition
 	async fn process_refs_type(&mut self) -> Result<Option<Value>, Error> {
 		if !self.ctx.get_capabilities().allows_experimental(&ExperimentalTarget::RecordReferences) {

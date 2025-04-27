@@ -1,4 +1,4 @@
-use super::{Ident, Kind};
+use super::{FlowResultExt, Ident, Kind};
 use crate::ctx::MutableContext;
 use crate::{ctx::Context, dbs::Options, doc::CursorDoc, err::Error, sql::value::Value};
 use reblessive::tree::Stk;
@@ -39,7 +39,7 @@ impl Closure {
 					})
 				}
 				(kind, Some(val)) => {
-					if let Ok(val) = val.to_owned().coerce_to(kind) {
+					if let Ok(val) = val.to_owned().coerce_to_kind(kind) {
 						ctx.add_value(name.to_string(), val.into());
 					} else {
 						return Err(Error::InvalidArguments {
@@ -55,9 +55,12 @@ impl Closure {
 		}
 
 		let ctx = ctx.freeze();
-		let result = self.body.compute(stk, &ctx, opt, doc).await?;
+		let result = self.body.compute(stk, &ctx, opt, doc).await.catch_return()?;
 		if let Some(returns) = &self.returns {
-			result.coerce_to(returns).map_err(|e| e.function_check_from_coerce("ANONYMOUS"))
+			result.coerce_to_kind(returns).map_err(|e| Error::ReturnCoerce {
+				name: "ANONYMOUS".to_string(),
+				error: Box::new(e),
+			})
 		} else {
 			Ok(result)
 		}

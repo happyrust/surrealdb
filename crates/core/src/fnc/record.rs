@@ -6,15 +6,17 @@ use crate::err::Error;
 use crate::sql::paths::ID;
 use crate::sql::thing::Thing;
 use crate::sql::value::Value;
-use crate::sql::{Array, Idiom, Kind, Literal, Part, Table};
+use crate::sql::{Array, FlowResultExt as _, Idiom, Kind, Literal, Part, Table};
 use reblessive::tree::Stk;
+
+use super::args::Optional;
 
 pub async fn exists(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, Option<&Options>, Option<&CursorDoc>),
 	(arg,): (Thing,),
 ) -> Result<Value, Error> {
 	if let Some(opt) = opt {
-		Ok(match Value::Thing(arg).get(stk, ctx, opt, doc, ID.as_ref()).await? {
+		Ok(match Value::Thing(arg).get(stk, ctx, opt, doc, ID.as_ref()).await.catch_return()? {
 			Value::None => Value::Bool(false),
 			_ => Value::Bool(true),
 		})
@@ -33,7 +35,7 @@ pub fn tb((arg,): (Thing,)) -> Result<Value, Error> {
 
 pub async fn refs(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
-	(id, ft, ff): (Thing, Option<String>, Option<String>),
+	(id, Optional(ft), Optional(ff)): (Thing, Optional<String>, Optional<String>),
 ) -> Result<Value, Error> {
 	if !ctx.get_capabilities().allows_experimental(&ExperimentalTarget::RecordReferences) {
 		return Err(Error::InvalidFunction {

@@ -4,6 +4,8 @@ use crate::fnc::util::string;
 use crate::sql::value::Value;
 use crate::sql::{Number, Regex};
 
+use super::args::{Any, Cast, Optional};
+
 /// Returns `true` if a string of this length is too much to allocate.
 fn limit(name: &str, n: usize) -> Result<(), Error> {
 	if n > *GENERATION_ALLOCATION_LIMIT {
@@ -16,7 +18,7 @@ fn limit(name: &str, n: usize) -> Result<(), Error> {
 	}
 }
 
-pub fn concat(args: Vec<Value>) -> Result<Value, Error> {
+pub fn concat(Any(args): Any) -> Result<Value, Error> {
 	let strings = args.into_iter().map(Value::as_string).collect::<Vec<_>>();
 	limit("string::concat", strings.iter().map(String::len).sum::<usize>())?;
 	Ok(strings.concat().into())
@@ -30,7 +32,7 @@ pub fn ends_with((val, chr): (String, String)) -> Result<Value, Error> {
 	Ok(val.ends_with(&chr).into())
 }
 
-pub fn join(args: Vec<Value>) -> Result<Value, Error> {
+pub fn join(Any(args): Any) -> Result<Value, Error> {
 	let mut args = args.into_iter().map(Value::as_string);
 	let chr = args.next().ok_or_else(|| Error::InvalidArguments {
 		name: String::from("string::join"),
@@ -60,12 +62,14 @@ pub fn lowercase((string,): (String,)) -> Result<Value, Error> {
 	Ok(string.to_lowercase().into())
 }
 
-pub fn repeat((val, num): (String, usize)) -> Result<Value, Error> {
+pub fn repeat((val, num): (String, i64)) -> Result<Value, Error> {
+	//TODO: Deal with truncation of neg:
+	let num = num as usize;
 	limit("string::repeat", val.len().saturating_mul(num))?;
 	Ok(val.repeat(num).into())
 }
 
-pub fn matches((val, regex): (String, Regex)) -> Result<Value, Error> {
+pub fn matches((val, Cast(regex)): (String, Cast<Regex>)) -> Result<Value, Error> {
 	Ok(regex.0.is_match(&val).into())
 }
 
@@ -82,7 +86,28 @@ pub fn replace((val, search, replace): (String, Value, String)) -> Result<Value,
 			}
 			Ok(val.replace(&search.0, &replace).into())
 		}
-		Value::Regex(search) => Ok(search.0.replace_all(&val, replace).into_owned().into()),
+		Value::Regex(search) => {
+			let mut new_val = String::with_capacity(val.len());
+			let mut last = 0;
+
+			for m in search.0.find_iter(&val) {
+				// Push everything until the match
+				new_val.push_str(&val[last..m.start()]);
+
+				// Push replacement
+				new_val.push_str(&replace);
+
+				// Abort early if we'd exceed the allowed limit
+				limit("string::replace", new_val.len())?;
+
+				last = m.end();
+			}
+
+			// Finally, push anything after the last match
+			new_val.push_str(&val[last..]);
+			limit("string::replace", new_val.len())?;
+			Ok(new_val.into())
+		}
 		_ => Err(Error::InvalidArguments {
 			name: "string::replace".to_string(),
 			message: format!(
@@ -96,34 +121,40 @@ pub fn reverse((string,): (String,)) -> Result<Value, Error> {
 	Ok(string.chars().rev().collect::<String>().into())
 }
 
-pub fn slice((val, beg, lim): (String, Option<isize>, Option<isize>)) -> Result<Value, Error> {
+pub fn slice(
+	(val, Optional(beg), Optional(lim)): (String, Optional<i64>, Optional<i64>),
+) -> Result<Value, Error> {
 	// Only count the chars if we need to and only do it once.
-	let mut char_count = usize::MAX;
-	let mut count_chars = || {
-		if char_count == usize::MAX {
-			char_count = val.chars().count();
-		}
-		char_count
-	};
+	let mut str_len_cache = None;
+	let mut str_len = || *str_len_cache.get_or_insert_with(|| val.chars().count() as i64);
 
-	let skip = match beg {
-		Some(v) if v < 0 => count_chars().saturating_sub(v.unsigned_abs()),
-		Some(v) => v as usize,
-		None => 0,
+	let beg = if let Some(v) = beg {
+		if v < 0 {
+			str_len().saturating_add(v).max(0) as usize
+		} else {
+			v as usize
+		}
+	} else {
+		0
 	};
 
 	let take = match lim {
-		Some(v) if v < 0 => count_chars().saturating_sub(skip).saturating_sub(v.unsigned_abs()),
-		Some(v) => v as usize,
+		Some(v) => {
+			if v < 0 {
+				let len = str_len().saturating_add(v).max(0) as usize;
+				len.saturating_sub(beg)
+			} else {
+				v as usize
+			}
+		}
 		None => usize::MAX,
 	};
 
-	Ok(if skip > 0 || take < usize::MAX {
-		val.chars().skip(skip).take(take).collect::<String>()
-	} else {
-		val
+	if take == 0 {
+		return Ok(String::new().into());
 	}
-	.into())
+
+	Ok(val.chars().skip(beg).take(take).collect::<String>().into())
 }
 
 pub fn slug((string,): (String,)) -> Result<Value, Error> {
@@ -218,6 +249,7 @@ pub mod html {
 
 pub mod is {
 	use crate::err::Error;
+	use crate::fnc::args::Optional;
 	use crate::sql::value::Value;
 	use crate::sql::{Datetime, Thing};
 	use chrono::NaiveDateTime;
@@ -245,7 +277,7 @@ pub mod is {
 		Ok(arg.is_ascii().into())
 	}
 
-	pub fn datetime((arg, fmt): (String, Option<String>)) -> Result<Value, Error> {
+	pub fn datetime((arg, Optional(fmt)): (String, Optional<String>)) -> Result<Value, Error> {
 		Ok(match fmt {
 			Some(fmt) => NaiveDateTime::parse_from_str(&arg, &fmt).is_ok().into(),
 			None => Datetime::try_from(arg.as_ref()).is_ok().into(),
@@ -304,7 +336,7 @@ pub mod is {
 		Ok(Ulid::from_string(arg.as_ref()).is_ok().into())
 	}
 
-	pub fn record((arg, tb): (String, Option<Value>)) -> Result<Value, Error> {
+	pub fn record((arg, Optional(tb)): (String, Optional<Value>)) -> Result<Value, Error> {
 		let res = match Thing::try_from(arg) {
 			Ok(t) => match tb {
 				Some(Value::Strand(tb)) => t.tb == *tb,
@@ -445,7 +477,9 @@ pub mod semver {
 		use crate::fnc::string::semver::parse_version;
 		use crate::sql::Value;
 
-		pub fn major((version, value): (String, u64)) -> Result<Value, Error> {
+		pub fn major((version, value): (String, i64)) -> Result<Value, Error> {
+			// TODO: Deal with negative trunc:
+			let value = value as u64;
 			parse_version(&version, "string::semver::set::major", "Invalid semantic version").map(
 				|mut version| {
 					version.major = value;
@@ -454,7 +488,9 @@ pub mod semver {
 			)
 		}
 
-		pub fn minor((version, value): (String, u64)) -> Result<Value, Error> {
+		pub fn minor((version, value): (String, i64)) -> Result<Value, Error> {
+			// TODO: Deal with negative trunc:
+			let value = value as u64;
 			parse_version(&version, "string::semver::set::minor", "Invalid semantic version").map(
 				|mut version| {
 					version.minor = value;
@@ -463,7 +499,10 @@ pub mod semver {
 			)
 		}
 
-		pub fn patch((version, value): (String, u64)) -> Result<Value, Error> {
+		pub fn patch((version, value): (String, i64)) -> Result<Value, Error> {
+			// TODO: Deal with negative trunc:
+			let value = value as u64;
+
 			parse_version(&version, "string::semver::set::patch", "Invalid semantic version").map(
 				|mut version| {
 					version.patch = value;
@@ -526,12 +565,20 @@ pub fn e3d_hash((string,): (String,)) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
 	use super::{contains, matches, replace, slice};
-	use crate::sql::{Number, Value};
+	use crate::{
+		err::Error,
+		fnc::args::{Cast, Optional},
+		sql::{Number, Value},
+	};
 
 	#[test]
 	fn string_slice() {
-		fn test(initial: &str, beg: Option<isize>, end: Option<isize>, expected: &str) {
-			assert_eq!(slice((initial.to_owned(), beg, end)).unwrap(), Value::from(expected));
+		#[track_caller]
+		fn test(initial: &str, beg: Option<i64>, end: Option<i64>, expected: &str) {
+			assert_eq!(
+				slice((initial.to_owned(), Optional(beg), Optional(end))).unwrap(),
+				Value::from(expected)
+			);
 		}
 
 		let string = "abcdefg";
@@ -552,6 +599,7 @@ mod tests {
 
 	#[test]
 	fn string_contains() {
+		#[track_caller]
 		fn test(base: &str, contained: &str, expected: bool) {
 			assert_eq!(
 				contains((base.to_string(), contained.to_string())).unwrap(),
@@ -570,6 +618,7 @@ mod tests {
 
 	#[test]
 	fn string_replace() {
+		#[track_caller]
 		fn test(base: &str, pattern: Value, replacement: &str, expected: &str) {
 			assert_eq!(
 				replace((base.to_string(), pattern.clone(), replacement.to_string())).unwrap(),
@@ -586,10 +635,26 @@ mod tests {
 	}
 
 	#[test]
+	fn string_replace_limit() {
+		let r = replace(("A".repeat(1000), Value::Regex("()".parse().unwrap()), "B".repeat(10000)));
+		match r {
+			Err(Error::InvalidArguments {
+				name,
+				message,
+			}) => {
+				assert_eq!(name, "string::replace");
+				assert_eq!(message, "Output must not exceed 1048576 bytes.");
+			}
+			_ => panic!("Unexpected result: {:?}", r),
+		}
+	}
+
+	#[test]
 	fn string_matches() {
+		#[track_caller]
 		fn test(base: &str, regex: &str, expected: bool) {
 			assert_eq!(
-				matches((base.to_string(), regex.parse().unwrap())).unwrap(),
+				matches((base.to_string(), Cast(regex.parse().unwrap()))).unwrap(),
 				Value::from(expected),
 				"matches({},{})",
 				base,

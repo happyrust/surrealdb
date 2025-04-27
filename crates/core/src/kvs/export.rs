@@ -11,6 +11,7 @@ use crate::sql::Value;
 use async_channel::Sender;
 use chrono::prelude::Utc;
 use chrono::TimeZone;
+use std::fmt;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -48,6 +49,7 @@ impl From<Config> for Value {
 			"functions" => config.functions.into(),
 			"analyzers" => config.analyzers.into(),
 			"versions" => config.versions.into(),
+			"records" => config.records.into(),
 			"tables" => match config.tables {
 				TableConfig::All => true.into(),
 				TableConfig::None => false.into(),
@@ -145,7 +147,7 @@ impl TryFrom<&Value> for TableConfig {
 				.cloned()
 				.map(|v| match v {
 					Value::Strand(str) => Ok(str.0),
-					v => Err(Error::InvalidExportConfig(v.to_owned(), "a string".into())),
+					v => Err(Error::InvalidExportConfig(v.clone(), "a string".into())),
 				})
 				.collect::<Result<Vec<String>, Error>>()
 				.map(TableConfig::Some),
@@ -169,6 +171,37 @@ impl TableConfig {
 			Self::None => false,
 			Self::Some(v) => v.iter().any(|v| v.eq(table)),
 		}
+	}
+}
+
+struct InlineCommentWriter<'a, F>(&'a mut F);
+impl<F: fmt::Write> fmt::Write for InlineCommentWriter<'_, F> {
+	fn write_str(&mut self, s: &str) -> fmt::Result {
+		for c in s.chars() {
+			self.write_char(c)?
+		}
+		Ok(())
+	}
+
+	fn write_char(&mut self, c: char) -> fmt::Result {
+		match c {
+			'\n' => self.0.write_str("\\n"),
+			'\r' => self.0.write_str("\\r"),
+			// NEL/Next Line
+			'\u{0085}' => self.0.write_str("\\u{0085}"),
+			// line seperator
+			'\u{2028}' => self.0.write_str("\\u{2028}"),
+			// Paragraph seperator
+			'\u{2029}' => self.0.write_str("\\u{2029}"),
+			_ => self.0.write_char(c),
+		}
+	}
+}
+
+struct InlineCommentDisplay<F>(F);
+impl<F: fmt::Display> fmt::Display for InlineCommentDisplay<F> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Write::write_fmt(&mut InlineCommentWriter(f), format_args!("{}", self.0))
 	}
 }
 
@@ -242,7 +275,7 @@ impl Transaction {
 		}
 
 		chn.send(bytes!("-- ------------------------------")).await?;
-		chn.send(bytes!(format!("-- {}", title))).await?;
+		chn.send(bytes!(format!("-- {}", InlineCommentDisplay(title)))).await?;
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!("")).await?;
 
@@ -292,7 +325,7 @@ impl Transaction {
 		chn: &Sender<Vec<u8>>,
 	) -> Result<(), Error> {
 		chn.send(bytes!("-- ------------------------------")).await?;
-		chn.send(bytes!(format!("-- TABLE: {}", table.name))).await?;
+		chn.send(bytes!(format!("-- TABLE: {}", InlineCommentDisplay(&table.name)))).await?;
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!("")).await?;
 		chn.send(bytes!(format!("{};", table))).await?;
@@ -328,7 +361,7 @@ impl Transaction {
 		chn: &Sender<Vec<u8>>,
 	) -> Result<(), Error> {
 		chn.send(bytes!("-- ------------------------------")).await?;
-		chn.send(bytes!(format!("-- TABLE DATA: {}", table.name))).await?;
+		chn.send(bytes!(format!("-- TABLE DATA: {}", InlineCommentDisplay(&table.name)))).await?;
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!("")).await?;
 
@@ -380,12 +413,15 @@ impl Transaction {
 	/// * `String` - Returns the generated SQL command as a string. If no command is generated, returns an empty string.
 	fn process_value(
 		k: thing::Thing,
-		v: Value,
+		mut v: Value,
 		records_relate: &mut Vec<String>,
 		records_normal: &mut Vec<String>,
 		is_tombstone: Option<bool>,
 		version: Option<u64>,
 	) -> String {
+		// Inject the id field into the document before processing.
+		let rid = crate::sql::Thing::from((k.tb, k.id.clone()));
+		v.def(&rid);
 		// Match on the value to determine if it is a graph edge record or a normal record.
 		match (v.pick(&*EDGE), v.pick(&*IN), v.pick(&*OUT)) {
 			// If the value is a graph edge record (indicated by EDGE, IN, and OUT fields):

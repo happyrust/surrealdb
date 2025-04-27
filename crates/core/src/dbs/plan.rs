@@ -59,6 +59,7 @@ impl Explanation {
 	) {
 		self.0.push(ExplainItem::new_collector(collector_type, details));
 	}
+
 	fn add_fallback(&mut self, reason: String) {
 		self.0.push(ExplainItem::new_fallback(reason));
 	}
@@ -107,37 +108,44 @@ impl ExplainItem {
 			},
 			Iterable::Yield(t) => Self {
 				name: "Iterate Yield".into(),
-				details: vec![("table", Value::from(t.0.to_owned()))],
+				details: vec![("table", Value::from(t.0.clone()))],
 			},
 			Iterable::Thing(t) => Self {
 				name: "Iterate Thing".into(),
-				details: vec![("thing", Value::Thing(t.to_owned()))],
+				details: vec![("thing", Value::Thing(t.clone()))],
 			},
 			Iterable::Defer(t) => Self {
 				name: "Iterate Defer".into(),
-				details: vec![("thing", Value::Thing(t.to_owned()))],
+				details: vec![("thing", Value::Thing(t.clone()))],
 			},
 			Iterable::Edges(e) => Self {
 				name: "Iterate Edges".into(),
-				details: vec![("from", Value::Thing(e.from.to_owned()))],
+				details: vec![("from", Value::Thing(e.from.clone()))],
 			},
-			Iterable::Table(t, rs) => Self {
+			Iterable::Table(t, rs, sc) => Self {
 				name: match rs {
 					RecordStrategy::Count => "Iterate Table Count",
 					RecordStrategy::KeysOnly => "Iterate Table Keys",
 					RecordStrategy::KeysAndValues => "Iterate Table",
 				}
 				.into(),
-				details: vec![("table", Value::from(t.0.to_owned()))],
+				details: vec![
+					("table", Value::from(t.0.clone())),
+					("direction", sc.to_string().into()),
+				],
 			},
-			Iterable::Range(tb, r, rs) => Self {
+			Iterable::Range(tb, r, rs, sc) => Self {
 				name: match rs {
 					RecordStrategy::Count => "Iterate Range Count",
 					RecordStrategy::KeysOnly => "Iterate Range Keys",
 					RecordStrategy::KeysAndValues => "Iterate Range",
 				}
 				.into(),
-				details: vec![("table", tb.to_owned().into()), ("range", r.to_owned().into())],
+				details: vec![
+					("table", tb.to_owned().into()),
+					("range", r.to_owned().into()),
+					("direction", sc.to_string().into()),
+				],
 			},
 			Iterable::Mergeable(t, v) => Self {
 				name: "Iterate Mergeable".into(),
@@ -161,7 +169,7 @@ impl ExplainItem {
 				],
 			},
 			Iterable::Index(t, ir, rs) => {
-				let mut details = vec![("table", Value::from(t.0.to_owned()))];
+				let mut details = vec![("table", Value::from(t.0.clone()))];
 				if let Some(qp) = ctx.get_query_planner() {
 					if let Some(exe) = qp.get_query_executor(&t.0) {
 						details.push(("plan", exe.explain(*ir)));

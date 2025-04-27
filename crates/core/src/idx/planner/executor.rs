@@ -17,6 +17,10 @@ use crate::idx::planner::iterators::{
 	UniqueEqualThingIterator, UniqueJoinThingIterator, UniqueRangeThingIterator,
 	UniqueUnionThingIterator, ValueType,
 };
+#[cfg(any(feature = "kv-rocksdb", feature = "kv-tikv"))]
+use crate::idx::planner::iterators::{
+	IndexRangeReverseThingIterator, UniqueRangeReverseThingIterator,
+};
 use crate::idx::planner::knn::{KnnBruteForceResult, KnnPriorityList};
 use crate::idx::planner::plan::IndexOperator::Matches;
 use crate::idx::planner::plan::{IndexOperator, IndexOption, RangeValue};
@@ -28,7 +32,9 @@ use crate::idx::IndexKeyBase;
 use crate::kvs::TransactionType;
 use crate::sql::index::{Distance, Index};
 use crate::sql::statements::DefineIndexStatement;
-use crate::sql::{Array, Cond, Expression, Idiom, Number, Object, Table, Thing, Value};
+use crate::sql::{
+	Array, Cond, Expression, FlowResultExt as _, Idiom, Number, Object, Table, Thing, Value,
+};
 use num_traits::{FromPrimitive, ToPrimitive};
 use reblessive::tree::Stk;
 use rust_decimal::Decimal;
@@ -92,7 +98,7 @@ impl IteratorEntry {
 			Self::Single(_, io) => io.explain(),
 			Self::Range(_, ir, from, to) => {
 				let mut e = HashMap::default();
-				e.insert("index", Value::from(ir.name.0.to_owned()));
+				e.insert("index", Value::from(ir.name.0.clone()));
 				e.insert("from", Value::from(from));
 				e.insert("to", Value::from(to));
 				Value::from(Object::from(e))
@@ -101,8 +107,8 @@ impl IteratorEntry {
 	}
 }
 impl InnerQueryExecutor {
-	#[allow(clippy::too_many_arguments)]
-	#[allow(clippy::mutable_key_type)]
+	#[expect(clippy::too_many_arguments)]
+	#[expect(clippy::mutable_key_type)]
 	pub(super) async fn new(
 		stk: &mut Stk,
 		ctx: &Context,
@@ -268,8 +274,8 @@ impl QueryExecutor {
 			Ok(Value::Bool(false))
 		} else {
 			if let Some((p, id, val, dist)) = self.0.knn_bruteforce_entries.get(exp) {
-				let v = id.compute(stk, ctx, opt, doc).await?;
-				if let Ok(v) = v.try_into() {
+				let v = id.compute(stk, ctx, opt, doc).await.catch_return()?;
+				if let Ok(v) = v.coerce_to() {
 					if let Ok(dist) = dist.compute(&v, val.as_ref()) {
 						p.add(dist, thg).await;
 						return Ok(Value::Bool(true));
@@ -388,11 +394,29 @@ impl QueryExecutor {
 					Box::new(IndexJoinThingIterator::new(ir, opt, ix.clone(), iterators)?);
 				Some(ThingIterator::IndexJoin(index_join))
 			}
-			IndexOperator::Order => {
-				let (ns, db) = opt.ns_db()?;
-				Some(ThingIterator::IndexRange(IndexRangeThingIterator::full_range(
-					ir, ns, db, ix,
-				)?))
+			IndexOperator::Order(reverse) => {
+				if *reverse {
+					#[cfg(any(feature = "kv-rocksdb", feature = "kv-tikv"))]
+					{
+						Some(ThingIterator::IndexRangeReverse(
+							IndexRangeReverseThingIterator::full_range(
+								ir,
+								opt.ns()?,
+								opt.db()?,
+								ix,
+							)?,
+						))
+					}
+					#[cfg(not(any(feature = "kv-rocksdb", feature = "kv-tikv")))]
+					None
+				} else {
+					Some(ThingIterator::IndexRange(IndexRangeThingIterator::full_range(
+						ir,
+						opt.ns()?,
+						opt.db()?,
+						ix,
+					)?))
+				}
 			}
 			_ => None,
 		})
@@ -770,9 +794,7 @@ impl QueryExecutor {
 		range: &IteratorRange<'_>,
 	) -> Result<ThingIterator, Error> {
 		let (ns, db) = opt.ns_db()?;
-		Ok(ThingIterator::UniqueRange(UniqueRangeThingIterator::new(
-			ir, ns, db, &ix.what, &ix.name, range,
-		)?))
+		Ok(ThingIterator::UniqueRange(UniqueRangeThingIterator::new(ir, ns, db, ix, range)?))
 	}
 
 	fn new_multiple_index_range_iterator(
@@ -831,11 +853,29 @@ impl QueryExecutor {
 					Box::new(UniqueJoinThingIterator::new(irf, opt, ixr.clone(), iterators)?);
 				Some(ThingIterator::UniqueJoin(unique_join))
 			}
-			IndexOperator::Order => {
-				let (ns, db) = opt.ns_db()?;
-				Some(ThingIterator::UniqueRange(UniqueRangeThingIterator::full_range(
-					irf, ns, db, ixr,
-				)?))
+			IndexOperator::Order(reverse) => {
+				if *reverse {
+					#[cfg(any(feature = "kv-rocksdb", feature = "kv-tikv"))]
+					{
+						Some(ThingIterator::UniqueRangeReverse(
+							UniqueRangeReverseThingIterator::full_range(
+								irf,
+								opt.ns()?,
+								opt.db()?,
+								ixr,
+							)?,
+						))
+					}
+					#[cfg(not(any(feature = "kv-rocksdb", feature = "kv-tikv")))]
+					None
+				} else {
+					Some(ThingIterator::UniqueRange(UniqueRangeThingIterator::full_range(
+						irf,
+						opt.ns()?,
+						opt.db()?,
+						ixr,
+					)?))
+				}
 			}
 			_ => None,
 		})
@@ -912,7 +952,7 @@ impl QueryExecutor {
 		Ok(iterators)
 	}
 
-	#[allow(clippy::too_many_arguments)]
+	#[expect(clippy::too_many_arguments)]
 	pub(crate) async fn matches(
 		&self,
 		stk: &mut Stk,
@@ -1156,7 +1196,7 @@ pub(super) struct HnswEntry {
 }
 
 impl HnswEntry {
-	#[allow(clippy::too_many_arguments)]
+	#[expect(clippy::too_many_arguments)]
 	async fn new(
 		stk: &mut Stk,
 		ctx: &Context,

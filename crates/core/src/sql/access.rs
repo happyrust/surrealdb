@@ -1,6 +1,4 @@
-use crate::sql::{
-	escape::escape_ident, fmt::Fmt, strand::no_nul_bytes, Duration, Id, Ident, Thing,
-};
+use crate::sql::{escape::EscapeIdent, fmt::Fmt, strand::no_nul_bytes, Duration, Id, Ident, Thing};
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
@@ -27,9 +25,9 @@ impl Default for AccessDuration {
 	fn default() -> Self {
 		Self {
 			// By default, access grants expire in 30 days.
-			grant: Some(Duration::from_days(30)),
+			grant: Some(Duration::from_days(30).expect("30 days should fit in a duration")),
 			// By default, tokens expire after one hour
-			token: Some(Duration::from_hours(1)),
+			token: Some(Duration::from_hours(1).expect("1 hour should fit in a duration")),
 			// By default, sessions do not expire
 			session: None,
 		}
@@ -96,7 +94,7 @@ impl Deref for Access {
 impl Access {
 	pub fn generate(&self) -> Thing {
 		Thing {
-			tb: self.0.to_owned(),
+			tb: self.0.clone(),
 			id: Id::rand(),
 		}
 	}
@@ -104,6 +102,6 @@ impl Access {
 
 impl Display for Access {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-		Display::fmt(&escape_ident(&self.0), f)
+		EscapeIdent(&self.0).fmt(f)
 	}
 }

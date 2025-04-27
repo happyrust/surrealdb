@@ -194,7 +194,7 @@ async fn define_statement_index_concurrently_building_status(
 	let mut appended_count = 0;
 	// While the concurrent indexing is running, we update and delete records
 	info!("Loop");
-	let time_out = Duration::from_secs(120);
+	let time_out = Duration::from_secs(300);
 	loop {
 		if now.elapsed().map_err(|e| Error::Internal(e.to_string()))?.gt(&time_out) {
 			panic!("Time-out {time_out:?}");
@@ -226,6 +226,10 @@ async fn define_statement_index_concurrently_building_status(
 							info!("Started");
 							continue;
 						}
+						"cleaning" => {
+							info!("Cleaning");
+							continue;
+						}
 						"indexing" => {
 							{
 								if new_initial != initial_count {
@@ -250,9 +254,9 @@ async fn define_statement_index_concurrently_building_status(
 							continue;
 						}
 						"ready" => {
-							let initial = new_initial.unwrap().coerce_to_i64()? as usize;
-							let pending = new_pending.unwrap().coerce_to_i64()?;
-							let updated = new_updated.unwrap().coerce_to_i64()? as usize;
+							let initial = new_initial.unwrap().coerce_to::<i64>()? as usize;
+							let pending = new_pending.unwrap().coerce_to::<i64>()?;
+							let updated = new_updated.unwrap().coerce_to::<i64>()? as usize;
 							assert!(initial > 0, "{initial} > 0");
 							assert!(initial <= initial_size, "{initial} <= {initial_size}");
 							assert_eq!(pending, 0);
@@ -271,7 +275,7 @@ async fn define_statement_index_concurrently_building_status(
 	Ok(())
 }
 
-#[test(tokio::test)]
+#[tokio::test(flavor = "multi_thread")]
 async fn define_statement_index_concurrently_building_status_standard() -> Result<(), Error> {
 	define_statement_index_concurrently_building_status(
 		"DEFINE INDEX test ON user FIELDS email CONCURRENTLY",
@@ -282,7 +286,7 @@ async fn define_statement_index_concurrently_building_status_standard() -> Resul
 	.await
 }
 
-#[test(tokio::test)]
+#[tokio::test(flavor = "multi_thread")]
 async fn define_statement_index_concurrently_building_status_standard_overwrite(
 ) -> Result<(), Error> {
 	define_statement_index_concurrently_building_status(
@@ -343,6 +347,7 @@ async fn define_statement_analyzer() -> Result<(), Error> {
 				htmlAnalyzer: 'DEFINE ANALYZER htmlAnalyzer FUNCTION fn::stripHtml TOKENIZERS BLANK,CLASS'
 			},
 			apis: {},
+			buckets: {},
 			configs: {},
 			functions: {
 				stripHtml: "DEFINE FUNCTION fn::stripHtml($html: string) { RETURN string::replace($html, /<[^>]*>/, ''); } PERMISSIONS FULL"
@@ -673,8 +678,8 @@ async fn permissions_checks_define_function() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: { greet: \"DEFINE FUNCTION fn::greet() { RETURN 'Hello'; } PERMISSIONS FULL\" }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
-		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: { greet: \"DEFINE FUNCTION fn::greet() { RETURN 'Hello'; } PERMISSIONS FULL\" }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
+		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -715,8 +720,8 @@ async fn permissions_checks_define_analyzer() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: {  }, analyzers: { analyzer: 'DEFINE ANALYZER analyzer TOKENIZERS BLANK' }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
-		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: {  }, analyzers: { analyzer: 'DEFINE ANALYZER analyzer TOKENIZERS BLANK' }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
+		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -840,8 +845,8 @@ async fn permissions_checks_define_access_db() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: { access: \"DEFINE ACCESS access ON DATABASE TYPE JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION NONE\" }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
-		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: { access: \"DEFINE ACCESS access ON DATABASE TYPE JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION NONE\" }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
+		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -965,8 +970,8 @@ async fn permissions_checks_define_user_db() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: { user: \"DEFINE USER user ON DATABASE PASSHASH 'secret' ROLES VIEWER DURATION FOR TOKEN 15m, FOR SESSION 6h\" } }"],
-        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: { user: \"DEFINE USER user ON DATABASE PASSHASH 'secret' ROLES VIEWER DURATION FOR TOKEN 15m, FOR SESSION 6h\" } }"],
+        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -1007,8 +1012,8 @@ async fn permissions_checks_define_access_record() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: { account: \"DEFINE ACCESS account ON DATABASE TYPE RECORD WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h\" }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
-		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: { account: \"DEFINE ACCESS account ON DATABASE TYPE RECORD WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h\" }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"],
+		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -1049,8 +1054,8 @@ async fn permissions_checks_define_param() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: { param: \"DEFINE PARAM $param VALUE 'foo' PERMISSIONS FULL\" }, tables: {  }, users: {  } }"],
-		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: { param: \"DEFINE PARAM $param VALUE 'foo' PERMISSIONS FULL\" }, tables: {  }, users: {  } }"],
+		vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -1088,8 +1093,8 @@ async fn permissions_checks_define_table() {
 
 	// Define the expected results for the check statement when the test statement succeeded and when it failed
 	let check_results = [
-        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: { TB: 'DEFINE TABLE TB TYPE ANY SCHEMALESS PERMISSIONS NONE' }, users: {  } }"],
-        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
+        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: { TB: 'DEFINE TABLE TB TYPE ANY SCHEMALESS PERMISSIONS NONE' }, users: {  } }"],
+        vec!["{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, params: {  }, tables: {  }, users: {  } }"]
     ];
 
 	let test_cases = [
@@ -1244,100 +1249,6 @@ async fn permissions_checks_define_index() {
 
 	let res = iam_check_cases(test_cases.iter(), &scenario, check_results).await;
 	assert!(res.is_ok(), "{}", res.unwrap_err());
-}
-
-#[tokio::test]
-
-async fn define_table_relation_in_out() -> Result<(), Error> {
-	let sql = r"
-		DEFINE TABLE likes TYPE RELATION FROM person TO person | thing SCHEMAFUL;
-		LET $first_p = CREATE person SET name = 'first person';
-		LET $second_p = CREATE person SET name = 'second person';
-		LET $thing = CREATE thing SET name = 'rust';
-		LET $other = CREATE other;
-		RELATE $first_p->likes->$thing;
-		RELATE $first_p->likes->$second_p;
-		CREATE likes;
-		RELATE $first_p->likes->$other;
-		RELATE $thing->likes->$first_p;
-	";
-	let dbs = new_ds().await?;
-	let ses = Session::owner().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(sql, &ses, None).await?;
-	assert_eq!(res.len(), 10);
-	//
-	for _ in 0..7 {
-		let tmp = res.remove(0).result;
-		tmp.unwrap();
-	}
-	//
-	let tmp = res.remove(0).result;
-	assert!(matches!(
-		tmp,
-		Err(crate::Error::TableCheck {
-			thing: _,
-			relation: _,
-			target_type: _
-		})
-	));
-	//
-	let tmp = res.remove(0).result;
-	assert!(tmp.is_err());
-	//
-	let tmp = res.remove(0).result;
-	assert!(tmp.is_err());
-	//
-
-	Ok(())
-}
-
-#[tokio::test]
-async fn define_table_relation_redefinition() -> Result<(), Error> {
-	let sql = "
-		DEFINE TABLE likes TYPE RELATION IN person OUT person;
-		LET $person = CREATE person;
-		LET $thing = CREATE thing;
-		LET $other = CREATE other;
-		RELATE $person->likes->$thing;
-		REMOVE TABLE likes;
-		DEFINE TABLE likes TYPE RELATION IN person OUT person | thing;
-		RELATE $person->likes->$thing;
-		RELATE $person->likes->$other;
-		REMOVE FIELD out ON TABLE likes;
-		DEFINE FIELD out ON TABLE likes TYPE record<person | thing | other>;
-		RELATE $person->likes->$other;
-	";
-	let mut t = Test::new(sql).await?;
-	t.skip_ok(4)?;
-	t.expect_error_func(|e| matches!(e, Error::FieldCheck { .. }))?;
-	t.skip_ok(3)?;
-	t.expect_error_func(|e| matches!(e, Error::FieldCheck { .. }))?;
-	t.skip_ok(3)?;
-	Ok(())
-}
-
-#[tokio::test]
-async fn define_table_type_normal() -> Result<(), Error> {
-	let sql = "
-		DEFINE TABLE thing TYPE NORMAL;
-		CREATE thing;
-		RELATE foo:one->thing->foo:two;
-	";
-	let dbs = new_ds().await?;
-	let ses = Session::owner().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(sql, &ses, None).await?;
-	assert_eq!(res.len(), 3);
-	//
-	let tmp = res.remove(0).result;
-	tmp.unwrap();
-	//
-	let tmp = res.remove(0).result;
-	tmp.unwrap();
-	//
-	let tmp = res.remove(0).result;
-	assert!(tmp.is_err());
-	//
-	Ok(())
 }
 
 #[tokio::test]

@@ -147,10 +147,10 @@ impl Datastore {
 		opts.set_row_cache(&cache);
 		// Configure memory-mapped reads
 		info!(target: TARGET, "Enable memory-mapped reads: {}", *cnf::ROCKSDB_ENABLE_MEMORY_MAPPED_READS);
-		opts.set_allow_mmap_reads(true);
+		opts.set_allow_mmap_reads(*cnf::ROCKSDB_ENABLE_MEMORY_MAPPED_READS);
 		// Configure memory-mapped writes
 		info!(target: TARGET, "Enable memory-mapped writes: {}", *cnf::ROCKSDB_ENABLE_MEMORY_MAPPED_WRITES);
-		opts.set_allow_mmap_writes(true);
+		opts.set_allow_mmap_writes(*cnf::ROCKSDB_ENABLE_MEMORY_MAPPED_WRITES);
 		// Set the delete compaction factory
 		info!(target: TARGET, "Setting delete compaction factory: {} / {} ({})",
 			*cnf::ROCKSDB_DELETION_FACTORY_WINDOW_SIZE,
@@ -236,6 +236,7 @@ impl Datastore {
 			db,
 		})
 	}
+
 	/// Shutdown the database
 	pub(crate) async fn shutdown(&self) -> Result<(), Error> {
 		// Create new flush options
@@ -253,6 +254,7 @@ impl Datastore {
 		// All good
 		Ok(())
 	}
+
 	/// Start a new transaction
 	pub(crate) async fn transaction(&self, write: bool, _: bool) -> Result<Transaction, Error> {
 		// Set the transaction options
@@ -564,19 +566,7 @@ impl super::api::Transaction for Transaction {
 	where
 		K: KeyEncode + Sprintable + Debug,
 	{
-		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
-		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
-		// Convert the range to bytes
-		let rng: Range<Key> = Range {
-			start: rng.start.encode_owned()?,
-			end: rng.end.encode_owned()?,
-		};
+		let rng = self.prepare_scan(rng, version).await?;
 		// Execute on the blocking threadpool
 		let res = affinitypool::spawn_local(move || {
 			// Create result set
@@ -621,6 +611,54 @@ impl super::api::Transaction for Transaction {
 
 	/// Retrieve a range of keys from the databases
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
+	async fn keysr<K>(
+		&mut self,
+		rng: Range<K>,
+		limit: u32,
+		version: Option<u64>,
+	) -> Result<Vec<Key>, Error>
+	where
+		K: KeyEncode + Sprintable + Debug,
+	{
+		let rng = self.prepare_scan(rng, version).await?;
+		// Get the transaction
+		let inner = self.inner.as_ref().unwrap();
+		// Create result set
+		let mut res = vec![];
+		// Set the key range
+		let beg = rng.start.as_slice();
+		let end = rng.end.as_slice();
+		// Set the ReadOptions with the snapshot
+		let mut ro = ReadOptions::default();
+		ro.set_snapshot(&inner.snapshot());
+		ro.set_iterate_lower_bound(beg);
+		ro.set_iterate_upper_bound(end);
+		ro.set_async_io(true);
+		ro.fill_cache(true);
+		// Create the iterator
+		let mut iter = inner.raw_iterator_opt(ro);
+		// Seek to the start key
+		iter.seek_for_prev(&rng.end);
+		// Check the scan limit
+		while res.len() < limit as usize {
+			// Check the key and value
+			if let Some(k) = iter.key() {
+				// Check the range validity
+				if k >= beg && k < end {
+					res.push(k.to_vec());
+					iter.prev();
+					continue;
+				}
+			}
+			// Exit
+			break;
+		}
+		// Return result
+		Ok(res)
+	}
+
+	/// Retrieve a range of keys from the databases
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
 	async fn scan<K>(
 		&mut self,
 		rng: Range<K>,
@@ -630,19 +668,7 @@ impl super::api::Transaction for Transaction {
 	where
 		K: KeyEncode + Sprintable + Debug,
 	{
-		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
-		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
-		// Convert the range to bytes
-		let rng: Range<Key> = Range {
-			start: rng.start.encode_owned()?,
-			end: rng.end.encode_owned()?,
-		};
+		let rng = self.prepare_scan(rng, version).await?;
 		// Execute on the blocking threadpool
 		let res = affinitypool::spawn_local(move || {
 			// Create result set
@@ -684,9 +710,81 @@ impl super::api::Transaction for Transaction {
 		// Return result
 		Ok(res)
 	}
+
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
+	async fn scanr<K>(
+		&mut self,
+		rng: Range<K>,
+		limit: u32,
+		version: Option<u64>,
+	) -> Result<Vec<(Key, Val)>, Error>
+	where
+		K: KeyEncode + Sprintable + Debug,
+	{
+		let rng = self.prepare_scan(rng, version).await?;
+		// Get the transaction
+		let inner = self.inner.as_ref().unwrap();
+		// Create result set
+		let mut res = vec![];
+		// Set the key range
+		let beg = rng.start.as_slice();
+		let end = rng.end.as_slice();
+		// Set the ReadOptions with the snapshot
+		let mut ro = ReadOptions::default();
+		ro.set_snapshot(&inner.snapshot());
+		ro.set_iterate_lower_bound(beg);
+		ro.set_iterate_upper_bound(end);
+		ro.set_async_io(true);
+		ro.fill_cache(true);
+		// Create the iterator
+		let mut iter = inner.raw_iterator_opt(ro);
+		// Seek to the start key
+		iter.seek_for_prev(&rng.end);
+		// Check the scan limit
+		while res.len() < limit as usize {
+			// Check the key and value
+			if let Some((k, v)) = iter.item() {
+				// Check the range validity
+				if k >= beg && k < end {
+					res.push((k.to_vec(), v.to_vec()));
+					iter.prev();
+					continue;
+				}
+			}
+			// Exit
+			break;
+		}
+		// Return result
+		Ok(res)
+	}
 }
 
 impl Transaction {
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
+	async fn prepare_scan<K>(
+		&mut self,
+		rng: Range<K>,
+		version: Option<u64>,
+	) -> Result<Range<Key>, Error>
+	where
+		K: KeyEncode + Sprintable + Debug,
+	{
+		// RocksDB does not support versioned queries.
+		if version.is_some() {
+			return Err(Error::UnsupportedVersionedQueries);
+		}
+		// Check to see if transaction is closed
+		if self.done {
+			return Err(Error::TxFinished);
+		}
+		// Convert the range to bytes
+		let rng: Range<Key> = Range {
+			start: rng.start.encode_owned()?,
+			end: rng.end.encode_owned()?,
+		};
+		Ok(rng)
+	}
+
 	pub(crate) fn new_save_point(&mut self) {
 		// Get the transaction
 		let inner = self.inner.as_ref().unwrap();

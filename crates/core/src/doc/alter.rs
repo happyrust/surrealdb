@@ -11,6 +11,7 @@ use crate::sql::paths::EDGE;
 use crate::sql::paths::IN;
 use crate::sql::paths::OUT;
 use crate::sql::value::Value;
+use crate::sql::FlowResultExt;
 use reblessive::tree::Stk;
 use std::sync::Arc;
 
@@ -169,24 +170,30 @@ impl Document {
 			true => {
 				// This is an INSERT statement
 				if let Workable::Insert(v) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current_reduced)).await?;
+					let v = v
+						.compute(stk, ctx, opt, Some(&self.current_reduced))
+						.await
+						.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 				// This is an INSERT RELATION statement
 				if let Workable::Relate(_, _, Some(v)) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current_reduced)).await?;
+					let v = v
+						.compute(stk, ctx, opt, Some(&self.current_reduced))
+						.await
+						.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 			}
 			false => {
 				// This is an INSERT statement
 				if let Workable::Insert(v) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current)).await?;
+					let v = v.compute(stk, ctx, opt, Some(&self.current)).await.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 				// This is an INSERT RELATION statement
 				if let Workable::Relate(_, _, Some(v)) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current)).await?;
+					let v = v.compute(stk, ctx, opt, Some(&self.current)).await.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 			}
@@ -224,7 +231,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the PATCH data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().patch(data)?
 				}
 				Data::MergeExpression(data) => {
@@ -234,7 +241,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the MERGE data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().merge(data)?
 				}
 				Data::ReplaceExpression(data) => {
@@ -244,7 +251,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the REPLACE data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().replace(data)?
 				}
 				Data::ContentExpression(data) => {
@@ -254,7 +261,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the CONTENT data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().replace(data)?
 				}
 				Data::UnsetExpression(i) => {
@@ -266,7 +273,7 @@ impl Document {
 					true => {
 						for x in x.iter() {
 							#[rustfmt::skip]
-							let v = x.2.compute(stk, ctx, opt, Some(&self.current_reduced)).await?;
+							let v = x.2.compute(stk, ctx, opt, Some(&self.current_reduced)).await.catch_return()?;
 							match &x.1 {
 								#[rustfmt::skip]
 								Operator::Equal => match v {
@@ -302,7 +309,7 @@ impl Document {
 					false => {
 						for x in x.iter() {
 							#[rustfmt::skip]
-							let v = x.2.compute(stk, ctx, opt, Some(&self.current)).await?;
+							let v = x.2.compute(stk, ctx, opt, Some(&self.current)).await.catch_return()?;
 							match &x.1 {
 								#[rustfmt::skip]
 								Operator::Equal => match v {
@@ -338,7 +345,7 @@ impl Document {
 						true => {
 							for x in x.iter() {
 								#[rustfmt::skip]
-								let v = x.2.compute(stk, &ctx, opt, Some(&self.current_reduced)).await?;
+								let v = x.2.compute(stk, &ctx, opt, Some(&self.current_reduced)).await.catch_return()?;
 								match &x.1 {
 									#[rustfmt::skip]
 									Operator::Equal => match v {
@@ -374,7 +381,7 @@ impl Document {
 						false => {
 							for x in x.iter() {
 								#[rustfmt::skip]
-								let v = x.2.compute(stk, &ctx, opt, Some(&self.current)).await?;
+								let v = x.2.compute(stk, &ctx, opt, Some(&self.current)).await.catch_return()?;
 								match &x.1 {
 									#[rustfmt::skip]
 									Operator::Equal => match v {

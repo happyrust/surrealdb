@@ -1,5 +1,6 @@
 use std::{
 	fmt::{self, Write},
+	io::{self, IsTerminal as _},
 	time::{Duration, Instant},
 };
 
@@ -27,7 +28,7 @@ impl TestReport {
 		let use_color = match color {
 			ColorMode::Always => true,
 			ColorMode::Never => false,
-			ColorMode::Auto => atty::is(atty::Stream::Stdout),
+			ColorMode::Auto => io::stdout().is_terminal(),
 		};
 		let mut buffer = String::new();
 		let mut f = Fmt::new(&mut buffer, 2);
@@ -176,6 +177,10 @@ impl TestReport {
 			TestError::Paniced(e) => {
 				writeln!(f, "> Test failed, tests caused a panic to occur")?;
 				f.indent(|f| writeln!(f, "- Panic payload: {e}"))
+			}
+			TestError::Import(import, error) => {
+				writeln!(f, "> Test failed, running import `{import}` caused an error:")?;
+				f.indent(|f| writeln!(f, "- {error}"))
 			}
 		}
 	}

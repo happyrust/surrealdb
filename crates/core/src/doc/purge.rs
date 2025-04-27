@@ -7,6 +7,7 @@ use crate::doc::CursorDoc;
 use crate::doc::CursorValue;
 use crate::doc::Document;
 use crate::err::Error;
+use crate::idx::planner::ScanDirection;
 use crate::key::r#ref::Ref;
 use crate::kvs::KeyDecode;
 use crate::sql::dir::Dir;
@@ -20,6 +21,7 @@ use crate::sql::statements::UpdateStatement;
 use crate::sql::table::Tables;
 use crate::sql::value::{Value, Values};
 use crate::sql::Data;
+use crate::sql::FlowResultExt as _;
 use crate::sql::Operator;
 use crate::sql::Part;
 use crate::sql::Thing;
@@ -95,9 +97,10 @@ impl Document {
 				// Obtain a transaction
 				let txn = ctx.tx();
 				// Obtain a stream of keys
-				let mut stream = txn.stream_keys(range.clone(), None);
+				let mut stream = txn.stream_keys(range.clone(), None, ScanDirection::Forward);
 				// Loop until no more entries
 				while let Some(res) = stream.next().await {
+					yield_now!();
 					// Decode the key
 					let key = res?;
 					let r#ref = Ref::decode(&key)?;
@@ -198,7 +201,8 @@ impl Document {
 										None,
 										&[Part::All],
 									)
-									.await?
+									.await
+									.catch_return()?
 									.into();
 								// Construct the document for the compute method
 								let doc = CursorDoc::new(None, None, doc);
@@ -206,6 +210,7 @@ impl Document {
 								// Compute the custom instruction.
 								v.compute(stk, &ctx, &opt.clone().with_perms(false), Some(&doc))
 									.await
+									.catch_return()
 									// Wrap any error in an error explaining what went wrong
 									.map_err(|e| {
 										Error::RefsUpdateFailure(rid.to_string(), e.to_string())

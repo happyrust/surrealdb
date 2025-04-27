@@ -4,7 +4,7 @@ use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::sql::{
 	fmt::{pretty_indent, Fmt, Pretty},
-	Number, Operation, Value,
+	Value,
 };
 use reblessive::tree::Stk;
 use revision::revisioned;
@@ -14,6 +14,8 @@ use std::fmt::{self, Display, Formatter, Write};
 use std::ops;
 use std::ops::Deref;
 use std::ops::DerefMut;
+
+use super::FlowResult;
 
 pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Array";
 
@@ -30,63 +32,12 @@ impl From<Value> for Array {
 	}
 }
 
-impl From<Vec<Value>> for Array {
-	fn from(v: Vec<Value>) -> Self {
-		Self(v)
-	}
-}
-
-impl From<Vec<i32>> for Array {
-	fn from(v: Vec<i32>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<f32>> for Array {
-	fn from(v: Vec<f32>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<f64>> for Array {
-	fn from(v: Vec<f64>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<usize>> for Array {
-	fn from(v: Vec<usize>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<&str>> for Array {
-	fn from(v: Vec<&str>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<String>> for Array {
-	fn from(v: Vec<String>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<Number>> for Array {
-	fn from(v: Vec<Number>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<Operation>> for Array {
-	fn from(v: Vec<Operation>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
-	}
-}
-
-impl From<Vec<bool>> for Array {
-	fn from(v: Vec<bool>) -> Self {
-		Self(v.into_iter().map(Value::from).collect())
+impl<T> From<Vec<T>> for Array
+where
+	Value: From<T>,
+{
+	fn from(v: Vec<T>) -> Self {
+		v.into_iter().map(Value::from).collect()
 	}
 }
 
@@ -150,13 +101,11 @@ impl Array {
 		ctx: &Context,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
+	) -> FlowResult<Value> {
 		let mut x = Self::with_capacity(self.len());
 		for v in self.iter() {
-			match v.compute(stk, ctx, opt, doc).await {
-				Ok(v) => x.push(v),
-				Err(e) => return Err(e),
-			};
+			let v = v.compute(stk, ctx, opt, doc).await?;
+			x.push(v);
 		}
 		Ok(Value::Array(x))
 	}
@@ -312,26 +261,6 @@ impl Complement<Array> for Array {
 			}
 		}
 		out
-	}
-}
-
-// ------------------------------
-
-#[allow(dead_code)]
-pub(crate) trait Concat<T> {
-	fn concat(self, other: T) -> T;
-}
-
-impl Concat<Array> for Array {
-	fn concat(mut self, mut other: Array) -> Array {
-		self.append(&mut other);
-		self
-	}
-}
-
-impl Concat<String> for String {
-	fn concat(self, other: String) -> String {
-		self + &other
 	}
 }
 
@@ -507,7 +436,7 @@ pub(crate) trait Uniq<T> {
 
 impl Uniq<Array> for Array {
 	fn uniq(mut self) -> Array {
-		#[allow(clippy::mutable_key_type)]
+		#[expect(clippy::mutable_key_type)]
 		let mut set: HashSet<&Value> = HashSet::new();
 		let mut to_remove: Vec<usize> = Vec::new();
 		for (i, item) in self.iter().enumerate() {
