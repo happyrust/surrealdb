@@ -17,7 +17,7 @@ use crate::sql::{
 	Future, Geometry, Idiom, Mock, Number, Object, Operation, Param, Part, Query, Range, Regex,
 	Strand, Subquery, Table, Tables, Thing, Uuid,
 };
-use crate::sql::{Closure, ControlFlow, FlowResult};
+use crate::sql::{Closure, ControlFlow, FlowResult, Ident, Kind};
 use chrono::{DateTime, Utc};
 
 use geo::Point;
@@ -477,6 +477,52 @@ impl Value {
 	// Simple output of value type
 	// -----------------------------------
 
+	pub fn kind(&self) -> Option<Kind> {
+		match self {
+			Value::None => None,
+			Value::Null => Some(Kind::Null),
+			Value::Bool(_) => Some(Kind::Bool),
+			Value::Number(_) => Some(Kind::Number),
+			Value::Strand(_) => Some(Kind::String),
+			Value::Duration(_) => Some(Kind::Duration),
+			Value::Datetime(_) => Some(Kind::Datetime),
+			Value::Uuid(_) => Some(Kind::Uuid),
+			Value::Array(arr) => Some(Kind::Array(
+				Box::new(arr.first().and_then(|v| v.kind()).unwrap_or_default()),
+				None,
+			)),
+			Value::Object(_) => Some(Kind::Object),
+			Value::Geometry(geo) => Some(Kind::Geometry(vec![geo.as_type().to_string()])),
+			Value::Bytes(_) => Some(Kind::Bytes),
+			Value::Thing(thing) => Some(Kind::Record(vec![thing.tb.clone().into()])),
+			Value::Param(_) => None,
+			Value::Idiom(_) => None,
+			Value::Table(_) => None,
+			Value::Mock(_) => None,
+			Value::Regex(_) => None,
+			Value::Cast(_) => None,
+			Value::Block(_) => None,
+			Value::Range(_) => None,
+			Value::Edges(_) => None,
+			Value::Future(_) => None,
+			Value::Constant(_) => None,
+			Value::Function(_) => None,
+			Value::Subquery(_) => None,
+			Value::Query(_) => None,
+			Value::Model(_) => None,
+			Value::Closure(closure) => {
+				let args_kinds =
+					closure.args.iter().map(|(_, kind)| kind.clone()).collect::<Vec<_>>();
+				let returns_kind = closure.returns.clone().map(Box::new);
+
+				Some(Kind::Function(Some(args_kinds), returns_kind))
+			}
+			Value::Refs(_) => None,
+			Value::Expression(_) => None,
+			Value::File(file) => Some(Kind::File(vec![Ident::from(file.bucket.as_str())])),
+		}
+	}
+
 	/// Returns the surql representation of the kind of the value as a string.
 	///
 	/// # Warning
@@ -594,7 +640,6 @@ impl Value {
 			},
 			Value::Uuid(v) => match other {
 				Value::Uuid(w) => v == w,
-				Value::Regex(w) => w.regex().is_match(v.to_raw().as_str()),
 				_ => false,
 			},
 			Value::Thing(v) => match other {
@@ -609,7 +654,6 @@ impl Value {
 			},
 			Value::Regex(v) => match other {
 				Value::Regex(w) => v == w,
-				Value::Uuid(w) => v.regex().is_match(w.to_raw().as_str()),
 				Value::Thing(w) => v.regex().is_match(w.to_raw().as_str()),
 				Value::Strand(w) => v.regex().is_match(w.as_str()),
 				_ => false,
@@ -821,27 +865,6 @@ impl Value {
 		}
 	}
 
-	pub fn can_be_range_bound(&self) -> bool {
-		matches!(
-			self,
-			Value::None
-				| Value::Null
-				| Value::Array(_)
-				| Value::Block(_)
-				| Value::Bool(_)
-				| Value::Datetime(_)
-				| Value::Duration(_)
-				| Value::Geometry(_)
-				| Value::Number(_)
-				| Value::Object(_)
-				| Value::Param(_)
-				| Value::Strand(_)
-				| Value::Subquery(_)
-				| Value::Table(_)
-				| Value::Uuid(_)
-		)
-	}
-
 	/// Validate that a Value is computed or contains only computed Values
 	pub fn validate_computed(&self) -> Result<(), Error> {
 		use Value::*;
@@ -897,6 +920,7 @@ impl Value {
 			Value::Subquery(v) => return stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
 			Value::Expression(v) => return stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
 			Value::Refs(v) => v.compute(ctx, opt, doc).await,
+			Value::Edges(v) => v.compute(stk, ctx, opt, doc).await,
 			_ => Ok(self.to_owned()),
 		};
 
@@ -957,6 +981,8 @@ pub(crate) trait TryAdd<Rhs = Self> {
 	fn try_add(self, rhs: Rhs) -> Result<Self::Output, Error>;
 }
 
+use std::ops::Add;
+
 impl TryAdd for Value {
 	type Output = Self;
 	fn try_add(self, other: Self) -> Result<Self, Error> {
@@ -966,6 +992,8 @@ impl TryAdd for Value {
 			(Self::Datetime(v), Self::Duration(w)) => Self::Datetime(w.try_add(v)?),
 			(Self::Duration(v), Self::Datetime(w)) => Self::Datetime(v.try_add(w)?),
 			(Self::Duration(v), Self::Duration(w)) => Self::Duration(v.try_add(w)?),
+			(Self::Array(v), Self::Array(w)) => Self::Array(v.add(w)),
+			(Self::Object(v), Self::Object(w)) => Self::Object(v.add(w)),
 			(v, w) => return Err(Error::TryAdd(v.to_raw_string(), w.to_raw_string())),
 		})
 	}
@@ -1099,13 +1127,13 @@ impl TryNeg for Value {
 /// Macro implementing conversion methods for the variants of the value enum.
 macro_rules! subtypes {
 	($($name:ident$( ( $($t:tt)* ) )? => ($is:ident,$as:ident,$into:ident)),*$(,)?) => {
-		pub enum Type{
+		pub enum Type {
 			$($name),*
 		}
 
 		impl Value {
 
-			pub fn type_of(&self) -> Type{
+			pub fn type_of(&self) -> Type {
 				match &self{
 					$(subtypes!{@pat $name $( ($($t)*) )?} => Type::$name),*
 				}

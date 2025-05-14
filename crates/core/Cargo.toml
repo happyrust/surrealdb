@@ -1,25 +1,18 @@
 [package]
 name = "surrealdb-core"
 publish = true
-edition = "2021"
-version = "3.0.0"
-rust-version = "1.84.0"
 readme = "README.md"
-authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
-description = "A scalable, distributed, collaborative, document-graph database, for the realtime web"
-repository = "https://github.com/surrealdb/surrealdb"
-homepage = "https://github.com/surrealdb/surrealdb"
 documentation = "https://docs.rs/surrealdb-core/"
-keywords = [
-    "database",
-    "embedded-database",
-    "key-value",
-    "key-value-store",
-    "kv-store",
-]
-categories = ["database-implementations", "data-structures", "embedded"]
-license-file = "../../LICENSE"
-resolver = "2"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license-file.workspace = true
 
 [features]
 # Public features
@@ -39,18 +32,8 @@ kv-rocksdb = [
     "dep:ext-sort",
     "dep:affinitypool",
 ]
-kv-tikv = [
-    "dep:tikv",
-    "tokio/time",
-    "dep:tempfile",
-    "dep:ext-sort",
-]
-kv-fdb = [
-    "dep:foundationdb",
-    "tokio/time",
-    "dep:tempfile",
-    "dep:ext-sort",
-]
+kv-tikv = ["dep:tikv", "tokio/time", "dep:tempfile", "dep:ext-sort"]
+kv-fdb = ["dep:foundationdb", "tokio/time", "dep:tempfile", "dep:ext-sort"]
 kv-surrealkv = [
     "dep:surrealkv",
     "tokio/time",
@@ -75,6 +58,7 @@ allocation-tracking = []
 # Special features
 kv-fdb-7_1 = ["foundationdb/fdb-7_1", "kv-fdb"]
 kv-fdb-7_3 = ["foundationdb/fdb-7_3", "kv-fdb"]
+enterprise = ["dep:rust-s3"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
@@ -131,6 +115,7 @@ async-executor.workspace = true
 async-graphql = { workspace = true, default-features = false, features = [
     "dynamic-schema",
 ] }
+async-trait.workspace = true
 base64.workspace = true
 bcrypt.workspace = true
 bincode.workspace = true
@@ -205,6 +190,7 @@ criterion = { workspace = true, features = ["async_tokio"] }
 env_logger.workspace = true
 flate2.workspace = true
 pprof = { workspace = true, features = ["flamegraph", "criterion"] }
+rstest.workspace = true
 serial_test.workspace = true
 temp-dir.workspace = true
 test-log = { workspace = true, features = ["trace"] }
@@ -244,6 +230,9 @@ mimalloc = { workspace = true, optional = true, default-features = false }
 
 [target.'cfg(any(target_os = "android", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 jemallocator = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rust-s3 = { workspace = true, optional = true }
 
 [lints]
 workspace = true

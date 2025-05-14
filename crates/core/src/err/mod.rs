@@ -29,11 +29,6 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-	/// This error is used for ignoring a document when processing a query
-	#[doc(hidden)]
-	#[error("Conditional clause is not truthy")]
-	Ignore,
-
 	/// The database encountered unreachable logic
 	#[error("The database encountered unreachable logic: {0}")]
 	Unreachable(String),
@@ -362,6 +357,12 @@ pub enum Error {
 	/// The requested param does not exist
 	#[error("The param '${name}' does not exist")]
 	PaNotFound {
+		name: String,
+	},
+
+	/// The requested database does not exist
+	#[error("The sequence '{name}' does not exist")]
+	SeqNotFound {
 		name: String,
 	},
 
@@ -993,6 +994,12 @@ pub enum Error {
 	/// The requested config already exists
 	#[error("The config for {name} already exists")]
 	CgAlreadyExists {
+		name: String,
+	},
+
+	/// The requested sequence already exists
+	#[error("The sequence '{name}' already exists")]
+	SeqAlreadyExists {
 		name: String,
 	},
 

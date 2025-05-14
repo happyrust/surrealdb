@@ -133,7 +133,7 @@ impl<'a> StatementContext<'a> {
 
 	pub(crate) fn check_record_strategy(
 		&self,
-		with_all_indexes: bool,
+		all_expressions_with_index: bool,
 		granted_permission: GrantedPermission,
 	) -> Result<RecordStrategy, Error> {
 		// Update / Upsert / Delete need to retrieve the values:
@@ -142,10 +142,10 @@ impl<'a> StatementContext<'a> {
 		if matches!(self.stm, Statement::Update(_) | Statement::Upsert(_) | Statement::Delete(_)) {
 			return Ok(RecordStrategy::KeysAndValues);
 		}
-		// If there is a WHERE clause, then
-		// we need to fetch and process
+		// If there is an index backs a WHERE clause but not all expressions,
+		// then we need to fetch and process
 		// record content values too.
-		if !with_all_indexes && self.cond.is_some() {
+		if !all_expressions_with_index && self.cond.is_some() {
 			return Ok(RecordStrategy::KeysAndValues);
 		}
 
@@ -226,7 +226,7 @@ pub(crate) struct QueryPlanner {
 	fallbacks: Vec<String>,
 	iteration_workflow: Vec<IterationStage>,
 	iteration_index: AtomicU8,
-	orders: Vec<IteratorRef>,
+	ordering_indexes: Vec<IteratorRef>,
 	granted_permissions: HashMap<String, GrantedPermission>,
 	any_specific_permission: bool,
 }
@@ -239,7 +239,7 @@ impl QueryPlanner {
 			fallbacks: vec![],
 			iteration_workflow: Vec::default(),
 			iteration_index: AtomicU8::new(0),
-			orders: vec![],
+			ordering_indexes: vec![],
 			granted_permissions: HashMap::default(),
 			any_specific_permission: false,
 		}
@@ -306,11 +306,11 @@ impl QueryPlanner {
 				if io.require_distinct() {
 					self.requires_distinct = true;
 				}
-				let is_order = exp.is_none();
+				let is_order = io.is_order();
 				let ir = exe.add_iterator(IteratorEntry::Single(exp, io));
 				self.add(t.clone(), Some(ir), exe, it, rs);
 				if is_order {
-					self.orders.push(ir);
+					self.ordering_indexes.push(ir);
 				}
 			}
 			Plan::MultiIndex(non_range_indexes, ranges_indexes, rs) => {
@@ -327,8 +327,11 @@ impl QueryPlanner {
 				self.requires_distinct = true;
 				self.add(t.clone(), None, exe, it, rs);
 			}
-			Plan::SingleIndexRange(ixn, rq, keys_only) => {
+			Plan::SingleIndexRange(ixn, rq, keys_only, is_order) => {
 				let ir = exe.add_iterator(IteratorEntry::Range(rq.exps, ixn, rq.from, rq.to));
+				if is_order {
+					self.ordering_indexes.push(ir);
+				}
 				self.add(t.clone(), Some(ir), exe, it, keys_only);
 			}
 			Plan::TableIterator(reason, rs, sc) => {
@@ -378,7 +381,7 @@ impl QueryPlanner {
 	}
 
 	pub(crate) fn is_order(&self, irf: &IteratorRef) -> bool {
-		self.orders.contains(irf)
+		self.ordering_indexes.contains(irf)
 	}
 
 	pub(crate) fn is_any_specific_permission(&self) -> bool {
