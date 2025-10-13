@@ -1,14 +1,14 @@
 /// A macro for returning an error when a unexpected token was found.
 ///
-/// This macro handles a variety of situations, including errors related to invalid tokens and
-/// unexpected `EOF` or whitespace.
+/// This macro handles a variety of situations, including errors related to
+/// invalid tokens and unexpected `EOF` or whitespace.
 ///
-/// This macro takes a reference to the parser, the token which was unexpected and a expression
-/// which explains what should be expected instead.
+/// This macro takes a reference to the parser, the token which was unexpected
+/// and a expression which explains what should be expected instead.
 ///
 /// This macro attaches the span from the token as an error span to the error.
 macro_rules! unexpected {
-	($parser:expr, $found:expr, $expected:expr $(, @$span:expr)? $(, $($t:tt)* )?) => {{
+	($parser:expr_2021, $found:expr_2021, $expected:expr_2021 $(, @$span:expr_2021)? $(, $($t:tt)* )?) => {{
 		let __found: $crate::syn::token::Token = $found;
 		match __found.kind{
 			$crate::syn::token::TokenKind::Invalid => {
@@ -16,7 +16,7 @@ macro_rules! unexpected {
 			}
 			$crate::syn::token::TokenKind::Eof => {
 				let error = $crate::syn::error::syntax_error!("Unexpected end of file, expected {}",$expected, @__found.span $( $($t)* )?);
-				return Err(error.with_data_pending())
+				return Err(error)
 			}
 			$crate::syn::token::TokenKind::WhiteSpace => {
 				$crate::syn::error::bail!("Unexpected whitespace, expected token {} to continue",$expected,  @__found.span$( $($t)* )?)
@@ -29,10 +29,10 @@ macro_rules! unexpected {
 
 }
 
-/// A macro for asserting that the next token should be of the given type, returns the token if
-/// this is the case otherwise it returns an error.
+/// A macro for asserting that the next token should be of the given type,
+/// returns the token if this is the case otherwise it returns an error.
 macro_rules! expected {
-	($parser:expr, $($kind:tt)*) => {{
+	($parser:expr_2021, $($kind:tt)*) => {{
 		let token: crate::syn::token::Token = $parser.next();
 		if let $($kind)* = token.kind{
 			token
@@ -42,11 +42,11 @@ macro_rules! expected {
 	}};
 }
 
-/// Pops the last token, checks if it is the desired glue value and then returns the value.
-/// This will panic if the token was not correct or the value was already eat, both of which the
-/// parser should make sure to uphold.
+/// Pops the last token, checks if it is the desired glue value and then returns
+/// the value. This will panic if the token was not correct or the value was
+/// already eat, both of which the parser should make sure to uphold.
 macro_rules! pop_glued {
-	($parser:expr, $variant:ident) => {{
+	($parser:expr_2021, $variant:ident) => {{
 		let token = $parser.pop_peek();
 		debug_assert!(matches!(
 			token.kind,
@@ -61,9 +61,10 @@ macro_rules! pop_glued {
 	}};
 }
 
-/// A macro for indicating that the parser encountered an token which it didn't expect.
+/// A macro for indicating that the parser encountered an token which it didn't
+/// expect.
 macro_rules! expected_whitespace {
-	($parser:expr, $($kind:tt)*) => {{
+	($parser:expr_2021, $($kind:tt)*) => {{
 		let token: crate::syn::token::Token = $parser.next_whitespace();
 		if let $($kind)* = token.kind{
 			token
@@ -73,29 +74,8 @@ macro_rules! expected_whitespace {
 	}};
 }
 
-#[cfg(test)]
-macro_rules! test_parse {
-	($func:ident$( ( $($e:expr),* $(,)? ))? , $t:expr) => {{
-		let mut parser = $crate::syn::parser::Parser::new($t.as_bytes());
-		let mut stack = reblessive::Stack::new();
-		stack.enter(|ctx| parser.$func(ctx,$($($e),*)*)).finish()
-	}};
-}
-
-#[cfg(test)]
-macro_rules! test_parse_with_settings {
-	($func:ident$( ( $($e:expr),* $(,)? ))? , $t:expr, $s:expr) => {{
-		let mut parser = $crate::syn::parser::Parser::new_with_settings(
-			$t.as_bytes(),
-			$s,
-		);
-		let mut stack = reblessive::Stack::new();
-		stack.enter(|ctx| parser.$func(ctx,$($($e),*)*)).finish()
-	}};
-}
-
 macro_rules! enter_object_recursion {
-	($name:ident = $this:expr => { $($t:tt)* }) => {{
+	($name:ident = $this:expr_2021 => { $($t:tt)* }) => {{
 		if $this.settings.object_recursion_limit == 0 {
 			return Err($crate::syn::parser::SyntaxError::new("Exceeded query recursion depth limit")
 				.with_span($this.last_span(), $crate::syn::error::MessageKind::Error))
@@ -129,7 +109,7 @@ macro_rules! enter_object_recursion {
 }
 
 macro_rules! enter_query_recursion {
-	($name:ident = $this:expr => { $($t:tt)* }) => {{
+	($name:ident = $this:expr_2021 => { $($t:tt)* }) => {{
 		if $this.settings.query_recursion_limit == 0 {
 			return Err($crate::syn::parser::SyntaxError::new("Exceeded query recursion depth limit")
 				.with_span($this.last_span(), $crate::syn::error::MessageKind::Error))
@@ -162,50 +142,7 @@ macro_rules! enter_query_recursion {
 	}};
 }
 
-// This macro is used to parse an option in the format `+option`.
-macro_rules! parse_option {
-	($parser: ident, $what: expr, $( $string: expr => $result: expr, )+ _ => $fallback: expr) => {
-		if $parser.eat(t!("+")) {
-			let what = $what;
-			let kind = $parser.next_token_value::<Ident>()?;
-			match kind.0.as_str() {
-				$(
-					v if v.eq_ignore_ascii_case($string) => { $result },
-				)+
-				found => {
-					let expected = vec![$( $string ),+]
-						.into_iter()
-						.map(|v| format!("`{v}`"))
-						.collect::<Vec<String>>();
-
-					let expected = if expected.len() > 1 {
-						format!(
-							"{} or {}",
-							expected[..expected.len() - 1].join(", "),
-							expected.last().unwrap()
-						)
-					} else {
-						expected[0].clone()
-					};
-
-					bail!("Unexpected {what} `{}` expected {expected}", found, @$parser.last_span());
-				}
-			}
-		} else {
-			$fallback
-		}
-	};
-}
-
-pub(crate) use enter_object_recursion;
-pub(crate) use enter_query_recursion;
-pub(crate) use expected;
-pub(crate) use expected_whitespace;
-pub(crate) use parse_option;
-pub(crate) use pop_glued;
-pub(crate) use unexpected;
-
-#[cfg(test)]
-pub(crate) use test_parse;
-#[cfg(test)]
-pub(crate) use test_parse_with_settings;
+pub(crate) use {
+	enter_object_recursion, enter_query_recursion, expected, expected_whitespace, pop_glued,
+	unexpected,
+};

@@ -1,5 +1,6 @@
 mod access;
 mod analyzer;
+mod api;
 mod bucket;
 mod database;
 mod event;
@@ -13,36 +14,27 @@ mod sequence;
 mod table;
 mod user;
 
-pub use access::RemoveAccessStatement;
-pub use analyzer::RemoveAnalyzerStatement;
-pub use bucket::RemoveBucketStatement;
-pub use database::RemoveDatabaseStatement;
-pub use event::RemoveEventStatement;
-pub use field::RemoveFieldStatement;
-pub use function::RemoveFunctionStatement;
-pub use index::RemoveIndexStatement;
-pub use model::RemoveModelStatement;
-pub use namespace::RemoveNamespaceStatement;
-pub use param::RemoveParamStatement;
-pub use sequence::RemoveSequenceStatement;
-pub use table::RemoveTableStatement;
-pub use user::RemoveUserStatement;
-
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::doc::CursorDoc;
-use crate::err::Error;
-use crate::sql::Value;
-
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+pub(crate) use access::RemoveAccessStatement;
+pub(crate) use analyzer::RemoveAnalyzerStatement;
+pub(crate) use api::RemoveApiStatement;
+pub(crate) use bucket::RemoveBucketStatement;
+pub(crate) use database::RemoveDatabaseStatement;
+pub(crate) use event::RemoveEventStatement;
+pub(crate) use field::RemoveFieldStatement;
+pub(crate) use function::RemoveFunctionStatement;
+pub(crate) use index::RemoveIndexStatement;
+pub(crate) use model::RemoveModelStatement;
+pub(crate) use namespace::RemoveNamespaceStatement;
+pub(crate) use param::RemoveParamStatement;
+pub(crate) use sequence::RemoveSequenceStatement;
+pub(crate) use table::RemoveTableStatement;
+pub(crate) use user::RemoveUserStatement;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub enum RemoveStatement {
+pub(crate) enum RemoveStatement {
 	Namespace(RemoveNamespaceStatement),
 	Database(RemoveDatabaseStatement),
 	Function(RemoveFunctionStatement),
@@ -55,39 +47,9 @@ pub enum RemoveStatement {
 	Index(RemoveIndexStatement),
 	User(RemoveUserStatement),
 	Model(RemoveModelStatement),
+	Api(RemoveApiStatement),
 	Bucket(RemoveBucketStatement),
 	Sequence(RemoveSequenceStatement),
-}
-
-impl RemoveStatement {
-	/// Check if we require a writeable transaction
-	pub(crate) fn writeable(&self) -> bool {
-		true
-	}
-	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-		_doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		match self {
-			Self::Namespace(ref v) => v.compute(ctx, opt).await,
-			Self::Database(ref v) => v.compute(ctx, opt).await,
-			Self::Function(ref v) => v.compute(ctx, opt).await,
-			Self::Access(ref v) => v.compute(ctx, opt).await,
-			Self::Param(ref v) => v.compute(ctx, opt).await,
-			Self::Table(ref v) => v.compute(ctx, opt).await,
-			Self::Event(ref v) => v.compute(ctx, opt).await,
-			Self::Field(ref v) => v.compute(ctx, opt).await,
-			Self::Index(ref v) => v.compute(ctx, opt).await,
-			Self::Analyzer(ref v) => v.compute(ctx, opt).await,
-			Self::User(ref v) => v.compute(ctx, opt).await,
-			Self::Model(ref v) => v.compute(ctx, opt).await,
-			Self::Bucket(ref v) => v.compute(ctx, opt).await,
-			Self::Sequence(ref v) => v.compute(ctx, opt).await,
-		}
-	}
 }
 
 impl Display for RemoveStatement {
@@ -105,8 +67,53 @@ impl Display for RemoveStatement {
 			Self::Analyzer(v) => Display::fmt(v, f),
 			Self::User(v) => Display::fmt(v, f),
 			Self::Model(v) => Display::fmt(v, f),
+			Self::Api(v) => Display::fmt(v, f),
 			Self::Bucket(v) => Display::fmt(v, f),
 			Self::Sequence(v) => Display::fmt(v, f),
+		}
+	}
+}
+
+impl From<RemoveStatement> for crate::expr::statements::RemoveStatement {
+	fn from(v: RemoveStatement) -> Self {
+		match v {
+			RemoveStatement::Namespace(v) => Self::Namespace(v.into()),
+			RemoveStatement::Database(v) => Self::Database(v.into()),
+			RemoveStatement::Function(v) => Self::Function(v.into()),
+			RemoveStatement::Analyzer(v) => Self::Analyzer(v.into()),
+			RemoveStatement::Access(v) => Self::Access(v.into()),
+			RemoveStatement::Param(v) => Self::Param(v.into()),
+			RemoveStatement::Table(v) => Self::Table(v.into()),
+			RemoveStatement::Event(v) => Self::Event(v.into()),
+			RemoveStatement::Field(v) => Self::Field(v.into()),
+			RemoveStatement::Index(v) => Self::Index(v.into()),
+			RemoveStatement::User(v) => Self::User(v.into()),
+			RemoveStatement::Model(v) => Self::Model(v.into()),
+			RemoveStatement::Api(v) => Self::Api(v.into()),
+			RemoveStatement::Bucket(v) => Self::Bucket(v.into()),
+			RemoveStatement::Sequence(v) => Self::Sequence(v.into()),
+		}
+	}
+}
+
+impl From<crate::expr::statements::RemoveStatement> for RemoveStatement {
+	fn from(v: crate::expr::statements::RemoveStatement) -> Self {
+		match v {
+			crate::expr::statements::RemoveStatement::Namespace(v) => Self::Namespace(v.into()),
+			crate::expr::statements::RemoveStatement::Database(v) => Self::Database(v.into()),
+			crate::expr::statements::RemoveStatement::Function(v) => Self::Function(v.into()),
+			crate::expr::statements::RemoveStatement::Analyzer(v) => Self::Analyzer(v.into()),
+			crate::expr::statements::RemoveStatement::Access(v) => Self::Access(v.into()),
+			crate::expr::statements::RemoveStatement::Param(v) => Self::Param(v.into()),
+			crate::expr::statements::RemoveStatement::Table(v) => Self::Table(v.into()),
+			crate::expr::statements::RemoveStatement::Event(v) => Self::Event(v.into()),
+			crate::expr::statements::RemoveStatement::Field(v) => Self::Field(v.into()),
+			crate::expr::statements::RemoveStatement::Index(v) => Self::Index(v.into()),
+			crate::expr::statements::RemoveStatement::User(v) => Self::User(v.into()),
+			crate::expr::statements::RemoveStatement::Model(v) => Self::Model(v.into()),
+			crate::expr::statements::RemoveStatement::Api(v) => Self::Api(v.into()),
+			crate::expr::statements::RemoveStatement::Bucket(v) => Self::Bucket(v.into()),
+			crate::expr::statements::RemoveStatement::Sequence(v) => Self::Sequence(v.into()),
 		}
 	}
 }

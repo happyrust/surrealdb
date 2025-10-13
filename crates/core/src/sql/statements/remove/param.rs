@@ -1,50 +1,12 @@
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::err::Error;
-use crate::iam::{Action, ResourceKind};
-use crate::sql::{Base, Ident, Value};
-
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
-#[revisioned(revision = 2)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct RemoveParamStatement {
-	pub name: Ident,
-	#[revision(start = 2)]
-	pub if_exists: bool,
-}
+use crate::fmt::EscapeIdent;
 
-impl RemoveParamStatement {
-	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(&self, ctx: &Context, opt: &Options) -> Result<Value, Error> {
-		let future = async {
-			// Allowed to run?
-			opt.is_allowed(Action::Edit, ResourceKind::Parameter, &Base::Db)?;
-			// Get the transaction
-			let txn = ctx.tx();
-			// Get the definition
-			let (ns, db) = opt.ns_db()?;
-			let pa = txn.get_db_param(ns, db, &self.name).await?;
-			// Delete the definition
-			let key = crate::key::database::pa::new(ns, db, &pa.name);
-			txn.del(key).await?;
-			// Clear the cache
-			txn.clear();
-			// Ok all good
-			Ok(Value::None)
-		}
-		.await;
-		match future {
-			Err(Error::PaNotFound {
-				..
-			}) if self.if_exists => Ok(Value::None),
-			v => v,
-		}
-	}
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct RemoveParamStatement {
+	pub name: String,
+	pub if_exists: bool,
 }
 
 impl Display for RemoveParamStatement {
@@ -53,7 +15,25 @@ impl Display for RemoveParamStatement {
 		if self.if_exists {
 			write!(f, " IF EXISTS")?
 		}
-		write!(f, " ${}", self.name)?;
+		write!(f, " ${}", EscapeIdent(&self.name))?;
 		Ok(())
+	}
+}
+
+impl From<RemoveParamStatement> for crate::expr::statements::RemoveParamStatement {
+	fn from(v: RemoveParamStatement) -> Self {
+		crate::expr::statements::RemoveParamStatement {
+			name: v.name,
+			if_exists: v.if_exists,
+		}
+	}
+}
+
+impl From<crate::expr::statements::RemoveParamStatement> for RemoveParamStatement {
+	fn from(v: crate::expr::statements::RemoveParamStatement) -> Self {
+		RemoveParamStatement {
+			name: v.name,
+			if_exists: v.if_exists,
+		}
 	}
 }

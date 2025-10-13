@@ -1,31 +1,21 @@
-use crate::dbs;
-use crate::err::Error;
+use anyhow::Result;
 use clap::Args;
-use surrealdb::engine::any::IntoEndpoint;
+use surrealdb_core::kvs::TransactionBuilderFactory;
 
 #[derive(Args, Debug)]
 pub struct FixCommandArguments {
 	#[arg(help = "Database path used for storing data")]
 	#[arg(env = "SURREAL_PATH", index = 1)]
 	#[arg(default_value = "memory")]
-	#[arg(value_parser = super::validator::path_valid)]
 	path: String,
 }
 
-pub async fn init(
-	FixCommandArguments {
-		path,
-	}: FixCommandArguments,
-) -> Result<(), Error> {
-	// Clean the path
-	let endpoint = path.into_endpoint()?;
-	let path = if endpoint.path.is_empty() {
-		endpoint.url.to_string()
-	} else {
-		endpoint.path
-	};
-	// Fix the datastore, if applicable
-	dbs::fix(path).await?;
+/// Validate the datastore path for the `fix` subcommand.
+///
+/// Only the `TransactionBuilderFactory` bound is required here because this
+/// command does not need to start the HTTP server or build routes.
+pub async fn init<F: TransactionBuilderFactory>(args: FixCommandArguments) -> Result<()> {
 	// All ok
-	Ok(())
+	F::path_valid(&args.path)?;
+	Err(anyhow::anyhow!("Fix is not implemented"))
 }

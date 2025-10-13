@@ -1,14 +1,14 @@
-use crate::ctx::MutableContext;
-use crate::iam::Auth;
-use crate::iam::{Level, Role};
-use crate::sql::value::Value;
-use chrono::Utc;
-use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use chrono::Utc;
+use surrealdb_types::ToSql;
+
+use crate::iam::{Auth, Level, Role};
+use crate::types::{PublicValue, PublicVariables};
+use crate::val::Value;
 
 /// Specifies the current session information when processing a query.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
 pub struct Session {
 	/// The current session [`Auth`] information
 	pub au: Arc<Auth>,
@@ -27,13 +27,13 @@ pub struct Session {
 	/// The current access method
 	pub ac: Option<String>,
 	/// The current authentication token
-	pub tk: Option<Value>,
+	pub tk: Option<PublicValue>,
 	/// The current record authentication data
-	pub rd: Option<Value>,
+	pub rd: Option<PublicValue>,
 	/// The current expiration time of the session
 	pub exp: Option<i64>,
-	/// The parameters set
-	pub parameters: BTreeMap<String, Value>,
+	/// The variables set
+	pub variables: PublicVariables,
 }
 
 impl Session {
@@ -86,29 +86,24 @@ impl Session {
 	}
 
 	pub(crate) fn values(&self) -> Vec<(&'static str, Value)> {
-		let access: Value = self.ac.clone().into();
-		let auth: Value = self.rd.clone().into();
-		let token: Value = self.tk.clone().into();
-		let session: Value = Value::from(map! {
-			"ac".to_string() => self.ac.clone().into(),
-			"exp".to_string() => self.exp.into(),
-			"db".to_string() => self.db.clone().into(),
-			"id".to_string() => self.id.clone().into(),
-			"ip".to_string() => self.ip.clone().into(),
-			"ns".to_string() => self.ns.clone().into(),
-			"or".to_string() => self.or.clone().into(),
-			"rd".to_string() => self.rd.clone().into(),
-			"tk".to_string() => self.tk.clone().into(),
+		use crate::sql::expression::convert_public_value_to_internal;
+
+		let access = self.ac.clone().map(|x| x.into()).unwrap_or(Value::None);
+		let auth = self.rd.clone().map(convert_public_value_to_internal).unwrap_or(Value::None);
+		let token = self.tk.clone().map(convert_public_value_to_internal).unwrap_or(Value::None);
+		let session = Value::from(map! {
+			"ac".to_string() => access.clone(),
+			"exp".to_string() => self.exp.map(Value::from).unwrap_or(Value::None),
+			"db".to_string() => self.db.clone().map(|x| x.into()).unwrap_or(Value::None),
+			"id".to_string() => self.id.clone().map(|x| x.into()).unwrap_or(Value::None),
+			"ip".to_string() => self.ip.clone().map(|x| x.into()).unwrap_or(Value::None),
+			"ns".to_string() => self.ns.clone().map(|x| x.into()).unwrap_or(Value::None),
+			"or".to_string() => self.or.clone().map(|x| x.into()).unwrap_or(Value::None),
+			"rd".to_string() => auth.clone(),
+			"tk".to_string() => token.clone(),
 		});
 
 		vec![("access", access), ("auth", auth), ("token", token), ("session", session)]
-	}
-
-	/// Convert a session into a runtime
-	pub(crate) fn context(&self, ctx: &mut MutableContext) {
-		let vars = self.values().into_iter();
-
-		ctx.add_values(vars);
 	}
 
 	/// Create a system session for a given level and role
@@ -135,10 +130,10 @@ impl Session {
 	}
 
 	/// Create a record user session for a given NS and DB
-	pub fn for_record(ns: &str, db: &str, ac: &str, rid: Value) -> Session {
+	pub fn for_record(ns: &str, db: &str, ac: &str, rid: PublicValue) -> Session {
 		Session {
 			ac: Some(ac.to_owned()),
-			au: Arc::new(Auth::for_record(rid.to_string(), ns, db, ac)),
+			au: Arc::new(Auth::for_record(rid.to_sql(), ns, db, ac)),
 			rt: false,
 			ip: None,
 			or: None,
@@ -148,7 +143,7 @@ impl Session {
 			tk: None,
 			rd: Some(rid),
 			exp: None,
-			parameters: Default::default(),
+			variables: Default::default(),
 		}
 	}
 

@@ -1,16 +1,18 @@
-use crate::idx::docids::DocId;
-use crate::idx::trees::dynamicset::DynamicSet;
-use crate::idx::trees::hnsw::ElementId;
-use crate::idx::trees::store::NodeId;
+use std::cmp::{Ordering, Reverse};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, VecDeque};
+
 #[cfg(debug_assertions)]
 use ahash::HashMap;
 use ahash::{HashSet, HashSetExt};
 use revision::revisioned;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
-use std::cmp::{Ordering, Reverse};
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, VecDeque};
+
+use crate::idx::seqdocids::DocId;
+use crate::idx::trees::dynamicset::DynamicSet;
+use crate::idx::trees::hnsw::ElementId;
+use crate::idx::trees::store::NodeId;
 
 #[derive(Debug, Clone, Copy, Ord, Eq, PartialEq, PartialOrd)]
 pub(super) struct PriorityNode(Reverse<FloatKey>, NodeId);
@@ -137,7 +139,8 @@ impl DoublePriorityQueue {
 }
 
 /// Treats f64 as a sortable data type.
-/// It provides an implementation so it can be used as a key in a BTreeMap or BTreeSet.
+/// It provides an implementation so it can be used as a key in a BTreeMap or
+/// BTreeSet.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FloatKey(f64);
 
@@ -173,14 +176,13 @@ impl Ord for FloatKey {
 }
 
 /// Ids64 is a collection able to store u64 identifiers in an optimised way.
-/// The enumerations are optimised in a way that, depending on the number of identifiers,
-/// the most memory efficient variant is used.
-/// When identifiers are added or removed, the method returned the most appropriate
-/// variant (if required).
+/// The enumerations are optimised in a way that, depending on the number of
+/// identifiers, the most memory efficient variant is used.
+/// When identifiers are added or removed, the method returned the most
+/// appropriate variant (if required).
 #[derive(Debug, Clone, PartialEq)]
 #[revisioned(revision = 1)]
 #[derive(Serialize, Deserialize)]
-#[non_exhaustive]
 pub(in crate::idx) enum Ids64 {
 	Empty,
 	One(u64),
@@ -519,7 +521,6 @@ where
 	}
 }
 
-#[non_exhaustive]
 pub(super) struct KnnResultBuilder {
 	knn: u64,
 	docs: RoaringTreemap,
@@ -616,27 +617,30 @@ pub struct KnnResult {
 
 #[cfg(test)]
 pub(super) mod tests {
-	use crate::err::Error;
-	use crate::idx::docids::DocId;
-	use crate::idx::trees::knn::{DoublePriorityQueue, FloatKey, Ids64, KnnResultBuilder};
-	use crate::idx::trees::vector::{SharedVector, Vector};
-	use crate::sql::index::{Distance, VectorType};
-	use crate::sql::{Array, Number, Value};
-	use crate::syn::Parse;
-	#[cfg(debug_assertions)]
-	use ahash::HashMap;
-	use ahash::HashSet;
-	use flate2::read::GzDecoder;
-	use rand::prelude::SmallRng;
-	use rand::{Rng, SeedableRng};
-	use roaring::RoaringTreemap;
-	use rust_decimal::prelude::Zero;
 	use std::cmp::Reverse;
 	use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 	use std::fs::File;
 	use std::io::{BufRead, BufReader};
 	use std::time::SystemTime;
+
+	#[cfg(debug_assertions)]
+	use ahash::HashMap;
+	use ahash::HashSet;
+	use anyhow::Result;
+	use flate2::read::GzDecoder;
+	use rand::prelude::SmallRng;
+	use rand::{Rng, SeedableRng};
+	use roaring::RoaringTreemap;
+	use rust_decimal::prelude::Zero;
 	use test_log::test;
+
+	use crate::catalog::{Distance, VectorType};
+	use crate::idx::seqdocids::DocId;
+	use crate::idx::trees::knn::{DoublePriorityQueue, FloatKey, Ids64, KnnResultBuilder};
+	use crate::idx::trees::vector::{SharedVector, Vector};
+	use crate::sql::expression::convert_public_value_to_internal;
+	use crate::syn;
+	use crate::val::{Number, Value};
 
 	pub(crate) fn get_seed_rnd() -> SmallRng {
 		let seed: u64 = std::env::var("TEST_SEED")
@@ -670,7 +674,7 @@ pub(super) mod tests {
 		t: VectorType,
 		path: &str,
 		limit: Option<usize>,
-	) -> Result<Vec<(DocId, V)>, Error> {
+	) -> Result<Vec<(DocId, V)>> {
 		// Open the gzip file
 		let file = File::open(path)?;
 
@@ -689,7 +693,10 @@ pub(super) mod tests {
 				}
 			}
 			let line = line_result?;
-			let array = Array::parse(&line);
+			let Value::Array(array) = convert_public_value_to_internal(syn::value(&line).unwrap())
+			else {
+				panic!("Expected a valid array value");
+			};
 			let vec = Vector::try_from_value(t, array.len(), &Value::Array(array))?.into();
 			res.push((i as DocId, vec));
 		}
@@ -700,16 +707,16 @@ pub(super) mod tests {
 		rng: &mut SmallRng,
 		t: VectorType,
 		dim: usize,
-		gen: &RandomItemGenerator,
+		r#gen: &RandomItemGenerator,
 	) -> SharedVector {
 		let mut vec: Vec<Number> = Vec::with_capacity(dim);
 		for _ in 0..dim {
-			vec.push(gen.generate(rng));
+			vec.push(r#gen.generate(rng));
 		}
 		let vec = Vector::try_from_vector(t, &vec).unwrap();
 		if vec.is_null() {
 			// Some similarities (cosine) is undefined for null vector.
-			new_random_vec(rng, t, dim, gen)
+			new_random_vec(rng, t, dim, r#gen)
 		} else {
 			vec.into()
 		}
@@ -736,11 +743,11 @@ pub(super) mod tests {
 			distance: &Distance,
 		) -> Self {
 			let mut rng = get_seed_rnd();
-			let gen = RandomItemGenerator::new(distance, dimension);
+			let r#gen = RandomItemGenerator::new(distance, dimension);
 			if unique {
-				TestCollection::new_unique(collection_size, vt, dimension, &gen, &mut rng)
+				TestCollection::new_unique(collection_size, vt, dimension, &r#gen, &mut rng)
 			} else {
-				TestCollection::new_random(collection_size, vt, dimension, &gen, &mut rng)
+				TestCollection::new_random(collection_size, vt, dimension, &r#gen, &mut rng)
 			}
 		}
 
@@ -756,13 +763,13 @@ pub(super) mod tests {
 			collection_size: usize,
 			vector_type: VectorType,
 			dimension: usize,
-			gen: &RandomItemGenerator,
+			r#gen: &RandomItemGenerator,
 			rng: &mut SmallRng,
 		) -> Self {
 			let mut vector_set = HashSet::default();
 			let mut attempts = collection_size * 2;
 			while vector_set.len() < collection_size {
-				vector_set.insert(new_random_vec(rng, vector_type, dimension, gen));
+				vector_set.insert(new_random_vec(rng, vector_type, dimension, r#gen));
 				attempts -= 1;
 				if attempts == 0 {
 					panic!("Fail generating a unique random collection {vector_type} {dimension}");
@@ -779,13 +786,13 @@ pub(super) mod tests {
 			collection_size: usize,
 			vector_type: VectorType,
 			dimension: usize,
-			gen: &RandomItemGenerator,
+			r#gen: &RandomItemGenerator,
 			rng: &mut SmallRng,
 		) -> Self {
 			let mut coll = TestCollection::NonUnique(Vec::with_capacity(collection_size));
 			// Prepare data set
 			for doc_id in 0..collection_size {
-				coll.add(doc_id as DocId, new_random_vec(rng, vector_type, dimension, gen));
+				coll.add(doc_id as DocId, new_random_vec(rng, vector_type, dimension, r#gen));
 			}
 			coll
 		}
@@ -958,8 +965,8 @@ pub(super) mod tests {
 
 	#[test]
 	#[ignore]
-	// In HNSW we are maintaining a candidate list that requires both to know the first element
-	// and the last element of a set.
+	// In HNSW we are maintaining a candidate list that requires both to know the
+	// first element and the last element of a set.
 	// There is two possible options.
 	// 1. Using a BTreeSet that provide first() and last() methods.
 	// 2. Maintaining two BinaryHeap. One providing the min, and the other the max.

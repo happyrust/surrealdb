@@ -1,21 +1,21 @@
-use crate::api::engine::local::Db;
-use crate::api::engine::local::SurrealKv;
-use crate::api::err::Error;
-use crate::api::opt::Config;
-use crate::api::opt::Endpoint;
-use crate::api::opt::IntoEndpoint;
-use crate::api::Result;
-use crate::Connect;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
 use url::Url;
+
+use crate::Connect;
+use crate::api::Result;
+use crate::api::engine::local::{Db, SurrealKv};
+use crate::api::err::Error;
+use crate::api::opt::endpoint::into_endpoint;
+use crate::api::opt::{Config, Endpoint, IntoEndpoint};
 
 const VERSIONED_SCHEME: &str = "surrealkv+versioned";
 
 macro_rules! endpoints {
 	($($name:ty),*) => {
 		$(
-			impl IntoEndpoint<SurrealKv> for $name {
+			impl IntoEndpoint<SurrealKv> for $name {}
+			impl into_endpoint::Sealed<SurrealKv> for $name {
 				type Client = Db;
 
 				fn into_endpoint(self) -> Result<Endpoint> {
@@ -28,12 +28,12 @@ macro_rules! endpoints {
 				}
 			}
 
-			impl IntoEndpoint<SurrealKv> for ($name, Config) {
+			impl IntoEndpoint<SurrealKv> for ($name, Config) {}
+			impl into_endpoint::Sealed<SurrealKv> for ($name, Config) {
 				type Client = Db;
 
 				fn into_endpoint(self) -> Result<Endpoint> {
-		#[expect(deprecated)]
-					let mut endpoint = IntoEndpoint::<SurrealKv>::into_endpoint(self.0)?;
+					let mut endpoint = into_endpoint::Sealed::<SurrealKv>::into_endpoint(self.0)?;
 					endpoint.config = self.1;
 					Ok(endpoint)
 				}
@@ -79,7 +79,8 @@ impl<R> Connect<Db, R> {
 	pub fn versioned(mut self) -> Self {
 		let replace_scheme = |mut endpoint: Endpoint| -> Result<Endpoint> {
 			match endpoint.url.scheme() {
-				// If the engine is an unversioned SurrealKV, we want to switch it to a versioned one
+				// If the engine is an unversioned SurrealKV, we want to switch it to a versioned
+				// one
 				"surrealkv" => {
 					// Replace the scheme in the URL
 					endpoint.url.set_scheme(VERSIONED_SCHEME).unwrap_or_else(|_| {
@@ -94,7 +95,7 @@ impl<R> Connect<Db, R> {
 				// SurrealKV is already versioned, nothing to do here
 				self::VERSIONED_SCHEME => Ok(endpoint),
 				// This engine doesn't support versions
-				scheme => Err(Error::VersionsNotSupported(scheme.to_owned()).into()),
+				scheme => Err(Error::VersionsNotSupported(scheme.to_owned())),
 			}
 		};
 		self.address = self.address.and_then(replace_scheme);

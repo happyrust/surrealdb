@@ -1,135 +1,65 @@
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::doc::CursorDoc;
-use crate::err::Error;
-use crate::iam::{Action, ResourceKind};
-use crate::sql::reference::Reference;
-use crate::sql::statements::DefineTableStatement;
-use crate::sql::{Base, Ident, Permissions, Strand, Value};
-use crate::sql::{Idiom, Kind};
-
-use reblessive::tree::Stk;
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
-use std::ops::Deref;
-use uuid::Uuid;
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+use super::AlterKind;
+use crate::fmt::{EscapeIdent, QuoteStr};
+use crate::sql::reference::Reference;
+use crate::sql::{Expr, Idiom, Kind, Permissions};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct AlterFieldStatement {
-	pub name: Idiom,
-	pub what: Ident,
-	pub if_exists: bool,
-	pub flex: Option<bool>,
-	pub kind: Option<Option<Kind>>,
-	pub readonly: Option<bool>,
-	pub value: Option<Option<Value>>,
-	pub assert: Option<Option<Value>>,
-	pub default: Option<Option<Value>>,
-	pub permissions: Option<Permissions>,
-	pub comment: Option<Option<Strand>>,
-	pub reference: Option<Option<Reference>>,
-	pub default_always: Option<bool>,
+pub enum AlterDefault {
+	#[default]
+	None,
+	Drop,
+	Always(Expr),
+	Set(Expr),
 }
 
-impl AlterFieldStatement {
-	pub(crate) async fn compute(
-		&self,
-		_stk: &mut Stk,
-		ctx: &Context,
-		opt: &Options,
-		_doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Field, &Base::Db)?;
-		// Get the NS and DB
-		let (ns, db) = opt.ns_db()?;
-		// Fetch the transaction
-		let txn = ctx.tx();
-		// Get the table definition
-		let name = self.name.to_string();
-		let mut df = match txn.get_tb_field(ns, db, &self.what, &name).await {
-			Ok(tb) => tb.deref().clone(),
-			Err(Error::FdNotFound {
-				..
-			}) if self.if_exists => return Ok(Value::None),
-			Err(v) => return Err(v),
-		};
-		// Process the statement
-		if let Some(ref flex) = &self.flex {
-			df.flex = *flex;
-		}
-		if let Some(ref kind) = &self.kind {
-			df.kind.clone_from(kind);
-		}
-		if let Some(ref readonly) = &self.readonly {
-			df.readonly = *readonly;
-		}
-		if let Some(ref value) = &self.value {
-			df.value.clone_from(value);
-		}
-		if let Some(ref assert) = &self.assert {
-			df.assert.clone_from(assert);
-		}
-		if let Some(ref default) = &self.default {
-			df.default.clone_from(default);
-		}
-		if let Some(ref permissions) = &self.permissions {
-			df.permissions = permissions.clone();
-		}
-		if let Some(ref comment) = &self.comment {
-			df.comment.clone_from(comment);
-		}
-		if let Some(ref reference) = &self.reference {
-			df.reference.clone_from(reference);
-
-			// Validate reference options
-			if df.reference.is_some() {
-				df.validate_reference_options(ctx)?;
+impl From<crate::expr::statements::alter::AlterDefault> for AlterDefault {
+	fn from(value: crate::expr::statements::alter::AlterDefault) -> Self {
+		match value {
+			crate::expr::statements::alter::AlterDefault::None => AlterDefault::None,
+			crate::expr::statements::alter::AlterDefault::Drop => AlterDefault::Drop,
+			crate::expr::statements::alter::AlterDefault::Always(expr) => {
+				AlterDefault::Always(expr.into())
+			}
+			crate::expr::statements::alter::AlterDefault::Set(expr) => {
+				AlterDefault::Set(expr.into())
 			}
 		}
-		if let Some(ref default_always) = &self.default_always {
-			df.default_always = *default_always;
-		}
-
-		// Validate reference options
-		df.validate_reference_options(ctx)?;
-
-		// Correct reference type
-		if let Some(kind) = df.get_reference_kind(ctx, opt).await? {
-			df.kind = Some(kind);
-		}
-
-		// Disallow mismatched types
-		df.disallow_mismatched_types(ctx, ns, db).await?;
-
-		// Set the table definition
-		let key = crate::key::table::fd::new(ns, db, &self.what, &name);
-		txn.set(key, revision::to_vec(&df)?, None).await?;
-		// Refresh the table cache
-		let key = crate::key::database::tb::new(ns, db, &self.what);
-		let tb = txn.get_tb(ns, db, &self.what).await?;
-		txn.set(
-			key,
-			revision::to_vec(&DefineTableStatement {
-				cache_fields_ts: Uuid::now_v7(),
-				..tb.as_ref().clone()
-			})?,
-			None,
-		)
-		.await?;
-		// Clear the cache
-		txn.clear();
-		// Process possible recursive defitions
-		df.process_recursive_definitions(ns, db, txn.clone()).await?;
-		// Clear the cache
-		txn.clear();
-		// Ok all good
-		Ok(Value::None)
 	}
+}
+
+impl From<AlterDefault> for crate::expr::statements::alter::AlterDefault {
+	fn from(value: AlterDefault) -> Self {
+		match value {
+			AlterDefault::None => crate::expr::statements::alter::AlterDefault::None,
+			AlterDefault::Drop => crate::expr::statements::alter::AlterDefault::Drop,
+			AlterDefault::Always(expr) => {
+				crate::expr::statements::alter::AlterDefault::Always(expr.into())
+			}
+			AlterDefault::Set(expr) => {
+				crate::expr::statements::alter::AlterDefault::Set(expr.into())
+			}
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct AlterFieldStatement {
+	pub name: Idiom,
+	pub what: String,
+	pub if_exists: bool,
+	pub flex: AlterKind<()>,
+	pub kind: AlterKind<Kind>,
+	pub readonly: AlterKind<()>,
+	pub value: AlterKind<Expr>,
+	pub assert: AlterKind<Expr>,
+	pub default: AlterDefault,
+	pub permissions: Option<Permissions>,
+	pub comment: AlterKind<String>,
+	pub reference: AlterKind<Reference>,
 }
 
 impl Display for AlterFieldStatement {
@@ -138,71 +68,92 @@ impl Display for AlterFieldStatement {
 		if self.if_exists {
 			write!(f, " IF EXISTS")?
 		}
-		write!(f, " {} ON {}", self.name, self.what)?;
-		if let Some(ref flex) = self.flex {
-			if *flex {
-				write!(f, " FLEXIBLE")?;
-			} else {
-				write!(f, " DROP FLEXIBLE")?;
-			}
+		write!(f, " {} ON {}", self.name, EscapeIdent(&self.what))?;
+		match self.flex {
+			AlterKind::Set(_) => write!(f, " FLEXIBLE")?,
+			AlterKind::Drop => write!(f, " DROP FLEXIBLE")?,
+			AlterKind::None => {}
 		}
-		if let Some(ref kind) = self.kind {
-			if let Some(ref kind) = kind {
-				write!(f, " TYPE {kind}")?;
-			} else {
-				write!(f, " DROP TYPE")?;
-			}
+		match self.kind {
+			AlterKind::Set(ref x) => write!(f, " TYPE {x}")?,
+			AlterKind::Drop => write!(f, " DROP TYPE")?,
+			AlterKind::None => {}
 		}
-		if let Some(ref readonly) = self.readonly {
-			if *readonly {
-				write!(f, " READONLY")?;
-			} else {
-				write!(f, " DROP READONLY")?;
-			}
+		match self.readonly {
+			AlterKind::Set(_) => write!(f, " READONLY")?,
+			AlterKind::Drop => write!(f, " DROP READONLY")?,
+			AlterKind::None => {}
 		}
-		if let Some(ref value) = self.value {
-			if let Some(ref value) = value {
-				write!(f, " VALUE {value}")?;
-			} else {
-				write!(f, " DROP VALUE")?;
-			}
+		match self.value {
+			AlterKind::Set(ref x) => write!(f, " VALUE {x}")?,
+			AlterKind::Drop => write!(f, " DROP VALUE")?,
+			AlterKind::None => {}
 		}
-		if let Some(ref assert) = self.assert {
-			if let Some(ref assert) = assert {
-				write!(f, " ASSERT {assert}")?;
-			} else {
-				write!(f, " DROP ASSERT")?;
-			}
+		match self.assert {
+			AlterKind::Set(ref x) => write!(f, " ASSERT {x}")?,
+			AlterKind::Drop => write!(f, " DROP ASSERT")?,
+			AlterKind::None => {}
 		}
-		if let Some(ref default) = self.default {
-			if let Some(ref default) = default {
-				write!(f, " DEFAULT")?;
-				if self.default_always.is_some_and(|x| x) {
-					write!(f, " ALWAYS")?;
-				}
 
-				write!(f, " {default}")?;
-			} else {
-				write!(f, " DROP DEFAULT")?;
-			}
+		match self.default {
+			AlterDefault::None => {}
+			AlterDefault::Drop => write!(f, "DROP DEFAULT")?,
+			AlterDefault::Always(ref d) => write!(f, "DEFAULT ALWAYS {d}")?,
+			AlterDefault::Set(ref d) => write!(f, "DEFAULT {d}")?,
 		}
+
 		if let Some(permissions) = &self.permissions {
 			write!(f, "{permissions}")?;
 		}
-		if let Some(comment) = &self.comment {
-			if let Some(ref comment) = comment {
-				write!(f, " COMMENT {comment}")?;
-			} else {
-				write!(f, " DROP COMMENT")?;
-			}
+
+		match self.comment {
+			AlterKind::Set(ref x) => write!(f, " COMMENT {}", QuoteStr(x))?,
+			AlterKind::Drop => write!(f, " DROP COMMENT")?,
+			AlterKind::None => {}
 		}
-		if let Some(reference) = &self.reference {
-			if let Some(ref reference) = reference {
-				write!(f, " REFERENCE {reference}")?;
-			} else {
-				write!(f, " DROP REFERENCE")?;
-			}
+		match self.reference {
+			AlterKind::Set(ref x) => write!(f, " REFERENCE {x}")?,
+			AlterKind::Drop => write!(f, " DROP REFERENCE")?,
+			AlterKind::None => {}
 		}
 		Ok(())
+	}
+}
+
+impl From<AlterFieldStatement> for crate::expr::statements::alter::AlterFieldStatement {
+	fn from(v: AlterFieldStatement) -> Self {
+		crate::expr::statements::alter::AlterFieldStatement {
+			name: v.name.into(),
+			what: v.what,
+			if_exists: v.if_exists,
+			flex: v.flex.into(),
+			kind: v.kind.into(),
+			readonly: v.readonly.into(),
+			value: v.value.into(),
+			assert: v.assert.into(),
+			default: v.default.into(),
+			permissions: v.permissions.map(Into::into),
+			comment: v.comment.into(),
+			reference: v.reference.into(),
+		}
+	}
+}
+
+impl From<crate::expr::statements::alter::AlterFieldStatement> for AlterFieldStatement {
+	fn from(v: crate::expr::statements::alter::AlterFieldStatement) -> Self {
+		AlterFieldStatement {
+			name: v.name.into(),
+			what: v.what,
+			if_exists: v.if_exists,
+			flex: v.flex.into(),
+			kind: v.kind.into(),
+			readonly: v.readonly.into(),
+			value: v.value.into(),
+			assert: v.assert.into(),
+			default: v.default.into(),
+			permissions: v.permissions.map(Into::into),
+			comment: v.comment.into(),
+			reference: v.reference.into(),
+		}
 	}
 }

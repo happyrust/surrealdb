@@ -1,19 +1,26 @@
-use super::KeyDecode as _;
-use super::Transaction;
-use crate::cnf::EXPORT_BATCH_SIZE;
-use crate::err::Error;
-use crate::key::thing;
-use crate::sql::paths::EDGE;
-use crate::sql::paths::IN;
-use crate::sql::paths::OUT;
-use crate::sql::statements::DefineTableStatement;
-use crate::sql::Value;
-use async_channel::Sender;
-use chrono::prelude::Utc;
-use chrono::TimeZone;
 use std::fmt;
 
-#[derive(Clone, Debug)]
+use anyhow::Result;
+use async_channel::Sender;
+use chrono::TimeZone;
+use chrono::prelude::Utc;
+use surrealdb_types::{SurrealValue, ToSql};
+
+use super::Transaction;
+use crate::catalog::providers::{
+	AuthorisationProvider, DatabaseProvider, TableProvider, UserProvider,
+};
+use crate::catalog::{DatabaseId, NamespaceId, TableDefinition};
+use crate::cnf::EXPORT_BATCH_SIZE;
+use crate::err::Error;
+use crate::expr::paths::{IN, OUT};
+use crate::expr::statements::define::{DefineAccessStatement, DefineUserStatement};
+use crate::expr::{Base, DefineAnalyzerStatement};
+use crate::key::record;
+use crate::kvs::KVValue;
+use crate::val::record::Record;
+
+#[derive(Clone, Debug, SurrealValue)]
 pub struct Config {
 	pub users: bool,
 	pub accesses: bool,
@@ -42,75 +49,13 @@ impl Default for Config {
 	}
 }
 
-impl From<Config> for Value {
-	fn from(config: Config) -> Value {
-		let obj = map!(
-			"users" => config.users.into(),
-			"accesses" => config.accesses.into(),
-			"params" => config.params.into(),
-			"functions" => config.functions.into(),
-			"analyzers" => config.analyzers.into(),
-			"versions" => config.versions.into(),
-			"records" => config.records.into(),
-			"sequences" => config.sequences.into(),
-			"tables" => match config.tables {
-				TableConfig::All => true.into(),
-				TableConfig::None => false.into(),
-				TableConfig::Some(v) => v.into()
-			},
-		);
-
-		obj.into()
-	}
-}
-
-impl TryFrom<&Value> for Config {
-	type Error = Error;
-	fn try_from(value: &Value) -> Result<Self, Self::Error> {
-		match value {
-			Value::Object(obj) => {
-				let mut config = Config::default();
-
-				macro_rules! bool_prop {
-					($prop:ident) => {{
-						match obj.get(stringify!($prop)) {
-							Some(Value::Bool(v)) => {
-								config.$prop = v.to_owned();
-							}
-							Some(v) => {
-								return Err(Error::InvalidExportConfig(
-									v.to_owned(),
-									"a bool".into(),
-								))
-							}
-							_ => (),
-						}
-					}};
-				}
-
-				bool_prop!(users);
-				bool_prop!(accesses);
-				bool_prop!(params);
-				bool_prop!(functions);
-				bool_prop!(analyzers);
-				bool_prop!(versions);
-				bool_prop!(records);
-
-				if let Some(v) = obj.get("tables") {
-					config.tables = v.try_into()?;
-				}
-
-				Ok(config)
-			}
-			v => Err(Error::InvalidExportConfig(v.to_owned(), "an object".into())),
-		}
-	}
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, SurrealValue)]
+#[surreal(untagged)]
 pub enum TableConfig {
 	#[default]
+	#[surreal(value = true)]
 	All,
+	#[surreal(value = false)]
 	None,
 	Some(Vec<String>),
 }
@@ -133,32 +78,6 @@ impl From<Vec<String>> for TableConfig {
 impl From<Vec<&str>> for TableConfig {
 	fn from(value: Vec<&str>) -> Self {
 		TableConfig::Some(value.into_iter().map(ToOwned::to_owned).collect())
-	}
-}
-
-impl TryFrom<&Value> for TableConfig {
-	type Error = Error;
-	fn try_from(value: &Value) -> Result<Self, Self::Error> {
-		match value {
-			Value::Bool(b) => match b {
-				true => Ok(TableConfig::All),
-				false => Ok(TableConfig::None),
-			},
-			Value::None | Value::Null => Ok(TableConfig::None),
-			Value::Array(v) => v
-				.iter()
-				.cloned()
-				.map(|v| match v {
-					Value::Strand(str) => Ok(str.0),
-					v => Err(Error::InvalidExportConfig(v.clone(), "a string".into())),
-				})
-				.collect::<Result<Vec<String>, Error>>()
-				.map(TableConfig::Some),
-			v => Err(Error::InvalidExportConfig(
-				v.to_owned(),
-				"a bool, none, null or array<string>".into(),
-			)),
-		}
 	}
 }
 
@@ -216,11 +135,17 @@ impl Transaction {
 		db: &str,
 		cfg: Config,
 		chn: Sender<Vec<u8>>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
+		let db = self.get_db_by_name(ns, db).await?.ok_or_else(|| {
+			anyhow::Error::new(Error::DbNotFound {
+				name: db.to_owned(),
+			})
+		})?;
+
 		// Output USERS, ACCESSES, PARAMS, FUNCTIONS, ANALYZERS
-		self.export_metadata(&cfg, &chn, ns, db).await?;
+		self.export_metadata(&cfg, &chn, db.namespace_id, db.database_id).await?;
 		// Output TABLES
-		self.export_tables(ns, db, &cfg, &chn).await?;
+		self.export_tables(&cfg, &chn, db.namespace_id, db.database_id).await?;
 		Ok(())
 	}
 
@@ -228,58 +153,78 @@ impl Transaction {
 		&self,
 		cfg: &Config,
 		chn: &Sender<Vec<u8>>,
-		ns: &str,
-		db: &str,
-	) -> Result<(), Error> {
+		ns: NamespaceId,
+		db: DatabaseId,
+	) -> Result<()> {
 		// Output OPTIONS
-		self.export_section("OPTION", vec!["OPTION IMPORT"], chn).await?;
+		self.export_section("OPTION", ["OPTION IMPORT"].iter(), chn).await?;
 
 		// Output USERS
 		if cfg.users {
 			let users = self.all_db_users(ns, db).await?;
-			self.export_section("USERS", users.to_vec(), chn).await?;
+			self.export_section(
+				"USERS",
+				users.iter().map(|x| DefineUserStatement::from_definition(Base::Db, x)),
+				chn,
+			)
+			.await?;
 		}
 
 		// Output ACCESSES
 		if cfg.accesses {
 			let accesses = self.all_db_accesses(ns, db).await?;
-			self.export_section("ACCESSES", accesses.to_vec(), chn).await?;
+			self.export_section(
+				"ACCESSES",
+				accesses
+					.iter()
+					.map(|x| DefineAccessStatement::from_definition(Base::Db, x).redact()),
+				chn,
+			)
+			.await?;
 		}
 
 		// Output PARAMS
 		if cfg.params {
 			let params = self.all_db_params(ns, db).await?;
-			self.export_section("PARAMS", params.to_vec(), chn).await?;
+			self.export_section("PARAMS", params.iter(), chn).await?;
 		}
 
 		// Output FUNCTIONS
 		if cfg.functions {
 			let functions = self.all_db_functions(ns, db).await?;
-			self.export_section("FUNCTIONS", functions.to_vec(), chn).await?;
+			self.export_section("FUNCTIONS", functions.iter(), chn).await?;
 		}
 
 		// Output ANALYZERS
 		if cfg.analyzers {
 			let analyzers = self.all_db_analyzers(ns, db).await?;
-			self.export_section("ANALYZERS", analyzers.to_vec(), chn).await?;
+			self.export_section(
+				"ANALYZERS",
+				analyzers.iter().map(DefineAnalyzerStatement::from_definition),
+				chn,
+			)
+			.await?;
 		}
 
 		// Output SEQUENCES
 		if cfg.sequences {
 			let sequences = self.all_db_sequences(ns, db).await?;
-			self.export_section("SEQUENCES", sequences.to_vec(), chn).await?;
+			self.export_section("SEQUENCES", sequences.iter(), chn).await?;
 		}
 
 		Ok(())
 	}
 
-	async fn export_section<T: ToString>(
+	async fn export_section<T>(
 		&self,
 		title: &str,
-		items: Vec<T>,
+		items: impl ExactSizeIterator<Item = T>,
 		chn: &Sender<Vec<u8>>,
-	) -> Result<(), Error> {
-		if items.is_empty() {
+	) -> Result<()>
+	where
+		T: ToSql,
+	{
+		if items.len() == 0 {
 			return Ok(());
 		}
 
@@ -289,7 +234,7 @@ impl Transaction {
 		chn.send(bytes!("")).await?;
 
 		for item in items {
-			chn.send(bytes!(format!("{};", item.to_string()))).await?;
+			chn.send(bytes!(format!("{};", item.to_sql()))).await?;
 		}
 
 		chn.send(bytes!("")).await?;
@@ -298,11 +243,11 @@ impl Transaction {
 
 	async fn export_tables(
 		&self,
-		ns: &str,
-		db: &str,
 		cfg: &Config,
 		chn: &Sender<Vec<u8>>,
-	) -> Result<(), Error> {
+		ns: NamespaceId,
+		db: DatabaseId,
+	) -> Result<()> {
 		// Check if tables are included in the export config
 		if !cfg.tables.is_any() {
 			return Ok(());
@@ -328,33 +273,33 @@ impl Transaction {
 
 	async fn export_table_structure(
 		&self,
-		ns: &str,
-		db: &str,
-		table: &DefineTableStatement,
+		ns: NamespaceId,
+		db: DatabaseId,
+		table: &TableDefinition,
 		chn: &Sender<Vec<u8>>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!(format!("-- TABLE: {}", InlineCommentDisplay(&table.name)))).await?;
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!("")).await?;
-		chn.send(bytes!(format!("{};", table))).await?;
+		chn.send(bytes!(format!("{};", table.to_sql()))).await?;
 		chn.send(bytes!("")).await?;
 		// Export all table field definitions for this table
 		let fields = self.all_tb_fields(ns, db, &table.name, None).await?;
 		for field in fields.iter() {
-			chn.send(bytes!(format!("{};", field))).await?;
+			chn.send(bytes!(format!("{};", field.to_sql()))).await?;
 		}
 		chn.send(bytes!("")).await?;
 		// Export all table index definitions for this table
 		let indexes = self.all_tb_indexes(ns, db, &table.name).await?;
 		for index in indexes.iter() {
-			chn.send(bytes!(format!("{};", index))).await?;
+			chn.send(bytes!(format!("{};", index.to_sql()))).await?;
 		}
 		chn.send(bytes!("")).await?;
 		// Export all table event definitions for this table
 		let events = self.all_tb_events(ns, db, &table.name).await?;
 		for event in events.iter() {
-			chn.send(bytes!(format!("{};", event))).await?;
+			chn.send(bytes!(format!("{};", event.to_sql()))).await?;
 		}
 		chn.send(bytes!("")).await?;
 		// Everything ok
@@ -363,19 +308,19 @@ impl Transaction {
 
 	async fn export_table_data(
 		&self,
-		ns: &str,
-		db: &str,
-		table: &DefineTableStatement,
+		ns: NamespaceId,
+		db: DatabaseId,
+		table: &TableDefinition,
 		cfg: &Config,
 		chn: &Sender<Vec<u8>>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!(format!("-- TABLE DATA: {}", InlineCommentDisplay(&table.name)))).await?;
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!("")).await?;
 
-		let beg = crate::key::thing::prefix(ns, db, &table.name)?;
-		let end = crate::key::thing::suffix(ns, db, &table.name)?;
+		let beg = crate::key::record::prefix(ns, db, &table.name)?;
+		let end = crate::key::record::suffix(ns, db, &table.name)?;
 		let mut next = Some(beg..end);
 
 		while let Some(rng) = next {
@@ -406,8 +351,9 @@ impl Transaction {
 
 	/// Processes a value and generates the appropriate SQL command.
 	///
-	/// This function processes a value, categorizing it into either normal records or graph edge records,
-	/// and generates the appropriate SQL command based on the type of record and the presence of a version.
+	/// This function processes a value, categorizing it into either normal
+	/// records or graph edge records, and generates the appropriate SQL
+	/// command based on the type of record and the presence of a version.
 	///
 	/// # Arguments
 	///
@@ -419,31 +365,38 @@ impl Transaction {
 	///
 	/// # Returns
 	///
-	/// * `String` - Returns the generated SQL command as a string. If no command is generated, returns an empty string.
-	fn process_value(
-		k: thing::Thing,
-		mut v: Value,
+	/// * `String` - Returns the generated SQL command as a string. If no command is generated,
+	///   returns an empty string.
+	fn process_record(
+		k: record::RecordKey,
+		mut record: Record,
 		records_relate: &mut Vec<String>,
 		records_normal: &mut Vec<String>,
 		is_tombstone: Option<bool>,
 		version: Option<u64>,
 	) -> String {
 		// Inject the id field into the document before processing.
-		let rid = crate::sql::Thing::from((k.tb, k.id.clone()));
-		v.def(&rid);
-		// Match on the value to determine if it is a graph edge record or a normal record.
-		match (v.pick(&*EDGE), v.pick(&*IN), v.pick(&*OUT)) {
+		let rid = crate::val::RecordId {
+			table: k.tb.into_owned(),
+			key: k.id,
+		};
+		record.data.to_mut().def(&rid);
+		// Match on the value to determine if it is a graph edge record or a normal
+		// record.
+		match (record.is_edge(), record.data.as_ref().pick(&*IN), record.data.as_ref().pick(&*OUT))
+		{
 			// If the value is a graph edge record (indicated by EDGE, IN, and OUT fields):
-			(Value::Bool(true), Value::Thing(_), Value::Thing(_)) => {
+			(true, crate::val::Value::RecordId(_), crate::val::Value::RecordId(_)) => {
 				if let Some(version) = version {
 					// If a version exists, format the value as an INSERT RELATION VERSION command.
 					let ts = Utc.timestamp_nanos(version as i64);
-					let sql = format!("INSERT RELATION {} VERSION d'{:?}';", v, ts);
+					let sql =
+						format!("INSERT RELATION {} VERSION d'{:?}';", record.data.as_ref(), ts);
 					records_relate.push(sql);
 					String::new()
 				} else {
 					// If no version exists, push the value to the records_relate vector.
-					records_relate.push(v.to_string());
+					records_relate.push(record.data.as_ref().to_string());
 					String::new()
 				}
 			}
@@ -452,15 +405,17 @@ impl Transaction {
 				if let Some(is_tombstone) = is_tombstone {
 					if is_tombstone {
 						// If the record is a tombstone, format it as a DELETE command.
-						format!("DELETE {}:{};", k.tb, k.id)
+						format!("DELETE {}:{};", rid.table, rid.key)
 					} else {
-						// If the record is not a tombstone and a version exists, format it as an INSERT VERSION command.
+						// If the record is not a tombstone and a version exists, format it as an
+						// INSERT VERSION command.
 						let ts = Utc.timestamp_nanos(version.unwrap() as i64);
-						format!("INSERT {} VERSION d'{:?}';", v, ts)
+						format!("INSERT {} VERSION d'{:?}';", record.data.as_ref(), ts)
 					}
 				} else {
-					// If no tombstone or version information is provided, push the value to the records_normal vector.
-					records_normal.push(v.to_string());
+					// If no tombstone or version information is provided, push the value to the
+					// records_normal vector.
+					records_normal.push(record.data.as_ref().to_string());
 					String::new()
 				}
 			}
@@ -469,24 +424,27 @@ impl Transaction {
 
 	/// Exports versioned data to the provided channel.
 	///
-	/// This function processes a list of versioned values, converting them into SQL commands
-	/// and sending them to the provided channel. It handles both normal records and graph edge records,
-	/// and ensures that the appropriate SQL commands are generated for each type of record.
+	/// This function processes a list of versioned values, converting them into
+	/// SQL commands and sending them to the provided channel. It handles both
+	/// normal records and graph edge records, and ensures that the appropriate
+	/// SQL commands are generated for each type of record.
 	///
 	/// # Arguments
 	///
 	/// * `versioned_values` - A vector of tuples containing the versioned values to be exported.
-	///   Each tuple consists of a key, value, version, and a boolean indicating if the record is a tombstone.
+	///   Each tuple consists of a key, value, version, and a boolean indicating if the record is a
+	///   tombstone.
 	/// * `chn` - A reference to the channel to which the SQL commands will be sent.
 	///
 	/// # Returns
 	///
-	/// * `Result<(), Error>` - Returns `Ok(())` if the operation is successful, or an `Error` if an error occurs.
+	/// * `Result<()>` - Returns `Ok(())` if the operation is successful, or an `Error` if an error
+	///   occurs.
 	async fn export_versioned_data(
 		&self,
 		versioned_values: Vec<(Vec<u8>, Vec<u8>, u64, bool)>,
 		chn: &Sender<Vec<u8>>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Initialize a vector to hold graph edge records.
 		let mut records_relate = Vec::with_capacity(*EXPORT_BATCH_SIZE as usize);
 
@@ -500,14 +458,14 @@ impl Transaction {
 				chn.send(bytes!("BEGIN;")).await?;
 			}
 
-			let k = thing::Thing::decode(&k)?;
-			let v: Value = if v.is_empty() {
-				Value::None
+			let k = record::RecordKey::decode_key(&k)?;
+			let v: Record = if v.is_empty() {
+				Default::default()
 			} else {
-				revision::from_slice(&v)?
+				KVValue::kv_decode_value(v)?
 			};
 			// Process the value and generate the appropriate SQL command.
-			let sql = Self::process_value(
+			let sql = Self::process_record(
 				k,
 				v,
 				&mut records_relate,
@@ -557,34 +515,36 @@ impl Transaction {
 
 	/// Exports regular data to the provided channel.
 	///
-	/// This function processes a list of regular values, converting them into SQL commands
-	/// and sending them to the provided channel. It handles both normal records and graph edge records,
-	/// and ensures that the appropriate SQL commands are generated for each type of record.
+	/// This function processes a list of regular values, converting them into
+	/// SQL commands and sending them to the provided channel. It handles both
+	/// normal records and graph edge records, and ensures that the appropriate
+	/// SQL commands are generated for each type of record.
 	///
 	/// # Arguments
 	///
-	/// * `regular_values` - A vector of tuples containing the regular values to be exported.
-	///   Each tuple consists of a key and a value.
+	/// * `regular_values` - A vector of tuples containing the regular values to be exported. Each
+	///   tuple consists of a key and a value.
 	/// * `chn` - A reference to the channel to which the SQL commands will be sent.
 	///
 	/// # Returns
 	///
-	/// * `Result<(), Error>` - Returns `Ok(())` if the operation is successful, or an `Error` if an error occurs.
+	/// * `Result<()>` - Returns `Ok(())` if the operation is successful, or an `Error` if an error
+	///   occurs.
 	async fn export_regular_data(
 		&self,
 		regular_values: Vec<(Vec<u8>, Vec<u8>)>,
 		chn: &Sender<Vec<u8>>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Initialize vectors to hold normal records and graph edge records.
 		let mut records_normal = Vec::with_capacity(*EXPORT_BATCH_SIZE as usize);
 		let mut records_relate = Vec::with_capacity(*EXPORT_BATCH_SIZE as usize);
 
 		// Process each regular value.
 		for (k, v) in regular_values {
-			let k = thing::Thing::decode(&k)?;
-			let v: Value = revision::from_slice(&v)?;
+			let k = record::RecordKey::decode_key(&k)?;
+			let v = Record::kv_decode_value(v)?;
 			// Process the value and categorize it into records_relate or records_normal.
-			Self::process_value(k, v, &mut records_relate, &mut records_normal, None, None);
+			Self::process_record(k, v, &mut records_relate, &mut records_normal, None, None);
 		}
 
 		// If there are normal records, generate and send the INSERT SQL command.
@@ -594,7 +554,8 @@ impl Transaction {
 			chn.send(bytes!(sql)).await?;
 		}
 
-		// If there are graph edge records, generate and send the INSERT RELATION SQL command.
+		// If there are graph edge records, generate and send the INSERT RELATION SQL
+		// command.
 		if !records_relate.is_empty() {
 			let values = records_relate.join(", ");
 			let sql = format!("INSERT RELATION [ {} ];", values);

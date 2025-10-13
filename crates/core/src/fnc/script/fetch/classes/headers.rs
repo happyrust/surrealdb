@@ -2,16 +2,13 @@
 
 use std::str::FromStr;
 
-use js::{
-	class::Trace,
-	prelude::{Coerced, List},
-	Array, Ctx, Exception, JsLifetime, Result, Value,
-};
+use js::class::Trace;
+use js::prelude::{Coerced, List};
+use js::{Array, Ctx, Exception, JsLifetime, Result, Value};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 #[derive(Clone, Trace, JsLifetime)]
 #[js::class]
-#[non_exhaustive]
 pub struct Headers {
 	#[qjs(skip_trace)]
 	pub(crate) inner: HeaderMap,
@@ -60,12 +57,12 @@ impl Headers {
 
 		for (k, v) in self.inner.iter() {
 			let k = k.as_str();
-			if Some(k) == res.last().map(|x| x.0 .0.as_str()) {
+			if Some(k) == res.last().map(|x| x.0.0.as_str()) {
 				let ent = res.last_mut().unwrap();
-				ent.0 .1.push_str(", ");
+				ent.0.1.push_str(", ");
 				// Header value came from a string, so it should also be able to be cast back
 				// to a string
-				ent.0 .1.push_str(v.to_str().unwrap());
+				ent.0.1.push_str(v.to_str().unwrap());
 			} else {
 				res.push(List((k.to_owned(), v.to_str().unwrap().to_owned())));
 			}
@@ -117,7 +114,8 @@ impl Headers {
 
 	// Returns all header keys contained in the header set
 	pub fn keys(&self) -> Vec<String> {
-		// TODO: Incorrect, should return an iterator but iterators are not supported yet by quickjs
+		// TODO: Incorrect, should return an iterator but iterators are not supported
+		// yet by quickjs
 		self.inner.keys().map(|v| v.as_str().to_owned()).collect::<Vec<String>>()
 	}
 
@@ -226,8 +224,8 @@ impl Headers {
 
 	fn append_inner(&mut self, ctx: &Ctx<'_>, key: &str, val: &str) -> Result<()> {
 		// Unsure what to do exactly here.
-		// Spec dictates normalizing string before adding it as a header value, i.e. removing
-		// any leading and trailing whitespace:
+		// Spec dictates normalizing string before adding it as a header value, i.e.
+		// removing any leading and trailing whitespace:
 		// [`https://fetch.spec.whatwg.org/#concept-header-value-normalize`]
 		// But non of the platforms I tested, normalize, instead they throw an error
 		// with `Invalid header value`. I'll chose to just do what the platforms do.
@@ -238,7 +236,7 @@ impl Headers {
 				return Err(Exception::throw_type(
 					ctx,
 					&format!("invalid header name `{key}`: {e}"),
-				))
+				));
 			}
 		};
 		let val = match HeaderValue::from_bytes(val.as_bytes()) {
@@ -247,7 +245,7 @@ impl Headers {
 				return Err(Exception::throw_type(
 					ctx,
 					&format!("invalid header value `{val}`: {e}"),
-				))
+				));
 			}
 		};
 
@@ -259,8 +257,9 @@ impl Headers {
 
 #[cfg(test)]
 mod test {
-	use crate::fnc::script::fetch::test::create_test_context;
 	use js::CatchResultExt;
+
+	use crate::fnc::script::fetch::test::create_test_context;
 
 	#[tokio::test]
 	async fn basic_headers_use() {

@@ -1,97 +1,63 @@
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::doc::CursorDoc;
-use crate::err::Error;
-use crate::iam::{Action, ResourceKind};
-use crate::sql::statements::info::InfoStructure;
-use crate::sql::{Base, Ident, Strand, Value};
-
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 
-#[revisioned(revision = 3)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+use super::DefineKind;
+use crate::sql::{Expr, Literal};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub struct DefineNamespaceStatement {
+	pub kind: DefineKind,
 	pub id: Option<u32>,
-	pub name: Ident,
-	pub comment: Option<Strand>,
-	#[revision(start = 2)]
-	pub if_not_exists: bool,
-	#[revision(start = 3)]
-	pub overwrite: bool,
+	pub name: Expr,
+	pub comment: Option<Expr>,
 }
 
-impl DefineNamespaceStatement {
-	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-		_doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Namespace, &Base::Root)?;
-		// Fetch the transaction
-		let txn = ctx.tx();
-		// Check if the definition exists
-		if txn.get_ns(&self.name).await.is_ok() {
-			if self.if_not_exists {
-				return Ok(Value::None);
-			} else if !self.overwrite {
-				return Err(Error::NsAlreadyExists {
-					name: self.name.to_string(),
-				});
-			}
+impl Default for DefineNamespaceStatement {
+	fn default() -> Self {
+		Self {
+			kind: DefineKind::Default,
+			id: None,
+			name: Expr::Literal(Literal::None),
+			comment: None,
 		}
-		// Process the statement
-		let key = crate::key::root::ns::new(&self.name);
-		txn.set(
-			key,
-			revision::to_vec(&DefineNamespaceStatement {
-				id: match self.id {
-					Some(id) => Some(id),
-					None => Some(txn.lock().await.get_next_ns_id().await?),
-				},
-				// Don't persist the `IF NOT EXISTS` clause to schema
-				if_not_exists: false,
-				overwrite: false,
-				..self.clone()
-			})?,
-			None,
-		)
-		.await?;
-		// Clear the cache
-		txn.clear();
-		// Ok all good
-		Ok(Value::None)
 	}
 }
 
 impl Display for DefineNamespaceStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "DEFINE NAMESPACE")?;
-		if self.if_not_exists {
-			write!(f, " IF NOT EXISTS")?
-		}
-		if self.overwrite {
-			write!(f, " OVERWRITE")?
+		match self.kind {
+			DefineKind::Default => {}
+			DefineKind::Overwrite => write!(f, " OVERWRITE")?,
+			DefineKind::IfNotExists => write!(f, " IF NOT EXISTS")?,
 		}
 		write!(f, " {}", self.name)?;
 		if let Some(ref v) = self.comment {
-			write!(f, " COMMENT {v}")?
+			write!(f, " COMMENT {}", v)?
 		}
 		Ok(())
 	}
 }
 
-impl InfoStructure for DefineNamespaceStatement {
-	fn structure(self) -> Value {
-		Value::from(map! {
-			"name".to_string() => self.name.structure(),
-			"comment".to_string(), if let Some(v) = self.comment => v.into(),
-		})
+impl From<DefineNamespaceStatement> for crate::expr::statements::DefineNamespaceStatement {
+	fn from(v: DefineNamespaceStatement) -> Self {
+		Self {
+			kind: v.kind.into(),
+			id: v.id,
+			name: v.name.into(),
+			comment: v.comment.map(|x| x.into()),
+		}
+	}
+}
+
+#[allow(clippy::fallible_impl_from)]
+impl From<crate::expr::statements::DefineNamespaceStatement> for DefineNamespaceStatement {
+	fn from(v: crate::expr::statements::DefineNamespaceStatement) -> Self {
+		Self {
+			kind: v.kind.into(),
+			id: v.id,
+			name: v.name.into(),
+			comment: v.comment.map(|x| x.into()),
+		}
 	}
 }

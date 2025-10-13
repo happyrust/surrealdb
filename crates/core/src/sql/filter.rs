@@ -1,13 +1,11 @@
-use crate::sql::language::Language;
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Display;
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+use crate::fmt::QuoteStr;
+use crate::sql::language::Language;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub enum Filter {
 	Ascii,
 	EdgeNgram(u16, u16),
@@ -27,7 +25,35 @@ impl Display for Filter {
 			Self::Ngram(min, max) => write!(f, "NGRAM({min},{max})"),
 			Self::Snowball(lang) => write!(f, "SNOWBALL({lang})"),
 			Self::Uppercase => f.write_str("UPPERCASE"),
-			Self::Mapper(path) => write!(f, "MAPPER({path})"),
+			Self::Mapper(path) => write!(f, "MAPPER({})", QuoteStr(path)),
+		}
+	}
+}
+
+impl From<Filter> for crate::expr::Filter {
+	fn from(v: Filter) -> Self {
+		match v {
+			Filter::Ascii => Self::Ascii,
+			Filter::EdgeNgram(min, max) => Self::EdgeNgram(min, max),
+			Filter::Lowercase => Self::Lowercase,
+			Filter::Ngram(min, max) => Self::Ngram(min, max),
+			Filter::Snowball(lang) => Self::Snowball(lang.into()),
+			Filter::Uppercase => Self::Uppercase,
+			Filter::Mapper(path) => Self::Mapper(path),
+		}
+	}
+}
+
+impl From<crate::expr::Filter> for Filter {
+	fn from(v: crate::expr::Filter) -> Self {
+		match v {
+			crate::expr::Filter::Ascii => Self::Ascii,
+			crate::expr::Filter::EdgeNgram(min, max) => Self::EdgeNgram(min, max),
+			crate::expr::Filter::Lowercase => Self::Lowercase,
+			crate::expr::Filter::Ngram(min, max) => Self::Ngram(min, max),
+			crate::expr::Filter::Snowball(lang) => Self::Snowball(lang.into()),
+			crate::expr::Filter::Uppercase => Self::Uppercase,
+			crate::expr::Filter::Mapper(path) => Self::Mapper(path),
 		}
 	}
 }

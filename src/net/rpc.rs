@@ -1,41 +1,36 @@
-use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::Arc;
 
-use super::headers::Accept;
-use super::headers::ContentType;
-use super::headers::SurrealId;
-use super::AppState;
-use crate::cnf;
-use crate::cnf::HTTP_MAX_RPC_BODY_SIZE;
-use crate::err::Error;
-use crate::rpc::format::HttpFormat;
-use crate::rpc::http::Http;
-use crate::rpc::response::IntoRpcResponse;
-use crate::rpc::websocket::Websocket;
-use crate::rpc::RpcState;
-use axum::extract::DefaultBodyLimit;
-use axum::extract::State;
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::response::IntoResponse;
 use axum::routing::options;
-use axum::{
-	extract::ws::{WebSocket, WebSocketUpgrade},
-	response::IntoResponse,
-	Extension, Router,
-};
-use axum_extra::headers::Header;
+use axum::{Extension, Router};
 use axum_extra::TypedHeader;
+use axum_extra::headers::Header;
 use bytes::Bytes;
-use http::header::SEC_WEBSOCKET_PROTOCOL;
 use http::HeaderMap;
-use surrealdb::dbs::capabilities::RouteTarget;
-use surrealdb::dbs::Session;
-use surrealdb::kvs::Datastore;
-use surrealdb::mem::ALLOC;
-use surrealdb::rpc::format::Format;
-use surrealdb::rpc::format::PROTOCOLS;
-use surrealdb::rpc::RpcContext;
+use http::header::SEC_WEBSOCKET_PROTOCOL;
+use surrealdb_core::dbs::Session;
+use surrealdb_core::dbs::capabilities::RouteTarget;
+use surrealdb_core::kvs::Datastore;
+use surrealdb_core::mem::ALLOC;
+use surrealdb_core::rpc::format::{Format, PROTOCOLS};
+use surrealdb_core::rpc::{DbResponse, RpcContext};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::RequestId;
 use uuid::Uuid;
+
+use super::AppState;
+use super::error::ResponseError;
+use super::headers::{Accept, ContentType, SurrealId};
+use crate::cnf;
+use crate::cnf::HTTP_MAX_RPC_BODY_SIZE;
+use crate::net::error::Error as NetError;
+use crate::rpc::RpcState;
+use crate::rpc::format::HttpFormat;
+use crate::rpc::http::Http;
+use crate::rpc::websocket::Websocket;
 
 pub(super) fn router() -> Router<Arc<RpcState>> {
 	Router::new()
@@ -57,12 +52,14 @@ async fn get_handler(
 	// Check if capabilities allow querying the requested HTTP route
 	if !db.allows_http_route(&RouteTarget::Rpc) {
 		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Rpc);
-		return Err(Error::ForbiddenRoute(RouteTarget::Rpc.to_string()));
+		return Err(NetError::ForbiddenRoute(RouteTarget::Rpc.to_string()));
 	}
 	// Check that a valid header has been specified
 	if headers.get(SEC_WEBSOCKET_PROTOCOL).is_none() {
 		warn!("A connection was made without a specified protocol.");
-		warn!("Automatic inference of the protocol format is deprecated in SurrealDB 2.0 and will be removed in SurrealDB 3.0.");
+		warn!(
+			"Automatic inference of the protocol format is deprecated in SurrealDB 2.0 and will be removed in SurrealDB 3.0."
+		);
 		warn!("Please upgrade any client to ensure that the connection format is specified.");
 	}
 	// Check if there is a connection id header specified
@@ -72,14 +69,14 @@ async fn get_handler(
 			match id.to_str() {
 				Ok(id) => {
 					// Attempt to parse the request id as a UUID
-					match Uuid::try_parse(id) {
+					match Uuid::from_str(id) {
 						// The specified request id was a valid UUID
 						Ok(id) => id,
 						// The specified request id was not a UUID
-						Err(_) => return Err(Error::Request),
+						Err(_) => return Err(NetError::Request),
 					}
 				}
-				Err(_) => return Err(Error::Request),
+				Err(_) => return Err(NetError::Request),
 			}
 		}
 		// Otherwise, use the generic WebSocket connection id header
@@ -89,14 +86,14 @@ async fn get_handler(
 			// A request id was specified to try to parse it
 			false => match id.header_value().to_str() {
 				// Attempt to parse the request id as a UUID
-				Ok(id) => match Uuid::try_parse(id) {
+				Ok(id) => match Uuid::from_str(id) {
 					// The specified request id was a valid UUID
 					Ok(id) => id,
 					// The specified request id was not a UUID
-					Err(_) => return Err(Error::Request),
+					Err(_) => return Err(NetError::Request),
 				},
 				// The request id contained invalid characters
-				Err(_) => return Err(Error::Request),
+				Err(_) => return Err(NetError::Request),
 			},
 		},
 	};
@@ -106,17 +103,23 @@ async fn get_handler(
 	session.id = Some(id.to_string());
 	// Check if a connection with this id already exists
 	if rpc_state.web_sockets.read().await.contains_key(&id) {
-		return Err(Error::Request);
+		return Err(NetError::Request);
 	}
-	// Now let's upgrade the WebSocket connection
+	// Now let's upgrade the WebSocket connection with comprehensive buffer configuration
 	Ok(ws
-		// Set the potential WebSocket protocols
+		// Set the potential WebSocket protocols (JSON, CBOR, Bincode, etc.)
 		.protocols(PROTOCOLS)
-		// Set the maximum WebSocket frame size
-		.max_frame_size(*cnf::WEBSOCKET_MAX_FRAME_SIZE)
-		// Set the maximum WebSocket message size
+		// Set the maximum WebSocket frame size to prevent oversized frames
+		.max_frame_size(*cnf::WEBSOCKET_MAX_MESSAGE_SIZE)
+		// Set the maximum WebSocket message size to prevent memory exhaustion
 		.max_message_size(*cnf::WEBSOCKET_MAX_MESSAGE_SIZE)
-		// Set an error
+		// Configure read buffer size for incoming data optimization
+		.read_buffer_size(*cnf::WEBSOCKET_READ_BUFFER_SIZE)
+		// Configure write buffer size for outgoing data optimization
+		.write_buffer_size(*cnf::WEBSOCKET_WRITE_BUFFER_SIZE)
+		// Set maximum write buffer size to apply backpressure when needed
+		.max_write_buffer_size(*cnf::WEBSOCKET_MAX_WRITE_BUFFER_SIZE)
+		// Handle WebSocket upgrade failures with appropriate logging
 		.on_failed_upgrade(|err| {
 			warn!("Failed to upgrade WebSocket connection: {err}");
 		})
@@ -148,44 +151,54 @@ async fn post_handler(
 	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
 	accept: Option<TypedHeader<Accept>>,
-	content_type: TypedHeader<ContentType>,
+	TypedHeader(content_type): TypedHeader<ContentType>,
 	body: Bytes,
-) -> Result<impl IntoResponse, impl IntoResponse> {
+) -> Result<impl IntoResponse, ResponseError> {
 	// Get the datastore reference
 	let db = &state.datastore;
 	// Check if capabilities allow querying the requested HTTP route
 	if !db.allows_http_route(&RouteTarget::Rpc) {
 		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Rpc);
-		return Err(Error::ForbiddenRoute(RouteTarget::Rpc.to_string()));
+		return Err(NetError::ForbiddenRoute(RouteTarget::Rpc.to_string()).into());
 	}
 	// Get the input format from the Content-Type header
-	let fmt: Format = content_type.deref().into();
+	let fmt: Format = (&content_type).into();
 	// Check that the input format is a valid format
 	if matches!(fmt, Format::Unsupported) {
-		return Err(Error::InvalidType);
+		return Err(NetError::InvalidType.into());
 	}
 	// Get the output format from the Accept header
 	let out: Option<Format> = accept.as_deref().map(Into::into);
 	// Check that the input format and the output format match
 	if let Some(out) = out {
 		if fmt != out {
-			return Err(Error::InvalidType);
+			return Err(NetError::InvalidType.into());
 		}
 	}
 	// Create a new HTTP instance
 	let rpc = Http::new(&state.datastore, session);
 	// Check to see available memory
 	if ALLOC.is_beyond_threshold() {
-		return Err(Error::ServerOverloaded);
+		return Err(NetError::ServerOverloaded.into());
 	}
 	// Parse the HTTP request body
 	match fmt.req_http(body) {
 		Ok(req) => {
 			// Execute the specified method
-			let res = RpcContext::execute(&rpc, req.version, req.method, req.params).await;
+			let res = RpcContext::execute(
+				&rpc,
+				req.version,
+				req.txn.map(Into::into),
+				req.method,
+				req.params,
+			)
+			.await;
 			// Return the HTTP response
-			fmt.res_http(res.into_response(None)).map_err(Error::from)
+			Ok(fmt.res_http(match res {
+				Ok(result) => DbResponse::success(None, result),
+				Err(err) => DbResponse::failure(None, err.into()),
+			})?)
 		}
-		Err(err) => Err(Error::from(err)),
+		Err(err) => Err(err.into()),
 	}
 }

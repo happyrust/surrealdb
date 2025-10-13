@@ -2,20 +2,22 @@
 
 mod cnf;
 
-use crate::err::Error;
-use crate::key::debug::Sprintable;
-use crate::kvs::{Check, Key, Val};
-use rocksdb::{
-	BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, FlushOptions, LogLevel,
-	OptimisticTransactionDB, OptimisticTransactionOptions, Options, ReadOptions, WriteOptions,
-};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use anyhow::{Result, bail, ensure};
+use rocksdb::{
+	BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, FlushOptions, LogLevel,
+	OptimisticTransactionDB, OptimisticTransactionOptions, Options, ReadOptions, WriteOptions,
+};
+
 use super::savepoint::SavePoints;
+use crate::err::Error;
+use crate::key::debug::Sprintable;
+use crate::kvs::{Check, Key, Val};
 
 const TARGET: &str = "surrealdb::core::kvs::rocksdb";
 
@@ -43,25 +45,13 @@ pub struct Transaction {
 
 impl Drop for Transaction {
 	fn drop(&mut self) {
-		if !self.done && self.write {
-			match self.check {
-				Check::None => {
-					trace!("A transaction was dropped without being committed or cancelled");
-				}
-				Check::Warn => {
-					warn!("A transaction was dropped without being committed or cancelled");
-				}
-				Check::Error => {
-					error!("A transaction was dropped without being committed or cancelled");
-				}
-			}
-		}
+		self.check.drop_check(self.done, self.write);
 	}
 }
 
 impl Datastore {
 	/// Open a new database
-	pub(crate) async fn new(path: &str) -> Result<Datastore, Error> {
+	pub(crate) async fn new(path: &str) -> Result<Datastore> {
 		// Configure custom options
 		let mut opts = Options::default();
 		// Ensure we use fdatasync
@@ -115,6 +105,31 @@ impl Datastore {
 		// Store large values separate from keys
 		info!(target: TARGET, "Minimum blob value size: {}", *cnf::ROCKSDB_MIN_BLOB_SIZE);
 		opts.set_min_blob_size(*cnf::ROCKSDB_MIN_BLOB_SIZE);
+		// Additional blob file options
+		info!(target: TARGET, "Target blob file size: {}", *cnf::ROCKSDB_BLOB_FILE_SIZE);
+		opts.set_blob_file_size(*cnf::ROCKSDB_BLOB_FILE_SIZE);
+		if let Some(c) = cnf::ROCKSDB_BLOB_COMPRESSION_TYPE.as_ref() {
+			info!(target: TARGET, "Blob compression type: {c}");
+			opts.set_blob_compression_type(match c.as_str() {
+				"none" => DBCompressionType::None,
+				"snappy" => DBCompressionType::Snappy,
+				"lz4" => DBCompressionType::Lz4,
+				"zstd" => DBCompressionType::Zstd,
+				l => {
+					bail!(Error::Ds(format!("Invalid compression type: {l}")));
+				}
+			});
+		}
+		info!(target: TARGET, "Enable blob garbage collection: {}", *cnf::ROCKSDB_ENABLE_BLOB_GC);
+		opts.set_enable_blob_gc(*cnf::ROCKSDB_ENABLE_BLOB_GC);
+		info!(target: TARGET, "Blob GC age cutoff: {}", *cnf::ROCKSDB_BLOB_GC_AGE_CUTOFF);
+		opts.set_blob_gc_age_cutoff(*cnf::ROCKSDB_BLOB_GC_AGE_CUTOFF);
+		info!(target: TARGET, "Blob GC force threshold: {}", *cnf::ROCKSDB_BLOB_GC_FORCE_THRESHOLD);
+		opts.set_blob_gc_force_threshold(*cnf::ROCKSDB_BLOB_GC_FORCE_THRESHOLD);
+		info!(target: TARGET, "Blob compaction readahead size: {}", *cnf::ROCKSDB_BLOB_COMPACTION_READAHEAD_SIZE);
+		opts.set_blob_compaction_readahead_size(
+			(*cnf::ROCKSDB_BLOB_COMPACTION_READAHEAD_SIZE) as u64,
+		);
 		// Set the write-ahead-log size limit in MB
 		info!(target: TARGET, "Write-ahead-log file size limit: {}MB", *cnf::ROCKSDB_WAL_SIZE_LIMIT);
 		opts.set_wal_size_limit_mb(*cnf::ROCKSDB_WAL_SIZE_LIMIT);
@@ -187,7 +202,7 @@ impl Datastore {
 			"error" => LogLevel::Error,
 			"fatal" => LogLevel::Fatal,
 			l => {
-				return Err(Error::Ds(format!("Invalid storage engine log level specified: {l}")));
+				bail!(Error::Ds(format!("Invalid storage engine log level specified: {l}")));
 			}
 		});
 		// Configure background WAL flush behaviour
@@ -216,14 +231,16 @@ impl Datastore {
 				// Clone the database reference
 				let dbc = db.clone();
 				// Create a new background thread
-				thread::spawn(move || loop {
-					// Get the specified flush interval
-					let wait = *cnf::ROCKSDB_BACKGROUND_FLUSH_INTERVAL;
-					// Wait for the specified interval
-					thread::sleep(Duration::from_millis(wait));
-					// Flush the WAL to disk periodically
-					if let Err(err) = dbc.flush_wal(*cnf::SYNC_DATA) {
-						error!("Failed to flush WAL: {err}");
+				thread::spawn(move || {
+					loop {
+						// Get the specified flush interval
+						let wait = *cnf::ROCKSDB_BACKGROUND_FLUSH_INTERVAL;
+						// Wait for the specified interval
+						thread::sleep(Duration::from_millis(wait));
+						// Flush the WAL to disk periodically
+						if let Err(err) = dbc.flush_wal(*cnf::SYNC_DATA) {
+							error!("Failed to flush WAL: {err}");
+						}
 					}
 				});
 				// Return the datastore
@@ -237,7 +254,7 @@ impl Datastore {
 	}
 
 	/// Shutdown the database
-	pub(crate) async fn shutdown(&self) -> Result<(), Error> {
+	pub(crate) async fn shutdown(&self) -> Result<()> {
 		// Create new flush options
 		let mut opts = FlushOptions::default();
 		// Wait for the sync to finish
@@ -259,7 +276,7 @@ impl Datastore {
 		&self,
 		write: bool,
 		_: bool,
-	) -> Result<Box<dyn crate::kvs::api::Transaction>, Error> {
+	) -> Result<Box<dyn crate::kvs::api::Transaction>> {
 		// Set the transaction options
 		let mut to = OptimisticTransactionOptions::default();
 		to.set_snapshot(true);
@@ -309,6 +326,10 @@ impl super::api::Transaction for Transaction {
 		"rocksdb"
 	}
 
+	fn supports_reverse_scan(&self) -> bool {
+		true
+	}
+
 	/// Behaviour if unclosed
 	fn check_level(&mut self, check: Check) {
 		self.check = check;
@@ -326,11 +347,9 @@ impl super::api::Transaction for Transaction {
 
 	/// Cancel a transaction
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn cancel(&mut self) -> Result<(), Error> {
+	async fn cancel(&mut self) -> Result<()> {
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Mark this transaction as done
 		self.done = true;
 		// Cancel this transaction
@@ -341,15 +360,11 @@ impl super::api::Transaction for Transaction {
 
 	/// Commit a transaction
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn commit(&mut self) -> Result<(), Error> {
+	async fn commit(&mut self) -> Result<()> {
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Check to see if transaction is writable
-		if !self.write {
-			return Err(Error::TxReadonly);
-		}
+		ensure!(self.write, Error::TxReadonly);
 		// Mark this transaction as done
 		self.done = true;
 		// Commit this transaction
@@ -360,15 +375,11 @@ impl super::api::Transaction for Transaction {
 
 	/// Check if a key exists
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn exists(&mut self, key: Key, version: Option<u64>) -> Result<bool, Error> {
+	async fn exists(&mut self, key: Key, version: Option<u64>) -> Result<bool> {
 		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
+		ensure!(version.is_none(), Error::UnsupportedVersionedQueries);
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Get the key
 		let res = self.inner.as_ref().unwrap().get_pinned_opt(key, &self.ro)?.is_some();
 		// Return result
@@ -377,15 +388,11 @@ impl super::api::Transaction for Transaction {
 
 	/// Fetch a key from the database
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn get(&mut self, key: Key, version: Option<u64>) -> Result<Option<Val>, Error> {
+	async fn get(&mut self, key: Key, version: Option<u64>) -> Result<Option<Val>> {
 		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
+		ensure!(version.is_none(), Error::UnsupportedVersionedQueries);
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Get the key
 		let res = self.inner.as_ref().unwrap().get_opt(key, &self.ro)?;
 		// Return result
@@ -394,15 +401,11 @@ impl super::api::Transaction for Transaction {
 
 	/// Fetch many keys from the datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(keys = keys.sprint()))]
-	async fn getm(&mut self, keys: Vec<Key>) -> Result<Vec<Option<Val>>, Error> {
+	async fn getm(&mut self, keys: Vec<Key>) -> Result<Vec<Option<Val>>> {
 		// Check to see if transaction is closed
-		if self.closed() {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.closed(), Error::TxFinished);
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Get the keys
 		let res = self.inner.as_ref().unwrap().multi_get_opt(keys, &self.ro);
 		// Convert result
@@ -413,19 +416,13 @@ impl super::api::Transaction for Transaction {
 
 	/// Insert or update a key in the database
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn set(&mut self, key: Key, val: Val, version: Option<u64>) -> Result<(), Error> {
+	async fn set(&mut self, key: Key, val: Val, version: Option<u64>) -> Result<()> {
 		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
+		ensure!(version.is_none(), Error::UnsupportedVersionedQueries);
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Check to see if transaction is writable
-		if !self.write {
-			return Err(Error::TxReadonly);
-		}
+		ensure!(self.write, Error::TxReadonly);
 		// Set the key
 		self.inner.as_ref().unwrap().put(key, val)?;
 		// Return result
@@ -434,23 +431,17 @@ impl super::api::Transaction for Transaction {
 
 	/// Insert a key if it doesn't exist in the database
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn put(&mut self, key: Key, val: Val, version: Option<u64>) -> Result<(), Error> {
+	async fn put(&mut self, key: Key, val: Val, version: Option<u64>) -> Result<()> {
 		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
+		ensure!(version.is_none(), Error::UnsupportedVersionedQueries);
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Check to see if transaction is writable
-		if !self.write {
-			return Err(Error::TxReadonly);
-		}
+		ensure!(self.write, Error::TxReadonly);
 		// Set the key if empty
 		match self.inner.as_ref().unwrap().get_pinned_opt(&key, &self.ro)? {
 			None => self.inner.as_ref().unwrap().put(key, val)?,
-			_ => return Err(Error::TxKeyAlreadyExists),
+			_ => bail!(Error::TxKeyAlreadyExists),
 		};
 		// Return result
 		Ok(())
@@ -458,20 +449,16 @@ impl super::api::Transaction for Transaction {
 
 	/// Insert a key if the current value matches a condition
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<(), Error> {
+	async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<()> {
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Check to see if transaction is writable
-		if !self.write {
-			return Err(Error::TxReadonly);
-		}
+		ensure!(self.write, Error::TxReadonly);
 		// Set the key if empty
 		match (self.inner.as_ref().unwrap().get_pinned_opt(&key, &self.ro)?, chk) {
 			(Some(v), Some(w)) if v.eq(&w) => self.inner.as_ref().unwrap().put(key, val)?,
 			(None, None) => self.inner.as_ref().unwrap().put(key, val)?,
-			_ => return Err(Error::TxConditionNotMet),
+			_ => bail!(Error::TxConditionNotMet),
 		};
 		// Return result
 		Ok(())
@@ -479,15 +466,11 @@ impl super::api::Transaction for Transaction {
 
 	/// Delete a key
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn del(&mut self, key: Key) -> Result<(), Error> {
+	async fn del(&mut self, key: Key) -> Result<()> {
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Check to see if transaction is writable
-		if !self.write {
-			return Err(Error::TxReadonly);
-		}
+		ensure!(self.write, Error::TxReadonly);
 		// Remove the key
 		self.inner.as_ref().unwrap().delete(key)?;
 		// Return result
@@ -496,20 +479,16 @@ impl super::api::Transaction for Transaction {
 
 	/// Delete a key if the current value matches a condition
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<(), Error> {
+	async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<()> {
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		// Check to see if transaction is writable
-		if !self.write {
-			return Err(Error::TxReadonly);
-		}
+		ensure!(self.write, Error::TxReadonly);
 		// Delete the key if valid
 		match (self.inner.as_ref().unwrap().get_pinned_opt(&key, &self.ro)?, chk) {
 			(Some(v), Some(w)) if v.eq(&w) => self.inner.as_ref().unwrap().delete(key)?,
 			(None, None) => self.inner.as_ref().unwrap().delete(key)?,
-			_ => return Err(Error::TxConditionNotMet),
+			_ => bail!(Error::TxConditionNotMet),
 		};
 		// Return result
 		Ok(())
@@ -522,7 +501,7 @@ impl super::api::Transaction for Transaction {
 		rng: Range<Key>,
 		limit: u32,
 		version: Option<u64>,
-	) -> Result<Vec<Key>, Error> {
+	) -> Result<Vec<Key>> {
 		let rng = self.prepare_scan(rng, version).await?;
 		// Execute on the blocking threadpool
 		let res = affinitypool::spawn_local(move || {
@@ -573,7 +552,7 @@ impl super::api::Transaction for Transaction {
 		rng: Range<Key>,
 		limit: u32,
 		version: Option<u64>,
-	) -> Result<Vec<Key>, Error> {
+	) -> Result<Vec<Key>> {
 		let rng = self.prepare_scan(rng, version).await?;
 		// Get the transaction
 		let inner = self.inner.as_ref().unwrap();
@@ -618,7 +597,7 @@ impl super::api::Transaction for Transaction {
 		rng: Range<Key>,
 		limit: u32,
 		version: Option<u64>,
-	) -> Result<Vec<(Key, Val)>, Error> {
+	) -> Result<Vec<(Key, Val)>> {
 		let rng = self.prepare_scan(rng, version).await?;
 		// Execute on the blocking threadpool
 		let res = affinitypool::spawn_local(move || {
@@ -668,7 +647,7 @@ impl super::api::Transaction for Transaction {
 		rng: Range<Key>,
 		limit: u32,
 		version: Option<u64>,
-	) -> Result<Vec<(Key, Val)>, Error> {
+	) -> Result<Vec<(Key, Val)>> {
 		let rng = self.prepare_scan(rng, version).await?;
 		// Get the transaction
 		let inner = self.inner.as_ref().unwrap();
@@ -717,7 +696,7 @@ impl super::api::Transaction for Transaction {
 		inner.set_savepoint();
 	}
 
-	async fn rollback_to_save_point(&mut self) -> Result<(), Error> {
+	async fn rollback_to_save_point(&mut self) -> Result<()> {
 		// Get the transaction
 		let inner = self.inner.as_ref().unwrap();
 		// Rollback
@@ -726,26 +705,18 @@ impl super::api::Transaction for Transaction {
 		Ok(())
 	}
 
-	fn release_last_save_point(&mut self) -> Result<(), Error> {
+	fn release_last_save_point(&mut self) -> Result<()> {
 		Ok(())
 	}
 }
 
 impl Transaction {
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
-	async fn prepare_scan(
-		&mut self,
-		rng: Range<Key>,
-		version: Option<u64>,
-	) -> Result<Range<Key>, Error> {
+	async fn prepare_scan(&mut self, rng: Range<Key>, version: Option<u64>) -> Result<Range<Key>> {
 		// RocksDB does not support versioned queries.
-		if version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
+		ensure!(version.is_none(), Error::UnsupportedVersionedQueries);
 		// Check to see if transaction is closed
-		if self.done {
-			return Err(Error::TxFinished);
-		}
+		ensure!(!self.done, Error::TxFinished);
 		Ok(rng)
 	}
 }

@@ -1,10 +1,7 @@
 use std::fmt;
 
-use clap::{
-	arg,
-	builder::{EnumValueParser, PossibleValue},
-	command, value_parser, ArgMatches, Command, ValueEnum,
-};
+use clap::builder::{EnumValueParser, PossibleValue};
+use clap::{ArgMatches, Command, ValueEnum, arg, command, value_parser};
 use semver::Version;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -21,9 +18,15 @@ impl ValueEnum for ResultsMode {
 
 	fn to_possible_value(&self) -> Option<PossibleValue> {
 		match self {
-			ResultsMode::Default => Some(PossibleValue::new("default").help("Do not change any tests")),
-			ResultsMode::Accept => Some(PossibleValue::new("accept").help("Write the results of tests which do not have results specified as the expected results")),
-			ResultsMode::Overwrite => Some(PossibleValue::new("overwrite").help("Overwrite the results of tests which do not have results and those that failed")),
+			ResultsMode::Default => {
+				Some(PossibleValue::new("default").help("Do not change any tests"))
+			}
+			ResultsMode::Accept => Some(PossibleValue::new("accept").help(
+				"Write the results of tests which do not have results specified as the expected results",
+			)),
+			ResultsMode::Overwrite => Some(PossibleValue::new("overwrite").help(
+				"Overwrite the results of tests which do not have results and those that failed",
+			)),
 		}
 	}
 }
@@ -33,12 +36,13 @@ pub enum Backend {
 	Memory,
 	RocksDb,
 	SurrealKv,
+	TikV,
 	Foundation,
 }
 
 impl ValueEnum for Backend {
 	fn value_variants<'a>() -> &'a [Self] {
-		&[Backend::Memory, Backend::RocksDb, Backend::SurrealKv, Backend::Foundation]
+		&[Backend::Memory, Backend::RocksDb, Backend::SurrealKv, Backend::TikV, Backend::Foundation]
 	}
 
 	fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -46,6 +50,7 @@ impl ValueEnum for Backend {
 			Backend::Memory => Some(PossibleValue::new("memory").alias("mem")),
 			Backend::RocksDb => Some(PossibleValue::new("rocksdb")),
 			Backend::SurrealKv => Some(PossibleValue::new("surrealkv").alias("file")),
+			Backend::TikV => Some(PossibleValue::new("tikv")),
 			Backend::Foundation => Some(PossibleValue::new("foundation")),
 		}
 	}

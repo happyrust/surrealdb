@@ -1,13 +1,13 @@
-use js::{class::Trace, JsLifetime};
+use js::JsLifetime;
+use js::class::Trace;
 
-use crate::sql::duration;
+use crate::val;
 
 #[derive(Clone, Trace, JsLifetime)]
 #[js::class]
-#[non_exhaustive]
 pub struct Duration {
 	#[qjs(skip_trace)]
-	pub(crate) value: Option<duration::Duration>,
+	pub(crate) value: Option<val::Duration>,
 }
 
 #[js::methods]
@@ -15,7 +15,7 @@ impl Duration {
 	#[qjs(constructor)]
 	pub fn new(value: String) -> Self {
 		Self {
-			value: duration::Duration::try_from(value).ok(),
+			value: value.parse().ok(),
 		}
 	}
 

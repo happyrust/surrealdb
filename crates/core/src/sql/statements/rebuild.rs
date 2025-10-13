@@ -1,43 +1,12 @@
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::doc::CursorDoc;
-use crate::err::Error;
-use crate::iam::{Action, ResourceKind};
-use crate::sql::ident::Ident;
-use crate::sql::value::Value;
-use crate::sql::Base;
-
-use reblessive::tree::Stk;
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+use crate::fmt::EscapeIdent;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub enum RebuildStatement {
 	Index(RebuildIndexStatement),
-}
-
-impl RebuildStatement {
-	/// Check if we require a writeable transaction
-	pub(crate) fn writeable(&self) -> bool {
-		true
-	}
-	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(
-		&self,
-		stk: &mut Stk,
-		ctx: &Context,
-		opt: &Options,
-		doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		match self {
-			Self::Index(s) => s.compute(stk, ctx, opt, doc).await,
-		}
-	}
 }
 
 impl Display for RebuildStatement {
@@ -48,47 +17,29 @@ impl Display for RebuildStatement {
 	}
 }
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct RebuildIndexStatement {
-	pub name: Ident,
-	pub what: Ident,
-	pub if_exists: bool,
-}
-
-impl RebuildIndexStatement {
-	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(
-		&self,
-		stk: &mut Stk,
-		ctx: &Context,
-		opt: &Options,
-		doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		let future = async {
-			// Allowed to run?
-			opt.is_allowed(Action::Edit, ResourceKind::Index, &Base::Db)?;
-			// Get the index definition
-			let (ns, db) = opt.ns_db()?;
-			let mut ix =
-				ctx.tx().get_tb_index(ns, db, &self.what, &self.name).await?.as_ref().clone();
-			ix.overwrite = true;
-			ix.if_not_exists = false;
-			// Rebuild the index
-			ix.compute(stk, ctx, opt, doc).await?;
-			// Ok all good
-			Ok(Value::None)
-		}
-		.await;
-		match future {
-			Err(Error::IxNotFound {
-				..
-			}) if self.if_exists => Ok(Value::None),
-			v => v,
+impl From<RebuildStatement> for crate::expr::statements::rebuild::RebuildStatement {
+	fn from(v: RebuildStatement) -> Self {
+		match v {
+			RebuildStatement::Index(v) => Self::Index(v.into()),
 		}
 	}
+}
+
+impl From<crate::expr::statements::rebuild::RebuildStatement> for RebuildStatement {
+	fn from(v: crate::expr::statements::rebuild::RebuildStatement) -> Self {
+		match v {
+			crate::expr::statements::rebuild::RebuildStatement::Index(v) => Self::Index(v.into()),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Hash)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct RebuildIndexStatement {
+	pub name: String,
+	pub what: String,
+	pub if_exists: bool,
+	pub concurrently: bool,
 }
 
 impl Display for RebuildIndexStatement {
@@ -97,7 +48,32 @@ impl Display for RebuildIndexStatement {
 		if self.if_exists {
 			write!(f, " IF EXISTS")?
 		}
-		write!(f, " {} ON {}", self.name, self.what)?;
+		write!(f, " {} ON {}", EscapeIdent(&self.name), EscapeIdent(&self.what))?;
+		if self.concurrently {
+			write!(f, " CONCURRENTLY")?
+		}
 		Ok(())
+	}
+}
+
+impl From<RebuildIndexStatement> for crate::expr::statements::rebuild::RebuildIndexStatement {
+	fn from(v: RebuildIndexStatement) -> Self {
+		Self {
+			name: v.name,
+			what: v.what,
+			if_exists: v.if_exists,
+			concurrently: v.concurrently,
+		}
+	}
+}
+
+impl From<crate::expr::statements::rebuild::RebuildIndexStatement> for RebuildIndexStatement {
+	fn from(v: crate::expr::statements::rebuild::RebuildIndexStatement) -> Self {
+		Self {
+			name: v.name,
+			what: v.what,
+			if_exists: v.if_exists,
+			concurrently: v.concurrently,
+		}
 	}
 }

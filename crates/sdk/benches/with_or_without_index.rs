@@ -1,11 +1,11 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use surrealdb::dbs::Session;
-use surrealdb::kvs::Datastore;
+
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use surrealdb_core::dbs::capabilities::{FuncTarget, Targets};
-use surrealdb_core::dbs::Capabilities;
-use surrealdb_core::sql::{Array, Number, Object, Value};
+use surrealdb_core::dbs::{Capabilities, Session};
+use surrealdb_core::kvs::Datastore;
+use surrealdb_types::{Array, Number, Object, Value};
 use tokio::runtime::Runtime;
 
 fn bench_with_or_without_index(c: &mut Criterion) {
@@ -74,7 +74,7 @@ async fn run(i: &Input, q: &str, expected: usize) {
 		let expected = Value::Array(Array::from(vec![Value::Object(Object::from(
 			BTreeMap::from([("count", Value::Number(Number::Int(expected as i64)))]),
 		))]));
-		assert_eq!(format!("{val:#}"), format!("{expected:#}"));
+		assert_eq!(val, expected);
 	}
 	black_box(r);
 }

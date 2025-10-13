@@ -1,19 +1,22 @@
-use crate::cnf::EXTERNAL_SORTING_BUFFER_LIMIT;
-use crate::dbs::plan::Explanation;
-use crate::err::Error;
-use crate::sql::order::Ordering;
-use crate::sql::Value;
-use ext_sort::{ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
-use rand::seq::SliceRandom as _;
-use rand::Rng as _;
-use revision::Revisioned;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 use std::{fs, io, mem};
+
+use anyhow::Result;
+use ext_sort::{ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
+use rand::Rng as _;
+use rand::seq::SliceRandom as _;
+use revision::{DeserializeRevisioned, SerializeRevisioned};
 use tempfile::{Builder, TempDir};
 #[cfg(not(target_family = "wasm"))]
 use tokio::task::spawn_blocking;
+
+use crate::cnf::EXTERNAL_SORTING_BUFFER_LIMIT;
+use crate::dbs::plan::Explanation;
+use crate::err::Error;
+use crate::expr::order::Ordering;
+use crate::val::Value;
 
 pub(super) struct FileCollector {
 	dir: TempDir,
@@ -119,8 +122,8 @@ impl FileCollector {
 					// sampling.
 					// This implementation is taken from the IteratorRandom::choose_multiple. It is
 					// emperically tested to produce n values uniformly sampled from the iterator.
-					// TODO (DelSkayn): Figure exactly out why this is guarenteed to produce a uniform
-					// sampling.
+					// TODO (DelSkayn): Figure exactly out why this is guarenteed to produce a
+					// uniform sampling.
 					for (i, v) in iter.enumerate() {
 						let v = v?;
 						// pick an index to insert the value in, swapping existing values if it is
@@ -214,7 +217,7 @@ impl FileWriter {
 
 	fn write_value<W: Write>(writer: &mut W, value: Value) -> Result<usize, Error> {
 		let mut val = Vec::new();
-		value.serialize_revisioned(&mut val)?;
+		SerializeRevisioned::serialize_revisioned(&value, &mut val)?;
 		// Write the size of the buffer in the index
 		Self::write_usize(writer, val.len())?;
 		// Write the buffer in the records
@@ -262,14 +265,15 @@ impl FileReader {
 		if let Err(e) = reader.read_exact(&mut buf) {
 			return Err(Error::Io(e));
 		}
-		let val = Value::deserialize_revisioned(&mut buf.as_slice())?;
+		let val: Value = DeserializeRevisioned::deserialize_revisioned(&mut buf.as_slice())?;
 		Ok(val)
 	}
 
 	fn read_usize<R: Read>(reader: &mut R) -> Result<usize, io::Error> {
 		let mut buf = vec![0u8; FileCollector::USIZE_SIZE];
 		reader.read_exact(&mut buf)?;
-		// Safe to call unwrap because we know the slice length matches the expected length
+		// Safe to call unwrap because we know the slice length matches the expected
+		// length
 		let u = usize::from_be_bytes(buf.try_into().unwrap());
 		Ok(u)
 	}

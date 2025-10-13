@@ -1,11 +1,13 @@
-use crate::err;
-use crate::err::Error;
-use crate::idx::ft::analyzer::filter::{Filter, FilterResult, Term};
-use crate::idx::ft::offsets::{Offset, Position};
-use crate::sql::tokenizer::Tokenizer as SqlTokenizer;
-use crate::sql::Value;
+use anyhow::{Result, bail};
 
-pub(in crate::idx) struct Tokens {
+use crate::err::Error;
+use crate::expr::tokenizer::Tokenizer as SqlTokenizer;
+use crate::idx::ft::Position;
+use crate::idx::ft::analyzer::filter::{Filter, FilterResult, Term};
+use crate::idx::ft::offset::Offset;
+use crate::val::Value;
+
+pub(in crate::idx::ft) struct Tokens {
 	/// The input string
 	i: String,
 	/// The final list of tokens
@@ -13,18 +15,18 @@ pub(in crate::idx) struct Tokens {
 }
 
 impl Tokens {
-	pub(super) fn new(i: String) -> Self {
+	pub(in crate::idx::ft) fn new(i: String) -> Self {
 		Self {
 			i,
 			t: Vec::new(),
 		}
 	}
 
-	pub(super) fn get_token_string<'a>(&'a self, t: &'a Token) -> Result<&'a str, Error> {
+	pub(in crate::idx::ft) fn get_token_string<'a>(&'a self, t: &'a Token) -> Result<&'a str> {
 		t.get_str(&self.i)
 	}
 
-	pub(super) fn filter(self, f: &Filter) -> Result<Tokens, Error> {
+	pub(super) fn filter(self, f: &Filter) -> Result<Tokens> {
 		let mut tks = Vec::new();
 		for tk in self.t {
 			if tk.is_empty() {
@@ -59,15 +61,24 @@ impl Tokens {
 		})
 	}
 
-	pub(super) fn list(&self) -> &Vec<Token> {
+	pub(in crate::idx::ft) fn list(&self) -> &Vec<Token> {
 		&self.t
+	}
+
+	pub(in crate::idx::ft) fn try_contains(&self, s: &str) -> Result<bool> {
+		for t in &self.t {
+			if self.get_token_string(t)?.eq(s) {
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 }
 
 impl TryFrom<Tokens> for Value {
-	type Error = err::Error;
+	type Error = anyhow::Error;
 
-	fn try_from(tokens: Tokens) -> Result<Self, Error> {
+	fn try_from(tokens: Tokens) -> Result<Self> {
 		let mut vec: Vec<Value> = Vec::with_capacity(tokens.t.len());
 		for token in tokens.t {
 			vec.push(token.get_str(&tokens.i)?.into())
@@ -77,7 +88,7 @@ impl TryFrom<Tokens> for Value {
 }
 
 #[derive(Clone, Debug, PartialOrd, PartialEq, Eq, Ord, Hash)]
-pub(super) enum Token {
+pub(in crate::idx::ft) enum Token {
 	Ref {
 		chars: (Position, Position, Position),
 		bytes: (Position, Position),
@@ -118,7 +129,7 @@ impl Token {
 		}
 	}
 
-	pub(super) fn new_offset(&self, i: u32) -> Offset {
+	pub(in crate::idx::ft) fn new_offset(&self, i: u32) -> Offset {
 		match self {
 			Token::Ref {
 				chars,
@@ -144,7 +155,7 @@ impl Token {
 		}
 	}
 
-	pub(super) fn get_char_len(&self) -> u32 {
+	pub(in crate::idx::ft) fn get_char_len(&self) -> u32 {
 		match self {
 			Token::Ref {
 				len,
@@ -157,7 +168,7 @@ impl Token {
 		}
 	}
 
-	pub(super) fn get_str<'a>(&'a self, i: &'a str) -> Result<&'a str, Error> {
+	pub(super) fn get_str<'a>(&'a self, i: &'a str) -> Result<&'a str> {
 		match self {
 			Token::Ref {
 				bytes,
@@ -167,7 +178,7 @@ impl Token {
 				let e = bytes.1 as usize;
 				let l = i.len();
 				if s >= l || e > l {
-					return Err(Error::AnalyzerError(format!(
+					bail!(Error::AnalyzerError(format!(
 						"Unable to extract the token. The offset position ({s},{e}) is out of range ({l})."
 					)));
 				}
@@ -198,15 +209,18 @@ impl Tokenizer {
 		if !cl.is_valid() {
 			return CharacterRole::NotTokenizable;
 		}
-		// At this stage, by default, we consider a character being part of the current token
+		// At this stage, by default, we consider a character being part of the current
+		// token
 		let mut r = CharacterRole::PartOfCurrentToken;
 		for s in &mut self.splitters {
 			match s.character_role(cl) {
-				// If a tokenizer considers the character being an isolated token we can immediately return
+				// If a tokenizer considers the character being an isolated token we can immediately
+				// return
 				CharacterRole::IsolatedToken => return CharacterRole::IsolatedToken,
 				// The character is part of a new token
 				CharacterRole::StartsNewToken => r = CharacterRole::StartsNewToken,
-				// If a tokenizer considers the character being not tokenizable we can immediately return
+				// If a tokenizer considers the character being not tokenizable we can immediately
+				// return
 				CharacterRole::NotTokenizable => return CharacterRole::NotTokenizable,
 				// We keep the character being part of the current token
 				CharacterRole::PartOfCurrentToken => {}
@@ -300,7 +314,8 @@ impl From<char> for CharacterClass {
 }
 
 impl CharacterClass {
-	/// Te be valid a character is either alphanumeric, punctuation or whitespace
+	/// Te be valid a character is either alphanumeric, punctuation or
+	/// whitespace
 	fn is_valid(&self) -> bool {
 		matches!(self, Self::Alphabetic(_) | Self::Numeric | Self::Punctuation | Self::Whitespace)
 	}

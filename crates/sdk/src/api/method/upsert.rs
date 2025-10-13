@@ -1,39 +1,46 @@
-use crate::api::conn::Command;
-use crate::api::method::BoxFuture;
-use crate::api::method::Content;
-use crate::api::method::Merge;
-use crate::api::method::Patch;
-use crate::api::opt::PatchOp;
-use crate::api::opt::Resource;
-use crate::api::Connection;
-use crate::api::Result;
-use crate::method::OnceLockExt;
-use crate::opt::KeyRange;
-use crate::Surreal;
-use crate::Value;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::borrow::Cow;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
-use surrealdb_core::sql::{to_value as to_core_value, Value as CoreValue};
 
+use surrealdb_types::{self, RecordIdKeyRange, SurrealValue, Value, Variables};
+use uuid::Uuid;
+
+use super::transaction::WithTransaction;
 use super::validate_data;
+use crate::Surreal;
+use crate::api::conn::Command;
+use crate::api::method::{BoxFuture, Content, Merge, Patch};
+use crate::api::opt::Resource;
+use crate::api::{Connection, Result};
+use crate::method::OnceLockExt;
+use crate::opt::PatchOps;
 
 /// An upsert future
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Upsert<'r, C: Connection, R> {
+	pub(super) txn: Option<Uuid>,
 	pub(super) client: Cow<'r, Surreal<C>>,
 	pub(super) resource: Result<Resource>,
 	pub(super) response_type: PhantomData<R>,
+}
+
+impl<C, R> WithTransaction for Upsert<'_, C, R>
+where
+	C: Connection,
+{
+	fn with_transaction(mut self, id: Uuid) -> Self {
+		self.txn = Some(id);
+		self
+	}
 }
 
 impl<C, R> Upsert<'_, C, R>
 where
 	C: Connection,
 {
-	/// Converts to an owned type which can easily be moved to a different thread
+	/// Converts to an owned type which can easily be moved to a different
+	/// thread
 	pub fn into_owned(self) -> Upsert<'static, C, R> {
 		Upsert {
 			client: Cow::Owned(self.client.into_owned()),
@@ -46,16 +53,24 @@ macro_rules! into_future {
 	($method:ident) => {
 		fn into_future(self) -> Self::IntoFuture {
 			let Upsert {
+				txn,
 				client,
 				resource,
 				..
 			} = self;
 			Box::pin(async move {
 				let router = client.inner.router.extract()?;
+
+				let what = resource?;
+
+				let mut variables = Variables::new();
+				let what = what.for_sql_query(&mut variables)?;
+
 				router
-					.$method(Command::Upsert {
-						what: resource?,
-						data: None,
+					.$method(Command::RawQuery {
+						txn,
+						query: Cow::Owned(format!("UPSERT {what}")),
+						variables,
 					})
 					.await
 			})
@@ -76,7 +91,7 @@ where
 impl<'r, Client, R> IntoFuture for Upsert<'r, Client, Option<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Option<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
@@ -87,7 +102,7 @@ where
 impl<'r, Client, R> IntoFuture for Upsert<'r, Client, Vec<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Vec<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
@@ -100,7 +115,7 @@ where
 	C: Connection,
 {
 	/// Restricts the records to upsert to those in the specified range
-	pub fn range(mut self, range: impl Into<KeyRange>) -> Self {
+	pub fn range(mut self, range: impl Into<RecordIdKeyRange>) -> Self {
 		self.resource = self.resource.and_then(|x| x.with_range(range.into()));
 		self
 	}
@@ -111,7 +126,7 @@ where
 	C: Connection,
 {
 	/// Restricts the records to upsert to those in the specified range
-	pub fn range(mut self, range: impl Into<KeyRange>) -> Self {
+	pub fn range(mut self, range: impl Into<RecordIdKeyRange>) -> Self {
 		self.resource = self.resource.and_then(|x| x.with_range(range.into()));
 		self
 	}
@@ -120,26 +135,43 @@ where
 impl<'r, C, R> Upsert<'r, C, R>
 where
 	C: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	/// Replaces the current document / record data with the specified data
 	pub fn content<D>(self, data: D) -> Content<'r, C, R>
 	where
-		D: Serialize + 'static,
+		D: SurrealValue,
 	{
-		Content::from_closure(self.client, || {
-			let data = to_core_value(data)?;
+		let data = data.into_value();
 
-			validate_data(&data, "Tried to upsert non-object-like data as content, only structs and objects are supported")?;
+		Content::from_closure(self.client, self.txn, || {
+			validate_data(
+				&data,
+				"Tried to upsert non-object-like data as content, only structs and objects are supported",
+			)?;
 
 			let data = match data {
-				CoreValue::None => None,
+				Value::None => None,
 				content => Some(content),
 			};
 
-			Ok(Command::Upsert {
-				what: self.resource?,
-				data,
+			let what = self.resource?;
+
+			let mut variables = Variables::new();
+			let what = what.for_sql_query(&mut variables)?;
+
+			let query = match data {
+				None => Cow::Owned(format!("UPSERT {what}")),
+				Some(content) => {
+					variables.insert("_content", content);
+					Cow::Owned(format!("UPSERT {what} CONTENT $_content"))
+				}
+			};
+
+			Ok(Command::RawQuery {
+				txn: self.txn,
+				query,
+				variables,
 			})
 		})
 	}
@@ -147,9 +179,10 @@ where
 	/// Merges the current document / record data with the specified data
 	pub fn merge<D>(self, data: D) -> Merge<'r, C, D, R>
 	where
-		D: Serialize,
+		D: SurrealValue,
 	{
 		Merge {
+			txn: self.txn,
 			client: self.client,
 			resource: self.resource,
 			content: data,
@@ -158,16 +191,12 @@ where
 		}
 	}
 
-	/// Patches the current document / record data with the specified JSON Patch data
-	pub fn patch(self, patch: impl Into<PatchOp>) -> Patch<'r, C, R> {
-		let PatchOp(result) = patch.into();
-		let patches = match result {
-			Ok(serde_content::Value::Seq(values)) => values.into_iter().map(Ok).collect(),
-			Ok(value) => vec![Ok(value)],
-			Err(error) => vec![Err(error)],
-		};
+	/// Patches the current document / record data with the specified JSON Patch
+	/// data
+	pub fn patch(self, patches: impl Into<PatchOps>) -> Patch<'r, C, R> {
 		Patch {
-			patches,
+			patches: patches.into(),
+			txn: self.txn,
 			client: self.client,
 			resource: self.resource,
 			upsert: true,

@@ -1,10 +1,9 @@
 use http::StatusCode;
 use thiserror::Error;
 
-use crate::sql::Bytesize;
+use crate::expr::Bytesize;
 
 #[derive(Error, Debug)]
-#[non_exhaustive]
 pub enum ApiError {
 	#[error("Invalid request body: Expected data frame but received another frame type")]
 	InvalidRequestBody,
@@ -29,12 +28,6 @@ pub enum ApiError {
 
 	#[error("An unreachable error occured: {0}")]
 	Unreachable(String),
-}
-
-impl From<ApiError> for String {
-	fn from(e: ApiError) -> String {
-		e.to_string()
-	}
 }
 
 impl ApiError {

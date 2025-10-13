@@ -1,44 +1,35 @@
-use std::sync::Arc;
+use std::fmt::Display;
 
-use super::params::Params;
-use super::AppState;
-use crate::cnf::HTTP_MAX_API_BODY_SIZE;
-use crate::err::Error;
 use axum::body::Body;
-use axum::extract::DefaultBodyLimit;
-use axum::extract::Path;
-use axum::extract::Query;
-use axum::http::HeaderMap;
-use axum::http::Method;
+use axum::extract::{DefaultBodyLimit, Path, Query};
+use axum::http::{HeaderMap, Method};
 use axum::response::IntoResponse;
 use axum::routing::any;
-use axum::Extension;
-use axum::Router;
+use axum::{Extension, Router};
+use futures::StreamExt;
 use http::header::CONTENT_TYPE;
-use surrealdb::dbs::capabilities::ExperimentalTarget;
-use surrealdb::dbs::capabilities::RouteTarget;
-use surrealdb::dbs::Session;
-use surrealdb::kvs::LockType;
-use surrealdb::kvs::TransactionType;
-use surrealdb::rpc::format::cbor;
-use surrealdb::rpc::format::json;
-use surrealdb::rpc::format::revision;
-use surrealdb::rpc::format::Format;
-use surrealdb::sql::statements::FindApi;
-use surrealdb::sql::Value;
+use surrealdb::types::Value;
 use surrealdb_core::api::err::ApiError;
-use surrealdb_core::api::{
-	body::ApiBody, invocation::ApiInvocation, method::Method as ApiMethod,
-	response::ResponseInstruction,
-};
+use surrealdb_core::api::response::ResponseInstruction;
+use surrealdb_core::catalog::ApiMethod;
+use surrealdb_core::dbs::Session;
+use surrealdb_core::dbs::capabilities::{ExperimentalTarget, RouteTarget};
+use surrealdb_core::rpc::RpcError;
+use surrealdb_core::rpc::format::{Format, cbor, flatbuffers, json};
 use tower_http::limit::RequestBodyLimitLayer;
+
+use super::AppState;
+use super::error::ResponseError;
+use crate::cnf::HTTP_MAX_API_BODY_SIZE;
+use crate::net::error::Error as NetError;
+use crate::net::params::Params;
 
 pub(super) fn router<S>() -> Router<S>
 where
 	S: Clone + Send + Sync + 'static,
 {
 	Router::new()
-		.route("/api/:ns/:db/*path", any(handler))
+		.route("/api/{ns}/{db}/{*path}", any(handler))
 		.route_layer(DefaultBodyLimit::disable())
 		.layer(RequestBodyLimitLayer::new(*HTTP_MAX_API_BODY_SIZE))
 }
@@ -51,20 +42,22 @@ async fn handler(
 	Query(query): Query<Params>,
 	method: Method,
 	body: Body,
-) -> Result<impl IntoResponse, impl IntoResponse> {
+) -> Result<impl IntoResponse, ResponseError> {
 	// Format the full URL
 	let url = format!("/api/{ns}/{db}/{path}");
 	// Get a database reference
 	let ds = &state.datastore;
+	// Update the session with the NS & DB
+	let session = session.with_ns(&ns).with_db(&db);
 	// Check if the experimental capability is enabled
 	if !state.datastore.get_capabilities().allows_experimental(&ExperimentalTarget::DefineApi) {
 		warn!("Experimental capability for API routes is not enabled");
-		return Err(Error::NotFound(url));
+		return Err(NetError::NotFound(url).into());
 	}
 	// Check if capabilities allow querying the requested HTTP route
 	if !ds.allows_http_route(&RouteTarget::Api) {
 		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Api);
-		return Err(Error::ForbiddenRoute(RouteTarget::Api.to_string()));
+		return Err(NetError::ForbiddenRoute(RouteTarget::Api.to_string()).into());
 	}
 
 	let method = match method {
@@ -74,99 +67,96 @@ async fn handler(
 		Method::POST => ApiMethod::Post,
 		Method::PUT => ApiMethod::Put,
 		Method::TRACE => ApiMethod::Trace,
-		_ => return Err(Error::NotFound(url)),
+		_ => return Err(NetError::NotFound(url).into()),
 	};
 
-	let tx = Arc::new(
-		ds.transaction(TransactionType::Write, LockType::Optimistic).await.map_err(Error::from)?,
-	);
-	let apis = tx.all_db_apis(&ns, &db).await.map_err(Error::from)?;
-	let segments: Vec<&str> = path.split('/').filter(|x| !x.is_empty()).collect();
+	let res = ds
+		.invoke_api_handler(
+			&ns,
+			&db,
+			&path,
+			&session,
+			method,
+			headers,
+			query.inner.clone(),
+			body.into_data_stream().map(|x| {
+				x.map_err(|_| {
+					Box::new(anyhow::anyhow!("Failed to get body"))
+						as Box<dyn Display + Send + Sync>
+				})
+			}),
+		)
+		.await
+		.map_err(ResponseError)?;
 
-	let (mut res, res_instruction) =
-		if let Some((api, params)) = apis.as_ref().find_api(segments, method) {
-			let invocation = ApiInvocation {
-				params,
-				method,
-				headers,
-				query: query.inner,
-			};
-
-			match invocation
-				.invoke_with_transaction(
-					tx.clone(),
-					ds.clone(),
-					&session,
-					api,
-					ApiBody::from_stream(body.into_data_stream()),
-				)
-				.await
-			{
-				Ok(Some(v)) => v,
-				Err(e) => return Err(Error::from(e)),
-				_ => return Err(Error::NotFound(url)),
-			}
-		} else {
-			return Err(Error::NotFound(url));
-		};
-
-	// Commit the transaction
-	tx.commit().await.map_err(Error::from)?;
+	let Some((mut res, res_instruction)) = res else {
+		return Err(NetError::NotFound(url).into());
+	};
 
 	let res_body: Vec<u8> = if let Some(body) = res.body {
 		match res_instruction {
 			ResponseInstruction::Raw => match body {
-				Value::Strand(v) => {
-					res.headers.entry(CONTENT_TYPE).or_insert("text/plain".parse().map_err(
-						|_| Error::Api(ApiError::Unreachable("Expected a valid format".into())),
-					)?);
-					v.0.into_bytes()
+				Value::String(v) => {
+					res.headers.entry(CONTENT_TYPE).or_insert(
+						surrealdb_core::api::format::PLAIN
+							.parse()
+							.map_err(|_| ApiError::Unreachable("Expected a valid format".into()))?,
+					);
+					v.into_bytes()
 				}
 				Value::Bytes(v) => {
 					res.headers.entry(CONTENT_TYPE).or_insert(
-						"application/octet-stream".parse().map_err(|_| {
-							Error::Api(ApiError::Unreachable("Expected a valid format".into()))
-						})?,
+						surrealdb_core::api::format::OCTET_STREAM
+							.parse()
+							.map_err(|_| ApiError::Unreachable("Expected a valid format".into()))?,
 					);
 					v.into()
 				}
 				v => {
-					return Err(Error::Api(ApiError::InvalidApiResponse(format!(
+					return Err(ApiError::InvalidApiResponse(format!(
 						"Expected bytes or string, found {}",
-						v.kindof()
-					))))
+						v.kind()
+					))
+					.into());
 				}
 			},
 			ResponseInstruction::Format(format) => {
 				if res.headers.contains_key("Content-Type") {
-					return Err(Error::Api(ApiError::InvalidApiResponse(
+					return Err(ApiError::InvalidApiResponse(
 						"A Content-Type header was already set while this was not expected".into(),
-					)));
+					)
+					.into());
 				}
 
 				let (header, val) = match format {
-					Format::Json => ("application/json", json::res(body)?),
-					Format::Cbor => ("application/cbor", cbor::res(body)?),
-					Format::Revision => ("application/surrealdb", revision::res(body)?),
-					_ => {
-						return Err(Error::Api(ApiError::Unreachable(
-							"Expected a valid format".into(),
-						)))
-					}
+					Format::Json => (
+						surrealdb_core::api::format::JSON,
+						json::encode(body).map_err(|_| RpcError::ParseError)?,
+					),
+					Format::Cbor => (
+						surrealdb_core::api::format::CBOR,
+						cbor::encode(body).map_err(|_| RpcError::ParseError)?,
+					),
+					Format::Flatbuffers => (
+						surrealdb_core::api::format::FLATBUFFERS,
+						flatbuffers::encode(&body).map_err(|_| RpcError::ParseError)?,
+					),
+					_ => return Err(ApiError::Unreachable("Expected a valid format".into()).into()),
 				};
 
 				res.headers.insert(
 					CONTENT_TYPE,
-					header.parse().map_err(|_| {
-						Error::Api(ApiError::Unreachable("Expected a valid format".into()))
-					})?,
+					header
+						.parse()
+						.map_err(|_| ApiError::Unreachable("Expected a valid format".into()))?,
 				);
 				val
 			}
 			ResponseInstruction::Native => {
-				return Err(Error::Api(ApiError::Unreachable(
+				return Err(ApiError::Unreachable(
 					"Found a native response instruction where this is not supported".into(),
-				)))
+				)
+				.into());
 			}
 		}
 	} else {

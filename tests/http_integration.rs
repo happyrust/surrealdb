@@ -5,15 +5,14 @@ mod http_integration {
 	use std::time::Duration;
 
 	use http::header::HeaderValue;
-	use http::{header, Method};
+	use http::{Method, header};
 	use reqwest::Client;
 	use serde_json::json;
 	use surrealdb::headers::{AUTH_DB, AUTH_NS};
-	use surrealdb::sql;
 	use test_log::test;
 	use ulid::Ulid;
 
-	use super::common::{self, StartServerArguments, PASS, USER};
+	use super::common::{self, PASS, StartServerArguments, USER};
 
 	#[test(tokio::test)]
 	async fn basic_auth() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,11 +51,14 @@ mod http_integration {
 			let res =
 				client.post(url).basic_auth(USER, Some(PASS)).body("CREATE foo").send().await?;
 			assert_eq!(res.status(), 200);
-			let body = res.text().await?;
-			assert!(body.contains(r#"[{"result":[{"id":"foo:"#), "body: {body}");
+			let body: serde_json::Value = res.json().await?;
+			assert_eq!(body[0]["status"], "OK");
+			assert_eq!(body[0]["result"].as_array().unwrap().len(), 1);
+			assert!(body[0]["result"][0]["id"].to_string().starts_with("\"foo:"));
 		}
 
-		// Prepare users with identical credentials on ROOT, NAMESPACE and DATABASE levels
+		// Prepare users with identical credentials on ROOT, NAMESPACE and DATABASE
+		// levels
 		{
 			let res =
 				client.post(url).basic_auth(USER, Some(PASS))
@@ -264,8 +266,10 @@ mod http_integration {
 		{
 			let res = client.post(url).bearer_auth(&token).body("CREATE foo").send().await?;
 			assert_eq!(res.status(), 200, "body: {}", res.text().await?);
-			let body = res.text().await?;
-			assert!(body.contains(r#"[{"result":[{"id":"foo:"#), "body: {body}");
+			let body: serde_json::Value = res.json().await?;
+			assert_eq!(body[0]["status"], "OK", "body: {body}");
+			assert_eq!(body[0]["result"].as_array().unwrap().len(), 1, "body: {body}");
+			assert!(body[0]["result"][0]["id"].to_string().starts_with("\"foo:"), "body: {body}");
 
 			// Check the selected namespace and database
 			let res = client
@@ -744,7 +748,8 @@ mod http_integration {
 			assert_eq!(res.status(), 401, "body: {}", res.text().await?);
 		}
 
-		// Signin with valid ROOT credentials without specifying NS nor DB and get the token
+		// Signin with valid ROOT credentials without specifying NS nor DB and get the
+		// token
 		{
 			let req_body = serde_json::to_string(
 				json!({
@@ -909,7 +914,7 @@ mod http_integration {
 			let res = client
 				.post(url)
 				.basic_auth(USER, Some(PASS))
-				.header(header::ACCEPT, "application/surrealdb")
+				.header(header::ACCEPT, surrealdb_core::api::format::FLATBUFFERS)
 				.body("CREATE foo")
 				.send()
 				.await?;
@@ -945,21 +950,10 @@ mod http_integration {
 			assert!(res.is_ok(), "upgrade err: {}", res.unwrap_err());
 		}
 
-		// Test nul character
-		{
-			let res =
-				client.post(url).body("parse::email::user('\\u0000@example.com')").send().await?;
-			assert_eq!(res.status(), 400);
-
-			let body = res.text().await?;
-			assert!(body.contains("Null bytes are not allowed"), "body: {body}");
-		}
-
 		Ok(())
 	}
 
 	#[test(tokio::test)]
-	#[cfg(feature = "http-compression")]
 	async fn sql_endpoint_with_compression() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_with_defaults().await.unwrap();
 		let url = &format!("http://{addr}/sql");
@@ -1048,13 +1042,17 @@ mod http_integration {
 		table: &str,
 		num_records: usize,
 	) -> Result<(), Box<dyn std::error::Error>> {
+		let end = num_records + 1;
 		let res = client
 			.post(format!("http://{addr}/sql"))
 			.basic_auth(USER, Some(PASS))
-			.body(format!("CREATE |`{table}`:1..{num_records}| SET default = 'content'"))
+			.body(format!("CREATE |`{table}`:1..{end}| SET default = 'content'"))
 			.send()
 			.await?;
-		let body: serde_json::Value = serde_json::from_str(&res.text().await?).unwrap();
+
+		let text = res.text().await?;
+		println!("{text}");
+		let body: serde_json::Value = serde_json::from_str(&text).unwrap();
 
 		assert_eq!(
 			body[0]["result"].as_array().unwrap().len(),
@@ -1167,7 +1165,7 @@ mod http_integration {
 			// Verify there are no records
 			let res = client.get(url).basic_auth(USER, Some(PASS)).send().await?;
 			let body: serde_json::Value = serde_json::from_str(&res.text().await?).unwrap();
-			assert_eq!(body[0]["result"].as_array().unwrap().len(), 0, "body: {body}");
+			assert_eq!(body["information"], "The table 'table' does not exist", "body: {body}");
 
 			// Try to create the record
 			let res = client
@@ -1200,7 +1198,10 @@ mod http_integration {
 			// Verify the table is empty
 			let res = client.get(url).basic_auth(USER, Some(PASS)).send().await?;
 			let body: serde_json::Value = serde_json::from_str(&res.text().await?).unwrap();
-			assert_eq!(body[0]["result"].as_array().unwrap().len(), 0, "body: {body}");
+			assert_eq!(
+				body["information"], "The table 'table_noauth' does not exist",
+				"body: {body}"
+			);
 		}
 
 		Ok(())
@@ -1234,7 +1235,10 @@ mod http_integration {
 				.body(r#"{"name": "record_name"}"#)
 				.send()
 				.await?;
-			assert_eq!(res.status(), 200, "body: {}", res.text().await?);
+			let status = res.status();
+			let body = res.text().await?;
+			println!("{}", body);
+			assert_eq!(status, 200);
 
 			// Verify the records were updated
 			let res = client.get(url).basic_auth(USER, Some(PASS)).send().await?;
@@ -1728,8 +1732,6 @@ mod http_integration {
 	#[test(tokio::test)]
 	async fn signup_mal() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_with_defaults().await.unwrap();
-		let rpc_url = &format!("http://{addr}/rpc");
-
 		let ns = Ulid::new().to_string();
 		let db = Ulid::new().to_string();
 
@@ -1737,8 +1739,8 @@ mod http_integration {
 		let mut headers = reqwest::header::HeaderMap::new();
 		headers.insert("surreal-ns", ns.parse()?);
 		headers.insert("surreal-db", db.parse()?);
-		headers.insert(header::ACCEPT, "application/surrealdb".parse()?);
-		headers.insert(header::CONTENT_TYPE, "application/surrealdb".parse()?);
+		headers.insert(header::ACCEPT, surrealdb_core::api::format::FLATBUFFERS.parse()?);
+		headers.insert(header::CONTENT_TYPE, surrealdb_core::api::format::FLATBUFFERS.parse()?);
 		let client = reqwest::Client::builder()
 			.connect_timeout(Duration::from_millis(10))
 			.default_headers(headers)
@@ -1761,41 +1763,6 @@ mod http_integration {
 				.send()
 				.await?;
 			assert!(res.status().is_success(), "body: {}", res.text().await?);
-		}
-
-		{
-			let mut request = sql::Object::default();
-			request.insert("method".to_string(), "signup".into());
-
-			let stmt: sql::Statement = {
-				let mut tmp = sql::statements::CreateStatement::default();
-				let rid = sql::thing("foo:42").unwrap();
-				let mut tmp_values = sql::Values::default();
-				tmp_values.0 = vec![rid.into()];
-				tmp.what = tmp_values;
-				sql::Statement::Create(tmp)
-			};
-
-			let mut obj = sql::Object::default();
-			obj.insert("email".to_string(), sql::Value::Query(stmt.into()));
-			obj.insert("pass".to_string(), "foo".into());
-			request.insert(
-				"params".to_string(),
-				sql::Value::Array(vec![sql::Value::Object(obj)].into()),
-			);
-
-			let req: sql::Value = sql::Value::Object(request);
-
-			let req = sql::serde::serialize(&req).unwrap();
-
-			let res = client.post(rpc_url).body(req).send().await?;
-
-			let body = res.text().await?;
-
-			assert!(
-				body.contains("Found a non-computed value where they are not allowed"),
-				"{body:?}"
-			);
 		}
 
 		Ok(())
@@ -2053,8 +2020,10 @@ mod http_integration {
 				.send()
 				.await
 				.unwrap();
-			let res = res.text().await.unwrap();
-			assert!(res.contains("[{\"result\":null,\"status\":\"OK\""), "body: {}", res);
+			let res: serde_json::Value = res.json().await.unwrap();
+
+			assert_eq!(res[0]["status"], "OK", "body: {res}");
+			assert_eq!(res[0]["result"], serde_json::Value::Null, "body: {res}");
 		}
 		// Deny 1
 		{
@@ -2135,8 +2104,9 @@ mod http_integration {
 				.send()
 				.await
 				.unwrap();
-			let res = res.text().await.unwrap();
-			assert!(res.contains("[{\"result\":123,\"status\":\"OK\""), "body: {}", res);
+			let res: serde_json::Value = res.json().await.unwrap();
+			assert_eq!(res[0]["status"], "OK");
+			assert_eq!(res[0]["result"], 123);
 		}
 		// Allow record
 		{

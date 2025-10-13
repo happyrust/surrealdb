@@ -1,17 +1,12 @@
 use std::str::FromStr;
 
-use wiremock::{
-	matchers::{body_string, header, method, path},
-	Mock, MockServer, ResponseTemplate,
-};
+use surrealdb_types::{Value, object};
+use wiremock::matchers::{body_string, header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::{
-	dbs::{
-		capabilities::{NetTarget, Targets},
-		Capabilities, Session,
-	},
-	kvs::Datastore,
-};
+use crate::dbs::capabilities::{NetTarget, Targets};
+use crate::dbs::{Capabilities, Session};
+use crate::kvs::Datastore;
 
 #[tokio::test]
 async fn test_fetch_get() {
@@ -35,9 +30,9 @@ async fn test_fetch_get() {
                 headers: {{
                     "some-header": "some-value",
                 }}
-            }});        
+            }});
             let body = await res.text();
-    
+
             return {{ status: res.status, body: body }};
         }}
     "#,
@@ -50,8 +45,12 @@ async fn test_fetch_get() {
 	server.verify().await;
 
 	assert_eq!(
-		res.to_string(),
-		"{ body: 'some body once told me', status: 200f }",
+		res,
+		// "{ body: 'some body once told me', status: 200f }",
+		Value::Object(object! {
+			body: "some body once told me".to_string(),
+			status: 200,
+		}),
 		"Unexpected result: {:?}",
 		res
 	);
@@ -82,9 +81,9 @@ async fn test_fetch_put() {
                     "some-header": "some-value",
                 }},
                 body: "some text",
-            }});        
+            }});
             let body = await res.text();
-    
+
             return {{ status: res.status, body: body }};
         }}
     "#,
@@ -97,10 +96,12 @@ async fn test_fetch_put() {
 	server.verify().await;
 
 	assert_eq!(
-		res.to_string(),
-		"{ body: 'some body once told me', status: 201f }",
-		"Unexpected result: {:?}",
-		res
+		res,
+		Value::Object(object! {
+			body: "some body once told me".to_string(),
+			status: 201,
+		}),
+		"Unexpected result: {res:?}"
 	);
 }
 
@@ -132,9 +133,9 @@ async fn test_fetch_error() {
                     "some-header": "some-value",
                 }},
                 body: "some text",
-            }});        
-            let body = await res.text();
-    
+            }});
+            let body = await res.json();
+
             return {{ status: res.status, body: body }};
         }}
     "#,
@@ -147,10 +148,15 @@ async fn test_fetch_error() {
 	server.verify().await;
 
 	assert_eq!(
-		res.to_string(),
-		"{ body: '{\"foo\":\"bar\",\"baz\":2}', status: 500f }",
-		"Unexpected result: {:?}",
-		res
+		res,
+		Value::Object(object! {
+			body: Value::Object(object! {
+				baz: 2,
+				foo: "bar".to_string(),
+			}),
+			status: 500,
+		}),
+		"Unexpected result: {res:?}",
 	);
 }
 
@@ -180,7 +186,7 @@ async fn test_fetch_denied() {
                 headers: {{
                     "some-header": "some-value",
                 }}
-            }});        
+            }});
             let body = await res.text();
 
             return {{ status: res.status, body: body }};

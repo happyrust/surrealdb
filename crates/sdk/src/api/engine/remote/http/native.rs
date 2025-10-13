@@ -1,27 +1,25 @@
+use std::collections::HashSet;
+use std::sync::atomic::AtomicI64;
+
+use async_channel::Receiver;
+use indexmap::IndexMap;
+use reqwest::ClientBuilder;
+use reqwest::header::HeaderMap;
+use surrealdb_core::cnf::SURREALDB_USER_AGENT;
+use tokio::sync::watch;
+use url::Url;
+
 use super::Client;
-use crate::api::conn::Connection;
-use crate::api::conn::Route;
-use crate::api::conn::Router;
+use crate::api::conn::{Route, Router};
 use crate::api::method::BoxFuture;
 use crate::api::opt::Endpoint;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 use crate::api::opt::Tls;
-use crate::api::ExtraFeatures;
-use crate::api::Result;
-use crate::api::Surreal;
+use crate::api::{ExtraFeatures, Result, Surreal, conn};
 use crate::opt::WaitFor;
-use async_channel::Receiver;
-use indexmap::IndexMap;
-use reqwest::header::HeaderMap;
-use reqwest::ClientBuilder;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicI64;
-use tokio::sync::watch;
-use url::Url;
 
 impl crate::api::Connection for Client {}
-
-impl Connection for Client {
+impl conn::Sealed for Client {
 	fn connect(address: Endpoint, capacity: usize) -> BoxFuture<'static, Result<Surreal<Self>>> {
 		Box::pin(async move {
 			let headers = super::default_headers();
@@ -44,7 +42,10 @@ impl Connection for Client {
 
 			let base_url = address.url;
 
-			super::health(client.get(base_url.join("health")?)).await?;
+			let req = client
+				.get(base_url.join("health")?)
+				.header(reqwest::header::USER_AGENT, &*SURREALDB_USER_AGENT);
+			super::health(req).await?;
 
 			let (route_tx, route_rx) = match capacity {
 				0 => async_channel::unbounded(),
@@ -78,6 +79,8 @@ pub(crate) async fn run_router(base_url: Url, client: reqwest::Client, route_rx:
 		let result =
 			super::router(route.request, &base_url, &client, &mut headers, &mut vars, &mut auth)
 				.await;
-		let _ = route.response.send(result).await;
+		// Convert api::err::Error to DbResultError
+		let db_result = result.map_err(surrealdb_core::rpc::DbResultError::from);
+		let _ = route.response.send(db_result).await;
 	}
 }

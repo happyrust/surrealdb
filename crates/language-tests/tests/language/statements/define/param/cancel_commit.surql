@@ -14,9 +14,10 @@ value = "1"
 value = "NONE"
 
 */
+
 BEGIN;
 DEFINE PARAM $a VALUE 1;
-$b = $a;
+let $b = $a;
 CANCEL;
 
 $b;

@@ -1,27 +1,32 @@
+use std::sync::Arc;
+
+use anyhow::{Result, bail};
+use chrono::Utc;
+use jsonwebtoken::{Header, encode};
+use revision::revisioned;
+use serde::{Deserialize, Serialize};
+use surrealdb_types::ToSql;
+use uuid::Uuid;
+
 use super::access::{authenticate_record, create_refresh_token_record};
+use crate::catalog;
+use crate::catalog::providers::{AuthorisationProvider, DatabaseProvider};
 use crate::cnf::{INSECURE_FORWARD_ACCESS_ERRORS, SERVER_NAME};
-use crate::dbs::capabilities::ExperimentalTarget;
 use crate::dbs::Session;
+use crate::dbs::capabilities::ExperimentalTarget;
 use crate::err::Error;
 use crate::iam::issue::{config, expiration};
 use crate::iam::token::Claims;
-use crate::iam::Auth;
-use crate::iam::{Actor, Level};
-use crate::kvs::{Datastore, LockType::*, TransactionType::*};
-use crate::sql::AccessType;
-use crate::sql::Object;
-use crate::sql::Value;
-use chrono::Utc;
-use jsonwebtoken::{encode, Header};
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use uuid::Uuid;
+use crate::iam::{Actor, Auth, Level, algorithm_to_jwt_algorithm};
+use crate::kvs::Datastore;
+use crate::kvs::LockType::*;
+use crate::kvs::TransactionType::*;
+use crate::types::PublicVariables;
+use crate::val::{Object, Value};
 
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub struct SignupData {
 	pub token: Option<String>,
 	pub refresh: Option<String>,
@@ -43,26 +48,24 @@ impl From<SignupData> for Value {
 pub async fn signup(
 	kvs: &Datastore,
 	session: &mut Session,
-	vars: Object,
-) -> Result<SignupData, Error> {
-	// Check vars contains only computed values
-	vars.validate_computed()?;
+	vars: PublicVariables,
+) -> Result<SignupData> {
 	// Parse the specified variables
-	let ns = vars.get("NS").or_else(|| vars.get("ns"));
-	let db = vars.get("DB").or_else(|| vars.get("db"));
-	let ac = vars.get("AC").or_else(|| vars.get("ac"));
+	let ns = vars.get("NS").or_else(|| vars.get("ns")).cloned();
+	let db = vars.get("DB").or_else(|| vars.get("db")).cloned();
+	let ac = vars.get("AC").or_else(|| vars.get("ac")).cloned();
 	// Check if the parameters exist
 	match (ns, db, ac) {
 		(Some(ns), Some(db), Some(ac)) => {
 			// Process the provided values
-			let ns = ns.to_raw_string();
-			let db = db.to_raw_string();
-			let ac = ac.to_raw_string();
+			let ns = ns.into_string()?;
+			let db = db.into_string()?;
+			let ac = ac.into_string()?;
 			// Attempt to signup using specified access method
 			// Currently, signup is only supported at the database level
 			super::signup::db_access(kvs, session, ns, db, ac, vars).await
 		}
-		_ => Err(Error::InvalidSignup),
+		_ => Err(anyhow::Error::new(Error::InvalidSignup)),
 	}
 }
 
@@ -72,159 +75,174 @@ pub async fn db_access(
 	ns: String,
 	db: String,
 	ac: String,
-	vars: Object,
-) -> Result<SignupData, Error> {
+	vars: PublicVariables,
+) -> Result<SignupData> {
 	// Create a new readonly transaction
 	let tx = kvs.transaction(Read, Optimistic).await?;
+	let db_def = match tx.get_db_by_name(&ns, &db).await? {
+		Some(db) => db,
+		None => {
+			return Err(Error::DbNotFound {
+				name: db.to_string(),
+			}
+			.into());
+		}
+	};
 	// Fetch the specified access method from storage
-	let access = tx.get_db_access(&ns, &db, &ac).await;
+	let access = tx.get_db_access(db_def.namespace_id, db_def.database_id, &ac).await;
 	// Ensure that the transaction is cancelled
 	tx.cancel().await?;
+
 	// Check the provided access method exists
-	match access {
-		Ok(av) => {
-			// Check the access method type
-			// Currently, only the record access method supports signup
-			match &av.kind {
-				AccessType::Record(at) => {
-					// Check if the record access method supports issuing tokens
-					let iss = match &at.jwt.issue {
-						Some(iss) => iss,
-						_ => return Err(Error::AccessMethodMismatch),
-					};
-					match &at.signup {
-						// This record access allows signup
-						Some(val) => {
-							// Setup the query params
-							let vars = Some(vars.0);
-							// Setup the system session for finding the signup record
-							let mut sess = Session::editor().with_ns(&ns).with_db(&db);
-							sess.ip.clone_from(&session.ip);
-							sess.or.clone_from(&session.or);
-							// Compute the value with the params
-							match kvs.evaluate(val, &sess, vars).await {
-								// The signup value succeeded
-								Ok(val) => {
-									match val.record() {
-										// There is a record returned
-										Some(mut rid) => {
-											// Create the authentication key
-											let key = config(iss.alg, &iss.key)?;
-											// Create the authentication claim
-											let claims = Claims {
-												iss: Some(SERVER_NAME.to_owned()),
-												iat: Some(Utc::now().timestamp()),
-												nbf: Some(Utc::now().timestamp()),
-												exp: expiration(av.duration.token)?,
-												jti: Some(Uuid::new_v4().to_string()),
-												ns: Some(ns.clone()),
-												db: Some(db.clone()),
-												ac: Some(ac.clone()),
-												id: Some(rid.to_raw()),
-												..Claims::default()
-											};
-											// AUTHENTICATE clause
-											if let Some(au) = &av.authenticate {
-												// Setup the system session for finding the signin record
-												let mut sess =
-													Session::editor().with_ns(&ns).with_db(&db);
-												sess.rd = Some(rid.clone().into());
-												sess.tk = Some((&claims).into());
-												sess.ip.clone_from(&session.ip);
-												sess.or.clone_from(&session.or);
-												rid = authenticate_record(kvs, &sess, au).await?;
-											}
-											// Create refresh token if defined for the record access method
-											let refresh = match &at.bearer {
-												Some(_) => {
-													// TODO(gguillemas): Remove this once bearer access is no longer experimental
-													if !kvs.get_capabilities().allows_experimental(
-														&ExperimentalTarget::BearerAccess,
-													) {
-														debug!("Will not create refresh token with disabled bearer access feature");
-														None
-													} else {
-														Some(
-															create_refresh_token_record(
-																kvs,
-																av.name.clone(),
-																&ns,
-																&db,
-																rid.clone(),
-															)
-															.await?,
-														)
-													}
-												}
-												None => None,
-											};
-											// Log the authenticated access method info
-											trace!("Signing up with access method `{}`", ac);
-											// Create the authentication token
-											let enc =
-												encode(&Header::new(iss.alg.into()), &claims, &key);
-											// Set the authentication on the session
-											session.tk = Some((&claims).into());
-											session.ns = Some(ns.clone());
-											session.db = Some(db.clone());
-											session.ac = Some(ac.clone());
-											session.rd = Some(Value::from(rid.clone()));
-											session.exp = expiration(av.duration.session)?;
-											session.au = Arc::new(Auth::new(Actor::new(
-												rid.to_string(),
-												Default::default(),
-												Level::Record(ns, db, rid.to_string()),
-											)));
-											// Check the authentication token
-											match enc {
-												// The auth token was created successfully
-												Ok(token) => Ok(SignupData {
-													token: Some(token),
-													refresh,
-												}),
-												_ => Err(Error::TokenMakingFailed),
-											}
-										}
-										_ => Err(Error::NoRecordFound),
-									}
-								}
-								Err(e) => match e {
-									// If the SIGNUP clause throws a specific error, authentication fails with that error
-									Error::Thrown(_) => Err(e),
-									// If the SIGNUP clause failed due to an unexpected error, be more specific
-									// This allows clients to handle these errors, which may be retryable
-									Error::Tx(_) | Error::TxFailure | Error::TxRetryable => {
-										debug!("Unexpected error found while executing a SIGNUP clause: {e}");
-										Err(Error::UnexpectedAuth)
-									}
-									// Otherwise, return a generic error unless it should be forwarded
-									e => {
-										debug!("Record user signup query failed: {e}");
-										if *INSECURE_FORWARD_ACCESS_ERRORS {
-											Err(e)
-										} else {
-											Err(Error::AccessRecordSignupQueryFailed)
-										}
-									}
-								},
-							}
-						}
-						_ => Err(Error::AccessRecordNoSignup),
+	let Ok(Some(av)) = access else {
+		bail!(Error::AccessNotFound)
+	};
+
+	// Check the access method type
+	// Currently, only the record access method supports signup
+	let catalog::AccessType::Record(ref at) = av.access_type else {
+		bail!(Error::AccessMethodMismatch)
+	};
+
+	// Check if the record access method supports issuing tokens
+	let Some(iss) = &at.jwt.issue else {
+		bail!(Error::AccessMethodMismatch)
+	};
+
+	let Some(val) = &at.signup else {
+		bail!(Error::AccessRecordNoSignup);
+	};
+	// Setup the query params
+	// Setup the system session for finding the signup record
+	let mut sess = Session::editor().with_ns(&ns).with_db(&db);
+	sess.ip.clone_from(&session.ip);
+	sess.or.clone_from(&session.or);
+	// Compute the value with the params
+	match kvs.evaluate(val, &sess, Some(vars)).await {
+		// The signup value succeeded
+		Ok(val) => {
+			// There is a record returned
+			let Ok(mut rid) = val.into_record() else {
+				bail!(Error::NoRecordFound)
+			};
+			// Create the authentication key
+			let key = config(iss.alg, &iss.key)?;
+			// Create the authentication claim
+			let claims = Claims {
+				iss: Some(SERVER_NAME.to_owned()),
+				iat: Some(Utc::now().timestamp()),
+				nbf: Some(Utc::now().timestamp()),
+				exp: expiration(av.token_duration)?,
+				jti: Some(Uuid::new_v4().to_string()),
+				ns: Some(ns.clone()),
+				db: Some(db.clone()),
+				ac: Some(ac.clone()),
+				id: Some(rid.to_sql()),
+				..Claims::default()
+			};
+			// AUTHENTICATE clause
+			if let Some(au) = &av.authenticate {
+				// Setup the system session for finding the signin record
+				let mut sess = Session::editor().with_ns(&ns).with_db(&db);
+				sess.rd = Some(
+					crate::val::convert_value_to_public_value(Value::RecordId(rid.clone().into()))
+						.unwrap(),
+				);
+				sess.tk = Some(
+					crate::val::convert_value_to_public_value(
+						claims.clone().into_claims_object().into(),
+					)
+					.unwrap(),
+				);
+				sess.ip.clone_from(&session.ip);
+				sess.or.clone_from(&session.or);
+				rid = authenticate_record(kvs, &sess, au).await?;
+			}
+			// Create refresh token if defined for the record access method
+			let refresh = match &at.bearer {
+				Some(_) => {
+					// TODO(gguillemas): Remove this once bearer access is no longer experimental
+					if !kvs
+						.get_capabilities()
+						.allows_experimental(&ExperimentalTarget::BearerAccess)
+					{
+						debug!("Will not create refresh token with disabled bearer access feature");
+						None
+					} else {
+						Some(
+							create_refresh_token_record(
+								kvs,
+								av.name.clone(),
+								&ns,
+								&db,
+								rid.clone().into(),
+							)
+							.await?,
+						)
 					}
 				}
-				_ => Err(Error::AccessMethodMismatch),
+				None => None,
+			};
+			// Log the authenticated access method info
+			trace!("Signing up with access method `{}`", ac);
+			// Create the authentication token
+			let enc = encode(&Header::new(algorithm_to_jwt_algorithm(iss.alg)), &claims, &key);
+			// Set the authentication on the session
+			session.tk = Some(
+				crate::val::convert_value_to_public_value(claims.into_claims_object().into())
+					.unwrap(),
+			);
+			session.ns = Some(ns.clone());
+			session.db = Some(db.clone());
+			session.ac = Some(ac.clone());
+			session.rd = Some(
+				crate::val::convert_value_to_public_value(Value::RecordId(rid.clone().into()))
+					.unwrap(),
+			);
+			session.exp = expiration(av.session_duration)?;
+			session.au = Arc::new(Auth::new(Actor::new(
+				rid.to_sql(),
+				Default::default(),
+				Level::Record(ns, db, rid.to_sql()),
+			)));
+			// Check the authentication token
+			match enc {
+				// The auth token was created successfully
+				Ok(token) => Ok(SignupData {
+					token: Some(token),
+					refresh,
+				}),
+				_ => Err(anyhow::Error::new(Error::TokenMakingFailed)),
 			}
 		}
-		_ => Err(Error::AccessNotFound),
+		Err(e) => match e.downcast_ref() {
+			// If the SIGNUP clause throws a specific error, authentication fails with that error
+			Some(Error::Thrown(_)) => Err(e),
+			// If the SIGNUP clause failed due to an unexpected error, be more specific
+			// This allows clients to handle these errors, which may be retryable
+			Some(Error::Tx(_) | Error::TxRetryable) => {
+				debug!("Unexpected error found while executing a SIGNUP clause: {e}");
+				Err(anyhow::Error::new(Error::UnexpectedAuth))
+			}
+			// Otherwise, return a generic error unless it should be forwarded
+			_ => {
+				if *INSECURE_FORWARD_ACCESS_ERRORS {
+					Err(e)
+				} else {
+					Err(anyhow::Error::new(Error::AccessRecordSignupQueryFailed))
+				}
+			}
+		},
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::{dbs::Capabilities, iam::Role};
 	use chrono::Duration;
-	use std::collections::HashMap;
+
+	use super::*;
+	use crate::dbs::Capabilities;
+	use crate::iam::Role;
 
 	#[tokio::test]
 	async fn test_record_signup() {
@@ -259,16 +277,16 @@ mod tests {
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("user", "user".into());
-			vars.insert("pass", "pass".into());
+			let mut vars = PublicVariables::new();
+			vars.insert("user", "user");
+			vars.insert("pass", "pass");
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -285,7 +303,8 @@ mod tests {
 			assert!(!sess.au.has_role(Role::Owner), "Auth user expected to not have Owner role");
 			// Session expiration should match the defined duration
 			let exp = sess.exp.unwrap();
-			// Expiration should match the current time plus session duration with some margin
+			// Expiration should match the current time plus session duration with some
+			// margin
 			let min_exp = (Utc::now() + Duration::hours(2) - Duration::seconds(10)).timestamp();
 			let max_exp = (Utc::now() + Duration::hours(2) + Duration::seconds(10)).timestamp();
 			assert!(
@@ -325,16 +344,16 @@ mod tests {
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
+			let mut vars = PublicVariables::new();
 			// Password is missing
-			vars.insert("user", "user".into());
+			vars.insert("user", "user");
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -379,16 +398,16 @@ mod tests {
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("user", "user".into());
-			vars.insert("pass", "pass".into());
+			let mut vars = PublicVariables::new();
+			vars.insert("user", "user");
+			vars.insert("pass", "pass");
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -435,16 +454,16 @@ mod tests {
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("user", "user".into());
-			vars.insert("pass", "pass".into());
+			let mut vars = PublicVariables::new();
+			vars.insert("user", "user");
+			vars.insert("pass", "pass");
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -468,7 +487,8 @@ mod tests {
 			assert!(!sess.au.has_role(Role::Owner), "Auth user expected to not have Owner role");
 			// Expiration should match the defined duration
 			let exp = sess.exp.unwrap();
-			// Expiration should match the current time plus session duration with some margin
+			// Expiration should match the current time plus session duration with some
+			// margin
 			let min_exp = (Utc::now() + Duration::hours(2) - Duration::seconds(10)).timestamp();
 			let max_exp = (Utc::now() + Duration::hours(2) + Duration::seconds(10)).timestamp();
 			assert!(
@@ -476,15 +496,15 @@ mod tests {
 				"Session expiration is expected to follow the defined duration"
 			);
 			// Signin with the refresh token
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("refresh", refresh.clone().into());
+			let mut vars = PublicVariables::new();
+			vars.insert("refresh", refresh.clone());
 			let res = signin::db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 			// Authentication should be identical as with user credentials
@@ -510,7 +530,8 @@ mod tests {
 			assert!(!sess.au.has_role(Role::Owner), "Auth user expected to not have Owner role");
 			// Expiration should match the defined duration
 			let exp = sess.exp.unwrap();
-			// Expiration should match the current time plus session duration with some margin
+			// Expiration should match the current time plus session duration with some
+			// margin
 			let min_exp = (Utc::now() + Duration::hours(2) - Duration::seconds(10)).timestamp();
 			let max_exp = (Utc::now() + Duration::hours(2) + Duration::seconds(10)).timestamp();
 			assert!(
@@ -518,28 +539,28 @@ mod tests {
 				"Session expiration is expected to follow the defined duration"
 			);
 			// Attempt to sign in with the original refresh token
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("refresh", refresh.into());
+			let mut vars = PublicVariables::new();
+			vars.insert("refresh", refresh);
 			let res = signin::db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
-			match res {
-				Ok(data) => panic!("Unexpected successful signin: {:?}", data),
-				Err(Error::InvalidAuth) => {} // ok
-				Err(e) => panic!("Expected InvalidAuth, but got: {e}"),
+			let e = res.unwrap_err();
+			match e.downcast().expect("Unexpected error kind") {
+				Error::InvalidAuth => {}
+				e => panic!("Unexpected error, expected InvalidAuth found {e}"),
 			}
 		}
 	}
 
 	#[tokio::test]
 	async fn test_record_signup_with_jwt_issuer() {
-		use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+		use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 		// Test with valid parameters
 		{
 			let public_key = r#"-----BEGIN PUBLIC KEY-----
@@ -617,16 +638,16 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("user", "user".into());
-			vars.insert("pass", "pass".into());
+			let mut vars = PublicVariables::new();
+			vars.insert("user", "user");
+			vars.insert("pass", "pass");
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -643,7 +664,8 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 			assert!(!sess.au.has_role(Role::Owner), "Auth user expected to not have Owner role");
 			// Session expiration should always be set for tokens issued by SurrealDB
 			let exp = sess.exp.unwrap();
-			// Expiration should match the current time plus session duration with some margin
+			// Expiration should match the current time plus session duration with some
+			// margin
 			let min_sess_exp =
 				(Utc::now() + Duration::hours(2) - Duration::seconds(10)).timestamp();
 			let max_sess_exp =
@@ -728,15 +750,15 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("id", 1.into());
+			let mut vars = PublicVariables::new();
+			vars.insert("id", 1);
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -755,7 +777,8 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 			assert!(!sess.au.has_role(Role::Owner), "Auth user expected to not have Owner role");
 			// Expiration should match the defined duration
 			let exp = sess.exp.unwrap();
-			// Expiration should match the current time plus session duration with some margin
+			// Expiration should match the current time plus session duration with some
+			// margin
 			let min_exp = (Utc::now() + Duration::hours(2) - Duration::seconds(10)).timestamp();
 			let max_exp = (Utc::now() + Duration::hours(2) + Duration::seconds(10)).timestamp();
 			assert!(
@@ -822,16 +845,16 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("email", "info@example.com".into());
-			vars.insert("pass", "company-password".into());
+			let mut vars = PublicVariables::new();
+			vars.insert("email", "info@example.com");
+			vars.insert("pass", "company-password");
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"owner".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
@@ -850,7 +873,8 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 			assert!(!sess.au.has_role(Role::Owner), "Auth user expected to not have Owner role");
 			// Expiration should match the defined duration
 			let exp = sess.exp.unwrap();
-			// Expiration should match the current time plus session duration with some margin
+			// Expiration should match the current time plus session duration with some
+			// margin
 			let min_exp = (Utc::now() + Duration::hours(2) - Duration::seconds(10)).timestamp();
 			let max_exp = (Utc::now() + Duration::hours(2) + Duration::seconds(10)).timestamp();
 			assert!(
@@ -893,24 +917,22 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("id", 1.into());
+			let mut vars = PublicVariables::new();
+			vars.insert("id", 1);
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
-			match res {
-				Err(Error::Thrown(e)) if e == "This user is not enabled" => {} // ok
-				res => panic!(
-				    "Expected authentication to failed due to user not being enabled, but instead received: {:?}",
-					res
-				),
+			let e = res.unwrap_err();
+			match e.downcast().expect("Unexpected error kind") {
+				Error::Thrown(e) => assert_eq!(e, "This user is not enabled"),
+				e => panic!("Unexpected error, expected Thrown found {e:?}"),
 			}
 		}
 
@@ -940,24 +962,22 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("id", 1.into());
+			let mut vars = PublicVariables::new();
+			vars.insert("id", 1);
 			let res = db_access(
 				&ds,
 				&mut sess,
 				"test".to_string(),
 				"test".to_string(),
 				"user".to_string(),
-				vars.into(),
+				vars,
 			)
 			.await;
 
-			match res {
-				Err(Error::InvalidAuth) => {} // ok
-				res => panic!(
-					"Expected authentication to generally fail, but instead received: {:?}",
-					res
-				),
+			let e = res.unwrap_err();
+			match e.downcast().expect("Unexpected error kind") {
+				Error::InvalidAuth => {}
+				e => panic!("Unexpected error, expected InvalidAuth found {e}"),
 			}
 		}
 	}
@@ -1006,9 +1026,9 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("user", "user".into());
-			vars.insert("pass", "pass".into());
+			let mut vars = PublicVariables::new();
+			vars.insert("user", "user");
+			vars.insert("pass", "pass");
 
 			let (res1, res2) = tokio::join!(
 				db_access(
@@ -1017,7 +1037,7 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 					"test".to_string(),
 					"test".to_string(),
 					"user".to_string(),
-					vars.clone().into(),
+					vars.clone(),
 				),
 				db_access(
 					&ds,
@@ -1025,21 +1045,27 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 					"test".to_string(),
 					"test".to_string(),
 					"user".to_string(),
-					vars.into(),
+					vars,
 				)
 			);
 
 			match (res1, res2) {
-				(Ok(r1), Ok(r2)) => panic!("Expected authentication to fail in one instance, but instead received: {:?} and {:?}", r1, r2),
-				(Err(e1), Err(e2)) => panic!("Expected authentication to fail in one instance, but instead received: {:?} and {:?}", e1, e2),
-				(Err(e1), Ok(_)) => match &e1 {
-						Error::UnexpectedAuth => {} // ok
-						e => panic!("Expected authentication to return an UnexpectedAuth error, but insted got: {e}")
-				}
-				(Ok(_), Err(e2)) => match &e2 {
-						Error::UnexpectedAuth => {} // ok
-						e => panic!("Expected authentication to return an UnexpectedAuth error, but insted got: {e}")
-				}
+				(Ok(r1), Ok(r2)) => panic!(
+					"Expected authentication to fail in one instance, but instead received: {:?} and {:?}",
+					r1, r2
+				),
+				(Err(e1), Err(e2)) => panic!(
+					"Expected authentication to fail in one instance, but instead received: {:?} and {:?}",
+					e1, e2
+				),
+				(Err(e1), Ok(_)) => match e1.downcast().expect("Unexpected error kind") {
+					Error::UnexpectedAuth => {}
+					e => panic!("Unexpected error, expected UnexpectedAuth found {e}"),
+				},
+				(Ok(_), Err(e2)) => match e2.downcast().expect("Unexpected error kind") {
+					Error::UnexpectedAuth => {}
+					e => panic!("Unexpected error, expected UnexpectedAuth found {e}"),
+				},
 			}
 		}
 
@@ -1081,8 +1107,8 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 				db: Some("test".to_string()),
 				..Default::default()
 			};
-			let mut vars: HashMap<&str, Value> = HashMap::new();
-			vars.insert("id", 1.into());
+			let mut vars = PublicVariables::new();
+			vars.insert("id", 1);
 
 			let (res1, res2) = tokio::join!(
 				db_access(
@@ -1091,7 +1117,7 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 					"test".to_string(),
 					"test".to_string(),
 					"user".to_string(),
-					vars.clone().into(),
+					vars.clone(),
 				),
 				db_access(
 					&ds,
@@ -1099,21 +1125,27 @@ dn/RsYEONbwQSjIfMPkvxF+8HQ==
 					"test".to_string(),
 					"test".to_string(),
 					"user".to_string(),
-					vars.into(),
+					vars,
 				)
 			);
 
 			match (res1, res2) {
-				(Ok(r1), Ok(r2)) => panic!("Expected authentication to fail in one instance, but instead received: {:?} and {:?}", r1, r2),
-				(Err(e1), Err(e2)) => panic!("Expected authentication to fail in one instance, but instead received: {:?} and {:?}", e1, e2),
-				(Err(e1), Ok(_)) => match &e1 {
-						Error::UnexpectedAuth => {} // ok
-						e => panic!("Expected authentication to return an UnexpectedAuth error, but insted got: {e}")
-				}
-				(Ok(_), Err(e2)) => match &e2 {
-						Error::UnexpectedAuth => {} // ok
-						e => panic!("Expected authentication to return an UnexpectedAuth error, but insted got: {e}")
-				}
+				(Ok(r1), Ok(r2)) => panic!(
+					"Expected authentication to fail in one instance, but instead received: {:?} and {:?}",
+					r1, r2
+				),
+				(Err(e1), Err(e2)) => panic!(
+					"Expected authentication to fail in one instance, but instead received: {:?} and {:?}",
+					e1, e2
+				),
+				(Err(e1), Ok(_)) => match e1.downcast().expect("Unexpected error kind") {
+					Error::UnexpectedAuth => {}
+					e => panic!("Unexpected error, expected UnexpectedAuth found {e}"),
+				},
+				(Ok(_), Err(e2)) => match e2.downcast().expect("Unexpected error kind") {
+					Error::UnexpectedAuth => {}
+					e => panic!("Unexpected error, expected UnexpectedAuth found {e}"),
+				},
 			}
 		}
 	}

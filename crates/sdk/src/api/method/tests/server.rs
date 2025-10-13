@@ -1,9 +1,8 @@
-use super::types::User;
-use crate::api::conn::{Command, DbResponse, Route};
-use crate::api::Response as QueryResponse;
-use crate::opt::Resource;
 use async_channel::Receiver;
-use surrealdb_core::sql::{to_value as to_core_value, Value as CoreValue};
+use surrealdb_core::dbs::QueryResultBuilder;
+
+use crate::api::conn::{Command, Route};
+use crate::types::Value;
 
 pub(super) fn mock(route_rx: Receiver<Route>) {
 	tokio::spawn(async move {
@@ -14,8 +13,10 @@ pub(super) fn mock(route_rx: Receiver<Route>) {
 		{
 			let cmd = request.command;
 
-			let result = match cmd {
-				Command::Invalidate | Command::Health => Ok(DbResponse::Other(CoreValue::None)),
+			let query_result = QueryResultBuilder::started_now();
+
+			let query_result = match cmd {
+				Command::Invalidate | Command::Health => query_result,
 				Command::Authenticate {
 					..
 				}
@@ -24,95 +25,33 @@ pub(super) fn mock(route_rx: Receiver<Route>) {
 				}
 				| Command::Unset {
 					..
-				} => Ok(DbResponse::Other(CoreValue::None)),
+				} => query_result,
 				Command::SubscribeLive {
 					..
-				} => Ok(DbResponse::Other("c6c0e36c-e2cf-42cb-b2d5-75415249b261".to_owned().into())),
-				Command::Version => Ok(DbResponse::Other("1.0.0".into())),
+				} => query_result.with_result(Ok(Value::String(
+					"c6c0e36c-e2cf-42cb-b2d5-75415249b261".to_string(),
+				))),
+				Command::Version => {
+					query_result.with_result(Ok(Value::String("1.0.0".to_string())))
+				}
 				Command::Use {
 					..
-				} => Ok(DbResponse::Other(CoreValue::None)),
+				} => query_result,
 				Command::Signup {
 					..
 				}
 				| Command::Signin {
 					..
-				} => Ok(DbResponse::Other("jwt".to_owned().into())),
+				} => query_result.with_result(Ok(Value::String("jwt".to_string()))),
 				Command::Set {
 					..
-				} => Ok(DbResponse::Other(CoreValue::None)),
-				Command::Query {
+				} => query_result,
+				Command::RawQuery {
 					..
-				}
-				| Command::RawQuery {
-					..
-				}
-				| Command::Patch {
-					..
-				}
-				| Command::Merge {
-					..
-				} => Ok(DbResponse::Query(QueryResponse::new())),
-				Command::Create {
-					data,
-					..
-				} => match data {
-					None => Ok(DbResponse::Other(to_core_value(User::default()).unwrap())),
-					Some(user) => Ok(DbResponse::Other(user.clone())),
-				},
-				Command::Select {
-					what,
-					..
-				}
-				| Command::Delete {
-					what,
-					..
-				} => match what {
-					Resource::Table(..) | Resource::Array(..) | Resource::Range(_) => {
-						Ok(DbResponse::Other(CoreValue::Array(Default::default())))
-					}
-					Resource::RecordId(..) => {
-						Ok(DbResponse::Other(to_core_value(User::default()).unwrap()))
-					}
-					_ => unreachable!(),
-				},
-				Command::Upsert {
-					what,
-					..
-				}
-				| Command::Update {
-					what,
-					..
-				} => match what {
-					Resource::Table(..) | Resource::Array(..) | Resource::Range(..) => {
-						Ok(DbResponse::Other(CoreValue::Array(Default::default())))
-					}
-					Resource::RecordId(..) => {
-						Ok(DbResponse::Other(to_core_value(User::default()).unwrap()))
-					}
-					_ => unreachable!(),
-				},
-				Command::Insert {
-					data,
-					..
-				} => match data {
-					CoreValue::Array(..) => {
-						Ok(DbResponse::Other(CoreValue::Array(Default::default())))
-					}
-					_ => Ok(DbResponse::Other(to_core_value(User::default()).unwrap())),
-				},
-				Command::InsertRelation {
-					data,
-					..
-				} => match data {
-					CoreValue::Array(..) => {
-						Ok(DbResponse::Other(CoreValue::Array(Default::default())))
-					}
-					_ => Ok(DbResponse::Other(to_core_value(User::default()).unwrap())),
-				},
+				} => query_result,
 				Command::Run {
 					..
-				} => Ok(DbResponse::Other(CoreValue::None)),
+				} => query_result,
 				Command::ExportMl {
 					..
 				}
@@ -130,10 +69,12 @@ pub(super) fn mock(route_rx: Receiver<Route>) {
 				}
 				| Command::ImportFile {
 					..
-				} => Ok(DbResponse::Other(CoreValue::None)),
+				} => query_result,
 			};
 
-			if let Err(message) = response.send(result).await {
+			let result = query_result.finish();
+
+			if let Err(message) = response.send(Ok(vec![result])).await {
 				panic!("message dropped; {message:?}");
 			}
 		}

@@ -1,12 +1,11 @@
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use revision::revisioned;
+
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialOrd)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub enum Scoring {
 	Bm {
 		k1: f32,
@@ -68,6 +67,35 @@ impl fmt::Display for Scoring {
 				b,
 			} => write!(f, "BM25({},{})", k1, b),
 			Self::Vs => f.write_str("VS"),
+		}
+	}
+}
+
+impl From<Scoring> for crate::catalog::Scoring {
+	fn from(v: Scoring) -> Self {
+		match v {
+			Scoring::Bm {
+				k1,
+				b,
+			} => crate::catalog::Scoring::Bm {
+				k1,
+				b,
+			},
+			Scoring::Vs => crate::catalog::Scoring::Vs,
+		}
+	}
+}
+impl From<crate::catalog::Scoring> for Scoring {
+	fn from(v: crate::catalog::Scoring) -> Self {
+		match v {
+			crate::catalog::Scoring::Bm {
+				k1,
+				b,
+			} => Self::Bm {
+				k1,
+				b,
+			},
+			crate::catalog::Scoring::Vs => Self::Vs,
 		}
 	}
 }

@@ -1,12 +1,10 @@
-use std::str::FromStr;
+use crate::catalog::PermissionKind;
+use crate::dbs::Statement;
 
-use cedar_policy::{Entity, EntityId, EntityTypeName, EntityUid};
-
-use crate::{dbs::Statement, sql::permission::PermissionKind};
-
-// TODO(sgirones): For now keep it simple. In the future, we will allow for custom roles and policies using a more exhaustive list of actions and resources.
+// TODO(sgirones): For now keep it simple. In the future, we will allow for
+// custom roles and policies using a more exhaustive list of actions and
+// resources.
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd)]
-#[non_exhaustive]
 pub enum Action {
 	View,
 	Edit,
@@ -27,27 +25,13 @@ impl Action {
 	}
 }
 
-#[expect(clippy::fallible_impl_from)]
-impl std::convert::From<&Action> for EntityUid {
-	fn from(action: &Action) -> Self {
-		EntityUid::from_type_name_and_id(
-			EntityTypeName::from_str("Action").unwrap(),
-			EntityId::from_str(&action.id()).unwrap(),
-		)
-	}
-}
-
-impl std::convert::From<&Action> for Entity {
-	fn from(action: &Action) -> Self {
-		Entity::new(action.into(), Default::default(), Default::default())
-	}
-}
-
 impl From<&Statement<'_>> for Action {
 	fn from(stmt: &Statement) -> Self {
 		match stmt {
 			Statement::Live(_) => Action::View,
-			Statement::Select(_) => Action::View,
+			Statement::Select {
+				..
+			} => Action::View,
 			Statement::Show(_) => Action::View,
 			Statement::Create(_) => Action::Edit,
 			Statement::Upsert(_) => Action::Edit,

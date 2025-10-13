@@ -1,37 +1,45 @@
-use crate::ctx::{Context, MutableContext};
-use crate::err::Error;
-use crate::idx::planner::QueryPlanner;
-use crate::sql::cond::Cond;
-use crate::sql::data::Data;
-use crate::sql::fetch::Fetchs;
-use crate::sql::field::Fields;
-use crate::sql::group::Groups;
-use crate::sql::idiom::Idioms;
-use crate::sql::limit::Limit;
-use crate::sql::order::Ordering;
-use crate::sql::output::Output;
-use crate::sql::split::Splits;
-use crate::sql::start::Start;
-use crate::sql::statements::access::AccessStatement;
-use crate::sql::statements::create::CreateStatement;
-use crate::sql::statements::delete::DeleteStatement;
-use crate::sql::statements::insert::InsertStatement;
-use crate::sql::statements::live::LiveStatement;
-use crate::sql::statements::relate::RelateStatement;
-use crate::sql::statements::select::SelectStatement;
-use crate::sql::statements::show::ShowStatement;
-use crate::sql::statements::update::UpdateStatement;
-use crate::sql::statements::upsert::UpsertStatement;
-use crate::sql::statements::DefineTableStatement;
-use crate::sql::{Explain, Permission, Timeout, With};
 use std::borrow::Cow;
 use std::fmt;
+
+use anyhow::Result;
+use reblessive::tree::Stk;
+
+use crate::catalog::{Permission, TableDefinition};
+use crate::ctx::{Context, MutableContext};
+use crate::dbs::Options;
+use crate::doc::CursorDoc;
+use crate::expr::cond::Cond;
+use crate::expr::data::Data;
+use crate::expr::fetch::Fetchs;
+use crate::expr::field::Fields;
+use crate::expr::group::Groups;
+use crate::expr::limit::Limit;
+use crate::expr::order::Ordering;
+use crate::expr::output::Output;
+use crate::expr::parameterize::exprs_to_fields;
+use crate::expr::split::Splits;
+use crate::expr::start::Start;
+use crate::expr::statements::access::AccessStatement;
+use crate::expr::statements::create::CreateStatement;
+use crate::expr::statements::delete::DeleteStatement;
+use crate::expr::statements::insert::InsertStatement;
+use crate::expr::statements::live::LiveStatement;
+use crate::expr::statements::relate::RelateStatement;
+use crate::expr::statements::select::SelectStatement;
+use crate::expr::statements::show::ShowStatement;
+use crate::expr::statements::update::UpdateStatement;
+use crate::expr::statements::upsert::UpsertStatement;
+use crate::expr::{Explain, Idiom, Timeout, With};
+use crate::idx::planner::QueryPlanner;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Statement<'a> {
 	Live(&'a LiveStatement),
 	Show(&'a ShowStatement),
-	Select(&'a SelectStatement),
+	Select {
+		stmt: &'a SelectStatement,
+		omit: Vec<Idiom>,
+	},
 	Create(&'a CreateStatement),
 	Upsert(&'a UpsertStatement),
 	Update(&'a UpdateStatement),
@@ -50,12 +58,6 @@ impl<'a> From<&'a LiveStatement> for Statement<'a> {
 impl<'a> From<&'a ShowStatement> for Statement<'a> {
 	fn from(v: &'a ShowStatement) -> Self {
 		Statement::Show(v)
-	}
-}
-
-impl<'a> From<&'a SelectStatement> for Statement<'a> {
-	fn from(v: &'a SelectStatement) -> Self {
-		Statement::Select(v)
 	}
 }
 
@@ -106,7 +108,10 @@ impl fmt::Display for Statement<'_> {
 		match self {
 			Statement::Live(v) => write!(f, "{v}"),
 			Statement::Show(v) => write!(f, "{v}"),
-			Statement::Select(v) => write!(f, "{v}"),
+			Statement::Select {
+				stmt,
+				..
+			} => write!(f, "{stmt}"),
 			Statement::Create(v) => write!(f, "{v}"),
 			Statement::Upsert(v) => write!(f, "{v}"),
 			Statement::Update(v) => write!(f, "{v}"),
@@ -121,7 +126,7 @@ impl fmt::Display for Statement<'_> {
 impl Statement<'_> {
 	/// Check if this is a SELECT statement
 	pub(crate) fn is_select(&self) -> bool {
-		matches!(self, Statement::Select(_))
+		matches!(self, Statement::Select { .. })
 	}
 
 	/// Check if this is a CREATE statement
@@ -181,15 +186,16 @@ impl Statement<'_> {
 	/// UPSERT some:thing UNSET test;
 	/// UPSERT some:thing SET test = true;
 	/// UPSERT some:thing MERGE { test: true };
-	/// UPSERT some:thing PATCH [{ op: 'replace', path: '/', value: { test: true } }];
-	/// UPSERT |some:1000| UNSET test;
+	/// UPSERT some:thing PATCH [{ op: 'replace', path: '/', value: { test: true
+	/// } }]; UPSERT |some:1000| UNSET test;
 	/// UPSERT |some:1000| SET test = true;
 	/// UPSERT |some:1000| MERGE { test: true };
-	/// UPSERT |some:1000| PATCH [{ op: 'replace', path: '/', value: { test: true } }];
-	/// UPSERT |some:1..1000| UNSET test;
+	/// UPSERT |some:1000| PATCH [{ op: 'replace', path: '/', value: { test:
+	/// true } }]; UPSERT |some:1..1000| UNSET test;
 	/// UPSERT |some:1..1000| SET test = true;
 	/// UPSERT |some:1..1000| MERGE { test: true };
-	/// UPSERT |some:1..1000| PATCH [{ op: 'replace', path: '/', value: { test: true } }];
+	/// UPSERT |some:1..1000| PATCH [{ op: 'replace', path: '/', value: { test:
+	/// true } }];
 	///
 	/// Importantly, when a WHERE clause condition is
 	/// specified on an UPSERT clause, then we do
@@ -245,16 +251,22 @@ impl Statement<'_> {
 	/// Returns any query fields if specified
 	pub(crate) fn expr(&self) -> Option<&Fields> {
 		match self {
-			Statement::Select(v) => Some(&v.expr),
-			Statement::Live(v) => Some(&v.expr),
+			Statement::Select {
+				stmt,
+				..
+			} => Some(&stmt.expr),
+			Statement::Live(v) => Some(&v.fields),
 			_ => None,
 		}
 	}
 
 	/// Returns any OMIT clause if specified
-	pub(crate) fn omit(&self) -> Option<&Idioms> {
+	pub(crate) fn omit(&self) -> Option<&Vec<Idiom>> {
 		match self {
-			Statement::Select(v) => v.omit.as_ref(),
+			Statement::Select {
+				omit,
+				..
+			} => Some(omit),
 			_ => None,
 		}
 	}
@@ -275,7 +287,10 @@ impl Statement<'_> {
 	pub(crate) fn cond(&self) -> Option<&Cond> {
 		match self {
 			Statement::Live(v) => v.cond.as_ref(),
-			Statement::Select(v) => v.cond.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.cond.as_ref(),
 			Statement::Upsert(v) => v.cond.as_ref(),
 			Statement::Update(v) => v.cond.as_ref(),
 			Statement::Delete(v) => v.cond.as_ref(),
@@ -286,7 +301,10 @@ impl Statement<'_> {
 	/// Returns any SPLIT clause if specified
 	pub(crate) fn split(&self) -> Option<&Splits> {
 		match self {
-			Statement::Select(v) => v.split.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.split.as_ref(),
 			_ => None,
 		}
 	}
@@ -294,7 +312,10 @@ impl Statement<'_> {
 	/// Returns any GROUP clause if specified
 	pub(crate) fn group(&self) -> Option<&Groups> {
 		match self {
-			Statement::Select(v) => v.group.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.group.as_ref(),
 			_ => None,
 		}
 	}
@@ -302,7 +323,10 @@ impl Statement<'_> {
 	/// Returns any ORDER clause if specified
 	pub(crate) fn order(&self) -> Option<&Ordering> {
 		match self {
-			Statement::Select(v) => v.order.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.order.as_ref(),
 			_ => None,
 		}
 	}
@@ -310,7 +334,10 @@ impl Statement<'_> {
 	/// Returns any WITH clause if specified
 	pub(crate) fn with(&self) -> Option<&With> {
 		match self {
-			Statement::Select(s) => s.with.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.with.as_ref(),
 			Statement::Update(s) => s.with.as_ref(),
 			Statement::Upsert(s) => s.with.as_ref(),
 			Statement::Delete(s) => s.with.as_ref(),
@@ -321,7 +348,10 @@ impl Statement<'_> {
 	/// Returns any FETCH clause if specified
 	pub(crate) fn fetch(&self) -> Option<&Fetchs> {
 		match self {
-			Statement::Select(v) => v.fetch.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.fetch.as_ref(),
 			_ => None,
 		}
 	}
@@ -329,7 +359,10 @@ impl Statement<'_> {
 	/// Returns any START clause if specified
 	pub(crate) fn start(&self) -> Option<&Start> {
 		match self {
-			Statement::Select(v) => v.start.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.start.as_ref(),
 			_ => None,
 		}
 	}
@@ -337,7 +370,10 @@ impl Statement<'_> {
 	/// Returns any LIMIT clause if specified
 	pub(crate) fn limit(&self) -> Option<&Limit> {
 		match self {
-			Statement::Select(v) => v.limit.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.limit.as_ref(),
 			_ => None,
 		}
 	}
@@ -347,7 +383,10 @@ impl Statement<'_> {
 			Statement::Create(v) => v.only,
 			Statement::Delete(v) => v.only,
 			Statement::Relate(v) => v.only,
-			Statement::Select(v) => v.only,
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.only,
 			Statement::Upsert(v) => v.only,
 			Statement::Update(v) => v.only,
 			_ => false,
@@ -371,7 +410,10 @@ impl Statement<'_> {
 	#[cfg(storage)]
 	pub(crate) fn tempfiles(&self) -> bool {
 		match self {
-			Statement::Select(v) => v.tempfiles,
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.tempfiles,
 			_ => false,
 		}
 	}
@@ -379,7 +421,10 @@ impl Statement<'_> {
 	/// Returns any EXPLAIN clause if specified
 	pub(crate) fn explain(&self) -> Option<&Explain> {
 		match self {
-			Statement::Select(s) => s.explain.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.explain.as_ref(),
 			Statement::Update(s) => s.explain.as_ref(),
 			Statement::Upsert(s) => s.explain.as_ref(),
 			Statement::Delete(s) => s.explain.as_ref(),
@@ -388,10 +433,10 @@ impl Statement<'_> {
 	}
 
 	/// Returns a reference to the appropriate `Permission` field within the
-	/// `DefineTableStatement` structure based on the type of the statement.
+	/// `TableDefinition` structure based on the type of the statement.
 	pub(crate) fn permissions<'b>(
 		&self,
-		table: &'b DefineTableStatement,
+		table: &'b TableDefinition,
 		doc_is_new: bool,
 	) -> &'b Permission {
 		if self.is_delete() {
@@ -410,16 +455,26 @@ impl Statement<'_> {
 			Statement::Create(s) => s.timeout.as_ref(),
 			Statement::Delete(s) => s.timeout.as_ref(),
 			Statement::Insert(s) => s.timeout.as_ref(),
-			Statement::Select(s) => s.timeout.as_ref(),
+			Statement::Select {
+				stmt,
+				..
+			} => stmt.timeout.as_ref(),
 			Statement::Update(s) => s.timeout.as_ref(),
 			Statement::Upsert(s) => s.timeout.as_ref(),
 			_ => None,
 		}
 	}
-	pub(crate) fn setup_timeout<'a>(&self, ctx: &'a Context) -> Result<Cow<'a, Context>, Error> {
+	pub(crate) async fn setup_timeout<'a>(
+		&self,
+		stk: &mut Stk,
+		ctx: &'a Context,
+		opt: &Options,
+		doc: Option<&CursorDoc>,
+	) -> Result<Cow<'a, Context>> {
 		if let Some(t) = self.timeout() {
+			let x = t.compute(stk, ctx, opt, doc).await?.0;
 			let mut ctx = MutableContext::new(ctx);
-			ctx.add_timeout(*t.0)?;
+			ctx.add_timeout(x)?;
 			Ok(Cow::Owned(ctx.freeze()))
 		} else {
 			Ok(Cow::Borrowed(ctx))
@@ -440,5 +495,20 @@ impl Statement<'_> {
 		} else {
 			ctx
 		}
+	}
+
+	pub(crate) async fn from_select<'a>(
+		stk: &mut Stk,
+		ctx: &Context,
+		opt: &Options,
+		doc: Option<&CursorDoc>,
+		stmt: &'a SelectStatement,
+	) -> Result<Statement<'a>> {
+		let omit = exprs_to_fields(stk, ctx, opt, doc, stmt.omit.as_slice()).await?;
+
+		Ok(Statement::Select {
+			stmt,
+			omit,
+		})
 	}
 }

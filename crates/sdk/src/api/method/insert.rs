@@ -1,37 +1,47 @@
-use crate::api::conn::Command;
-use crate::api::err::Error;
-use crate::api::method::BoxFuture;
-use crate::api::method::Content;
-use crate::api::opt::Resource;
-use crate::api::Connection;
-use crate::api::Result;
-use crate::method::OnceLockExt;
-use crate::Surreal;
-use crate::Value;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::borrow::Cow;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
-use surrealdb_core::sql::{to_value as to_core_value, Object as CoreObject, Value as CoreValue};
+
+use surrealdb_types::{SurrealValue, Value, Variables};
+use uuid::Uuid;
 
 use super::insert_relation::InsertRelation;
+use super::transaction::WithTransaction;
 use super::validate_data;
+use crate::Surreal;
+use crate::api::conn::Command;
+use crate::api::err::Error;
+use crate::api::method::{BoxFuture, Content};
+use crate::api::opt::Resource;
+use crate::api::{Connection, Result};
+use crate::method::OnceLockExt;
 
 /// An insert future
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Insert<'r, C: Connection, R> {
+	pub(super) txn: Option<Uuid>,
 	pub(super) client: Cow<'r, Surreal<C>>,
 	pub(super) resource: Result<Resource>,
 	pub(super) response_type: PhantomData<R>,
+}
+
+impl<C, R> WithTransaction for Insert<'_, C, R>
+where
+	C: Connection,
+{
+	fn with_transaction(mut self, id: Uuid) -> Self {
+		self.txn = Some(id);
+		self
+	}
 }
 
 impl<C, R> Insert<'_, C, R>
 where
 	C: Connection,
 {
-	/// Converts to an owned type which can easily be moved to a different thread
+	/// Converts to an owned type which can easily be moved to a different
+	/// thread
 	pub fn into_owned(self) -> Insert<'static, C, R> {
 		Insert {
 			client: Cow::Owned(self.client.into_owned()),
@@ -44,36 +54,37 @@ macro_rules! into_future {
 	($method:ident) => {
 		fn into_future(self) -> Self::IntoFuture {
 			let Insert {
+				txn,
 				client,
 				resource,
 				..
 			} = self;
 			Box::pin(async move {
-				let (table, data) = match resource? {
-					Resource::Table(table) => (table.into(), CoreObject::default()),
-					Resource::RecordId(record_id) => {
-						let record_id = record_id.into_inner();
-						let mut map = CoreObject::default();
-						map.insert("id".to_string(), record_id.id.into());
-						(record_id.tb, map)
+				let router = client.inner.router.extract()?;
+
+				let what_resource = resource?;
+
+				let mut variables = Variables::new();
+				let what = what_resource.for_sql_query(&mut variables)?;
+
+				let query = match what_resource {
+					Resource::Table(_) => {
+						// CREATE accepts a table name expression and works without content
+						Cow::Owned(format!("CREATE {what}"))
 					}
+					Resource::RecordId(_) => Cow::Owned(format!("CREATE {what}")),
 					Resource::Object(_) => return Err(Error::InsertOnObject.into()),
 					Resource::Array(_) => return Err(Error::InsertOnArray.into()),
-					Resource::Edge {
-						..
-					} => return Err(Error::InsertOnEdges.into()),
-					Resource::Range {
-						..
-					} => return Err(Error::InsertOnRange.into()),
-					Resource::Unspecified => return Err(Error::InsertOnUnspecified.into()),
-				};
-				let cmd = Command::Insert {
-					what: Some(table.to_string()),
-					data: data.into(),
+					Resource::Range(_) => return Err(Error::InsertOnRange.into()),
 				};
 
-				let router = client.inner.router.extract()?;
-				router.$method(cmd).await
+				router
+					.$method(Command::RawQuery {
+						txn,
+						query,
+						variables,
+					})
+					.await
 			})
 		}
 	};
@@ -92,7 +103,7 @@ where
 impl<'r, Client, R> IntoFuture for Insert<'r, Client, Option<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Option<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
@@ -103,7 +114,7 @@ where
 impl<'r, Client, R> IntoFuture for Insert<'r, Client, Vec<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Vec<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
@@ -114,48 +125,66 @@ where
 impl<'r, C, R> Insert<'r, C, R>
 where
 	C: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	/// Specifies the data to insert into the table
 	pub fn content<D>(self, data: D) -> Content<'r, C, R>
 	where
-		D: Serialize + 'static,
+		D: SurrealValue,
 	{
-		Content::from_closure(self.client, || {
-			let mut data = to_core_value(data)?;
-			validate_data(&data, "Tried to insert non-object-like data as content, only structs and objects are supported")?;
-			match self.resource? {
-				Resource::Table(table) => Ok(Command::Insert {
-					what: Some(table),
-					data,
-				}),
-				Resource::RecordId(thing) => {
-					if data.is_array() {
-						Err(Error::InvalidParams(
-							"Tried to insert multiple records on a record ID".to_owned(),
-						)
-						.into())
-					} else {
-						let thing = thing.into_inner();
-						if let CoreValue::Object(ref mut x) = data {
-							x.insert("id".to_string(), thing.id.into());
-						}
+		let mut data = data.into_value();
+		Content::from_closure(self.client, self.txn, || {
+			validate_data(
+				&data,
+				"Tried to insert non-object-like data as content, only structs and objects are supported",
+			)?;
 
-						Ok(Command::Insert {
-							what: Some(thing.tb),
-							data,
-						})
+			let what_resource = self.resource?;
+
+			let mut variables = Variables::new();
+			let what = what_resource.for_sql_query(&mut variables)?;
+
+			let query = match what_resource {
+				Resource::Table(_) => {
+					// For tables with content, we need to check if data is an array or single
+					// object If array, use INSERT INTO (wrapped in block to support
+					// type::table); if object, use CREATE with CONTENT
+					if data.is_array() {
+						// INSERT INTO can handle arrays of objects, but it can't accept
+						// type::table() directly so we wrap it in a block
+						Cow::Owned(format!(
+							"{{ LET $__table = {what}; INSERT INTO $__table $_data }}"
+						))
+					} else {
+						// Single object - use CREATE with CONTENT
+						Cow::Owned(format!("CREATE {what} CONTENT $_data"))
 					}
 				}
-				Resource::Object(_) => Err(Error::InsertOnObject.into()),
-				Resource::Array(_) => Err(Error::InsertOnArray.into()),
-				Resource::Edge(_) => Err(Error::InsertOnEdges.into()),
-				Resource::Range(_) => Err(Error::InsertOnRange.into()),
-				Resource::Unspecified => Ok(Command::Insert {
-					what: None,
-					data,
-				}),
-			}
+				Resource::RecordId(record_id) => {
+					if data.is_array() {
+						return Err(Error::InvalidParams(
+							"Tried to insert multiple records on a record ID".to_owned(),
+						));
+					}
+
+					if let Value::Object(ref mut x) = data {
+						x.insert("id".to_string(), record_id.key.into_value());
+					}
+
+					Cow::Owned(format!("CREATE {what} CONTENT $_data"))
+				}
+				Resource::Object(_) => return Err(Error::InsertOnObject),
+				Resource::Array(_) => return Err(Error::InsertOnArray),
+				Resource::Range(_) => return Err(Error::InsertOnRange),
+			};
+
+			variables.insert("_data".to_string(), data);
+
+			Ok(Command::RawQuery {
+				txn: self.txn,
+				query,
+				variables,
+			})
 		})
 	}
 }
@@ -163,48 +192,59 @@ where
 impl<'r, C, R> Insert<'r, C, R>
 where
 	C: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	/// Specifies the data to insert into the table
 	pub fn relation<D>(self, data: D) -> InsertRelation<'r, C, R>
 	where
-		D: Serialize + 'static,
+		D: SurrealValue + 'static,
 	{
 		InsertRelation::from_closure(self.client, || {
-			let mut data = to_core_value(data)?;
-			validate_data(&data, "Tried to insert non-object-like data as relation data, only structs and objects are supported")?;
-			match self.resource? {
-				Resource::Table(table) => Ok(Command::InsertRelation {
-					what: Some(table),
-					data,
-				}),
-				Resource::RecordId(thing) => {
-					if data.is_array() {
-						Err(Error::InvalidParams(
-							"Tried to insert multiple records on a record ID".to_owned(),
-						)
-						.into())
-					} else {
-						let thing = thing.into_inner();
-						if let CoreValue::Object(ref mut x) = data {
-							x.insert("id".to_string(), thing.id.into());
-						}
+			let mut data = data.into_value();
+			validate_data(
+				&data,
+				"Tried to insert non-object-like data as relation data, only structs and objects are supported",
+			)?;
 
-						Ok(Command::InsertRelation {
-							what: Some(thing.tb),
-							data,
-						})
-					}
+			let what_resource = self.resource?;
+
+			let mut variables = Variables::new();
+			let what = what_resource.for_sql_query(&mut variables)?;
+
+			let query = match what_resource {
+				Resource::Table(_) => {
+					// `INSERT RELATION INTO` is finicky. It cannot accept an expression for the
+					// table name, so we wrap the call in a block and use a local variable so
+					// that we still only get one returned result.
+					Cow::Owned(format!(
+						"{{ LET $__table = {what}; INSERT RELATION INTO $__table $_data; }}"
+					))
 				}
-				Resource::Unspecified => Ok(Command::InsertRelation {
-					what: None,
-					data,
-				}),
-				Resource::Object(_) => Err(Error::InsertOnObject.into()),
-				Resource::Array(_) => Err(Error::InsertOnArray.into()),
-				Resource::Edge(_) => Err(Error::InsertOnEdges.into()),
-				Resource::Range(_) => Err(Error::InsertOnRange.into()),
-			}
+				Resource::RecordId(record_id) => {
+					if data.is_array() {
+						return Err(Error::InvalidParams(
+							"Tried to insert multiple records on a record ID".to_owned(),
+						));
+					}
+
+					if let Value::Object(ref mut x) = data {
+						x.insert("id".to_string(), record_id.key.into_value());
+					}
+
+					Cow::Owned(format!("INSERT RELATION INTO {what} $_data RETURN AFTER"))
+				}
+				Resource::Array(_) => return Err(Error::InsertOnArray),
+				Resource::Range(_) => return Err(Error::InsertOnRange),
+				Resource::Object(_) => return Err(Error::InsertOnObject),
+			};
+
+			variables.insert("_data".to_string(), data);
+
+			Ok(Command::RawQuery {
+				txn: self.txn,
+				query,
+				variables,
+			})
 		})
 	}
 }

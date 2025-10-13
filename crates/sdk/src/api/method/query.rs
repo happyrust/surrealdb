@@ -1,94 +1,85 @@
-use super::{live, Stream};
-use crate::api::conn::Command;
-use crate::api::err::Error;
-use crate::api::method::BoxFuture;
-use crate::api::opt;
-use crate::api::Connection;
-use crate::api::ExtraFeatures;
-use crate::api::Result;
-use crate::method::OnceLockExt;
-use crate::method::Stats;
-use crate::method::WithStats;
-use crate::value::Notification;
-use crate::{Surreal, Value};
-use futures::future::Either;
-use futures::stream::SelectAll;
-use futures::StreamExt;
-use indexmap::IndexMap;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::pin::Pin;
-use std::task::Context;
-use std::task::Poll;
-use surrealdb_core::sql::{
-	self, to_value as to_core_value, Object as CoreObject, Statement, Value as CoreValue,
-};
+use std::task::{Context, Poll};
+
+use futures::StreamExt;
+use futures::future::Either;
+use futures::stream::SelectAll;
+use indexmap::IndexMap;
+use surrealdb_core::dbs::QueryType;
+use surrealdb_core::rpc::{DbResultError, DbResultStats};
+use surrealdb_types::{self, SurrealValue, Value, Variables};
+use uuid::Uuid;
+
+use super::transaction::WithTransaction;
+use crate::Surreal;
+use crate::api::conn::Command;
+use crate::api::err::Error;
+use crate::api::method::BoxFuture;
+use crate::api::{Connection, Result, opt};
+use crate::method::live::Stream;
+use crate::method::{OnceLockExt, WithStats};
+use crate::notification::Notification;
 
 /// A query future
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Query<'r, C: Connection> {
+	pub(crate) txn: Option<Uuid>,
 	pub(crate) client: Cow<'r, Surreal<C>>,
-	pub(crate) inner: Result<ValidQuery>,
+	pub(crate) query: Cow<'r, str>,
+	pub(crate) variables: Result<Variables>,
 }
 
-#[derive(Debug)]
-pub(crate) enum ValidQuery {
-	Raw {
-		query: Cow<'static, str>,
-		bindings: CoreObject,
-	},
-	Normal {
-		query: Vec<Statement>,
-		register_live_queries: bool,
-		bindings: CoreObject,
-	},
+impl<C> WithTransaction for Query<'_, C>
+where
+	C: Connection,
+{
+	fn with_transaction(mut self, id: Uuid) -> Self {
+		self.txn = Some(id);
+		self
+	}
+}
+
+pub trait IntoVariables {
+	fn into_variables(self) -> Result<Variables>;
+}
+
+impl<T: SurrealValue> IntoVariables for T {
+	fn into_variables(self) -> Result<Variables> {
+		let value = self.into_value();
+		match value {
+			Value::Object(obj) => Ok(Variables::from(obj)),
+			Value::Array(arr) => {
+				let mut vars = Variables::new();
+				for v in arr.chunks(2) {
+					let key = v[0].clone().into_string().unwrap();
+					let value = v[1].clone();
+					vars.insert(key, value);
+				}
+				Ok(vars)
+			}
+			unexpected => {
+				Err(Error::InvalidParams(format!("Invalid variables type: {unexpected:?}")))
+			}
+		}
+	}
 }
 
 impl<'r, C> Query<'r, C>
 where
 	C: Connection,
 {
-	pub(crate) fn normal(
-		client: Cow<'r, Surreal<C>>,
-		query: Vec<Statement>,
-		bindings: CoreObject,
-		register_live_queries: bool,
-	) -> Self {
-		Query {
-			client,
-			inner: Ok(ValidQuery::Normal {
-				query,
-				bindings,
-				register_live_queries,
-			}),
-		}
-	}
-
-	pub(crate) fn map_valid<F>(self, f: F) -> Self
-	where
-		F: FnOnce(ValidQuery) -> Result<ValidQuery>,
-	{
-		match self.inner {
-			Ok(x) => Query {
-				client: self.client,
-				inner: f(x),
-			},
-			x => Query {
-				client: self.client,
-				inner: x,
-			},
-		}
-	}
-
-	/// Converts to an owned type which can easily be moved to a different thread
+	/// Converts to an owned type which can easily be moved to a different
+	/// thread
 	pub fn into_owned(self) -> Query<'static, C> {
 		Query {
+			txn: self.txn,
 			client: Cow::Owned(self.client.into_owned()),
-			inner: self.inner,
+			query: Cow::Owned(self.query.into_owned()),
+			variables: self.variables,
 		}
 	}
 }
@@ -97,97 +88,55 @@ impl<'r, Client> IntoFuture for Query<'r, Client>
 where
 	Client: Connection,
 {
-	type Output = Result<Response>;
+	type Output = Result<IndexedResults>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
 
 	fn into_future(self) -> Self::IntoFuture {
+		let Self {
+			txn,
+			client,
+			query,
+			variables,
+		} = self;
+
 		Box::pin(async move {
 			// Extract the router from the client
-			let router = self.client.inner.router.extract()?;
+			let router = client.inner.router.extract()?;
 
-			match self.inner? {
-				ValidQuery::Raw {
-					query,
-					bindings,
-				} => {
-					router
-						.execute_query(Command::RawQuery {
-							query,
-							variables: bindings,
-						})
+			let results = router
+				.execute_query(Command::RawQuery {
+					query: Cow::Owned(query.into_owned()),
+					txn,
+					variables: variables?,
+				})
+				.await?;
+
+			let mut indexed_results = IndexedResults::new();
+
+			for (index, result) in results.into_iter().enumerate() {
+				let stats = DbResultStats::default().with_execution_time(result.time);
+
+				match result.query_type {
+					QueryType::Other => {
+						indexed_results.results.insert(index, (stats, result.result));
+					}
+					QueryType::Live => {
+						let live_query_id = result.result?.into_uuid()?;
+						let live_stream = crate::method::live::register(
+							router,
+							live_query_id.into(),
+						)
 						.await
-				}
-				ValidQuery::Normal {
-					query,
-					register_live_queries,
-					bindings,
-				} => {
-					let query_statements = query;
-
-					// Collect the indexes of the live queries which should be registerd.
-					let query_indicies = if register_live_queries {
-						query_statements
-							.iter()
-							// BEGIN, COMMIT, and CANCEL don't return a result.
-							.filter(|x| {
-								!matches!(
-									x,
-									Statement::Begin(_)
-										| Statement::Commit(_) | Statement::Cancel(_)
-								)
-							})
-							.enumerate()
-							.filter(|(_, x)| matches!(x, Statement::Live(_)))
-							.map(|(i, _)| i)
-							.collect()
-					} else {
-						Vec::new()
-					};
-
-					// If there are live queries and it is not supported, return an error.
-					if !query_indicies.is_empty()
-						&& !router.features.contains(&ExtraFeatures::LiveQueries)
-					{
-						return Err(Error::LiveQueriesNotSupported.into());
+						.map(|rx| {
+							Stream::new(client.inner.clone().into(), live_query_id.into(), Some(rx))
+						});
+						indexed_results.live_queries.insert(index, live_stream);
 					}
-
-					let mut query = sql::Query::default();
-					query.0 .0 = query_statements;
-
-					let mut response = router
-						.execute_query(Command::Query {
-							query,
-							variables: bindings,
-						})
-						.await?;
-
-					for idx in query_indicies {
-						let Some((_, result)) = response.results.get(&idx) else {
-							continue;
-						};
-
-						// This is a live query. We are using this as a workaround to avoid
-						// creating another public error variant for this internal error.
-						let res = match result {
-							Ok(id) => {
-								let CoreValue::Uuid(uuid) = id else {
-									return Err(Error::InternalError(
-										"successfull live query did not return a uuid".to_string(),
-									)
-									.into());
-								};
-								live::register(router, uuid.0).await.map(|rx| {
-									Stream::new(self.client.inner.clone().into(), uuid.0, Some(rx))
-								})
-							}
-							Err(_) => Err(crate::Error::from(Error::NotLiveQuery(idx))),
-						};
-						response.live_queries.insert(idx, res);
-					}
-
-					Ok(response)
+					QueryType::Kill => {}
 				}
 			}
+
+			Ok(indexed_results)
 		})
 	}
 }
@@ -196,7 +145,7 @@ impl<'r, Client> IntoFuture for WithStats<Query<'r, Client>>
 where
 	Client: Connection,
 {
-	type Output = Result<WithStats<Response>>;
+	type Output = Result<WithStats<IndexedResults>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
 
 	fn into_future(self) -> Self::IntoFuture {
@@ -207,43 +156,27 @@ where
 	}
 }
 
-impl<C> Query<'_, C>
+impl<'r, C> Query<'r, C>
 where
 	C: Connection,
 {
 	/// Chains a query onto an existing query
-	pub fn query(self, surql: impl opt::IntoQuery) -> Self {
+	pub fn query(self, surql: impl Into<Cow<'r, str>>) -> Self {
 		let client = self.client.clone();
-		self.map_valid(move |valid| match valid {
-			ValidQuery::Raw {
-				..
-			} => {
-				Err(Error::InvalidParams("Appending to raw queries is not supported".to_owned())
-					.into())
-			}
-			ValidQuery::Normal {
-				mut query,
-				register_live_queries,
-				bindings,
-			} => match client.query(surql).inner {
-				Ok(ValidQuery::Normal {
-					query: stmts,
-					..
-				}) => {
-					query.extend(stmts);
-					Ok(ValidQuery::Normal {
-						query,
-						register_live_queries,
-						bindings,
-					})
-				}
-				Ok(ValidQuery::Raw {
-					..
-				}) => Err(Error::InvalidParams("Appending raw queries is not supported".to_owned())
-					.into()),
-				Err(error) => Err(error),
-			},
-		})
+		let query = if self.query.is_empty() {
+			surql.into()
+		} else if self.query.ends_with(';') {
+			Cow::Owned(format!("{} {}", self.query, surql.into()))
+		} else {
+			Cow::Owned(format!("{}; {}", self.query, surql.into()))
+		};
+
+		Query {
+			txn: self.txn,
+			client,
+			query,
+			variables: self.variables,
+		}
 	}
 
 	/// Return query statistics along with its results
@@ -289,55 +222,30 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn bind(self, bindings: impl Serialize + 'static) -> Self {
-		self.map_valid(move |mut valid| {
-			let current_bindings = match &mut valid {
-				ValidQuery::Raw {
-					bindings,
-					..
-				} => bindings,
-				ValidQuery::Normal {
-					bindings,
-					..
-				} => bindings,
-			};
-			let bindings = to_core_value(bindings)?;
-			match bindings {
-				CoreValue::Object(mut map) => current_bindings.append(&mut map.0),
-				CoreValue::Array(array) => {
-					if array.len() != 2 || !matches!(array[0], CoreValue::Strand(_)) {
-						let bindings = CoreValue::Array(array);
-						let bindings = Value::from_inner(bindings);
-						return Err(Error::InvalidBindings(bindings).into());
-					}
-
-					let mut iter = array.into_iter();
-					let Some(CoreValue::Strand(key)) = iter.next() else {
-						unreachable!()
-					};
-					let Some(value) = iter.next() else {
-						unreachable!()
-					};
-
-					current_bindings.insert(key.0, value);
-				}
-				_ => {
-					let bindings = Value::from_inner(bindings);
-					return Err(Error::InvalidBindings(bindings).into());
-				}
+	pub fn bind(self, vars: impl IntoVariables) -> Self {
+		let variables = match (self.variables, vars.into_variables()) {
+			(Ok(mut a), Ok(b)) => {
+				a.extend(b);
+				Ok(a)
 			}
+			(Ok(_a), Err(e)) => Err(e),
+			(Err(e), Ok(_b)) => Err(e),
+			(Err(e), Err(_f)) => Err(e),
+		};
 
-			Ok(valid)
-		})
+		Query {
+			txn: self.txn,
+			client: self.client,
+			query: self.query,
+			variables,
+		}
 	}
 }
 
-pub(crate) type QueryResult = Result<CoreValue>;
-
 /// The response type of a `Surreal::query` request
 #[derive(Debug)]
-pub struct Response {
-	pub(crate) results: IndexMap<usize, (Stats, QueryResult)>,
+pub struct IndexedResults {
+	pub(crate) results: IndexMap<usize, (DbResultStats, std::result::Result<Value, DbResultError>)>,
 	pub(crate) live_queries: IndexMap<usize, Result<Stream<Value>>>,
 }
 
@@ -347,7 +255,7 @@ pub struct Response {
 pub struct QueryStream<R>(pub(crate) Either<Stream<R>, SelectAll<Stream<R>>>);
 
 impl futures::Stream for QueryStream<Value> {
-	type Item = Notification<Value>;
+	type Item = Result<Notification<Value>>;
 
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		self.as_mut().0.poll_next_unpin(cx)
@@ -356,7 +264,7 @@ impl futures::Stream for QueryStream<Value> {
 
 impl<R> futures::Stream for QueryStream<Notification<R>>
 where
-	R: DeserializeOwned + Unpin,
+	R: SurrealValue + Unpin,
 {
 	type Item = Result<Notification<R>>;
 
@@ -365,7 +273,7 @@ where
 	}
 }
 
-impl Response {
+impl IndexedResults {
 	pub(crate) fn new() -> Self {
 		Self {
 			results: Default::default(),
@@ -436,9 +344,8 @@ impl Response {
 	/// of the other indices, so you can take them in any order you see fit.
 	pub fn take<R>(&mut self, index: impl opt::QueryResult<R>) -> Result<R>
 	where
-		R: DeserializeOwned,
+		R: SurrealValue,
 	{
-		#[expect(deprecated)]
 		index.query_result(self)
 	}
 
@@ -484,21 +391,22 @@ impl Response {
 	/// # }
 	/// ```
 	///
-	/// Consume the stream the same way you would any other type that implements `futures::Stream`.
+	/// Consume the stream the same way you would any other type that implements
+	/// `futures::Stream`.
 	pub fn stream<R>(&mut self, index: impl opt::QueryStream<R>) -> Result<QueryStream<R>> {
-		#[expect(deprecated)]
 		index.query_stream(self)
 	}
 
 	/// Take all errors from the query response
 	///
-	/// The errors are keyed by the corresponding index of the statement that failed.
-	/// Afterwards the response is left with only statements that did not produce any errors.
+	/// The errors are keyed by the corresponding index of the statement that
+	/// failed. Afterwards the response is left with only statements that did
+	/// not produce any errors.
 	///
 	/// # Examples
 	///
 	/// ```no_run
-	///
+	/// 
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -507,7 +415,7 @@ impl Response {
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn take_errors(&mut self) -> HashMap<usize, crate::Error> {
+	pub fn take_errors(&mut self) -> HashMap<usize, DbResultError> {
 		let mut keys = Vec::new();
 		for (key, result) in &self.results {
 			if result.1.is_err() {
@@ -523,12 +431,13 @@ impl Response {
 		errors
 	}
 
-	/// Check query response for errors and return the first error, if any, or the response
+	/// Check query response for errors and return the first error, if any, or
+	/// the response
 	///
 	/// # Examples
 	///
 	/// ```no_run
-	///
+	/// 
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -537,7 +446,7 @@ impl Response {
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn check(mut self) -> Result<Self> {
+	pub fn check(mut self) -> std::result::Result<Self, DbResultError> {
 		let mut first_error = None;
 		for (key, result) in &self.results {
 			if result.1.is_err() {
@@ -558,7 +467,7 @@ impl Response {
 	/// # Examples
 	///
 	/// ```no_run
-	///
+	/// 
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -573,7 +482,7 @@ impl Response {
 	}
 }
 
-impl WithStats<Response> {
+impl WithStats<IndexedResults> {
 	/// Takes and returns records returned from the database
 	///
 	/// Similar to [Response::take] but this method returns `None` when
@@ -636,26 +545,25 @@ impl WithStats<Response> {
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn take<R>(&mut self, index: impl opt::QueryResult<R>) -> Option<(Stats, Result<R>)>
+	pub fn take<R>(&mut self, index: impl opt::QueryResult<R>) -> Option<(DbResultStats, Result<R>)>
 	where
-		R: DeserializeOwned,
+		R: SurrealValue,
 	{
-		#[expect(deprecated)]
 		let stats = index.stats(&self.0)?;
-		#[expect(deprecated)]
 		let result = index.query_result(&mut self.0);
 		Some((stats, result))
 	}
 
 	/// Take all errors from the query response
 	///
-	/// The errors are keyed by the corresponding index of the statement that failed.
-	/// Afterwards the response is left with only statements that did not produce any errors.
+	/// The errors are keyed by the corresponding index of the statement that
+	/// failed. Afterwards the response is left with only statements that did
+	/// not produce any errors.
 	///
 	/// # Examples
 	///
 	/// ```no_run
-	///
+	/// 
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -664,7 +572,7 @@ impl WithStats<Response> {
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn take_errors(&mut self) -> HashMap<usize, (Stats, crate::Error)> {
+	pub fn take_errors(&mut self) -> HashMap<usize, (DbResultStats, DbResultError)> {
 		let mut keys = Vec::new();
 		for (key, result) in &self.0.results {
 			if result.1.is_err() {
@@ -680,12 +588,13 @@ impl WithStats<Response> {
 		errors
 	}
 
-	/// Check query response for errors and return the first error, if any, or the response
+	/// Check query response for errors and return the first error, if any, or
+	/// the response
 	///
 	/// # Examples
 	///
 	/// ```no_run
-	///
+	/// 
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -704,7 +613,7 @@ impl WithStats<Response> {
 	/// # Examples
 	///
 	/// ```no_run
-	///
+	/// 
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
@@ -719,7 +628,7 @@ impl WithStats<Response> {
 	}
 
 	/// Returns the unwrapped response
-	pub fn into_inner(self) -> Response {
+	pub fn into_inner(self) -> IndexedResults {
 		self.0
 	}
 }
@@ -727,28 +636,31 @@ impl WithStats<Response> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{value::to_value, Error::Api};
-	use serde::Deserialize;
-	use surrealdb_core::sql::Value as CoreValue;
 
-	#[derive(Debug, Clone, Serialize, Deserialize)]
+	#[derive(Debug, Clone, SurrealValue)]
 	struct Summary {
 		title: String,
 	}
 
-	#[derive(Debug, Clone, Serialize, Deserialize)]
+	#[derive(Debug, Clone, SurrealValue)]
 	struct Article {
 		title: String,
 		body: String,
 	}
 
-	fn to_map(vec: Vec<QueryResult>) -> IndexMap<usize, (Stats, QueryResult)> {
+	fn to_map(
+		vec: Vec<std::result::Result<Value, DbResultError>>,
+	) -> IndexMap<usize, (DbResultStats, std::result::Result<Value, DbResultError>)> {
 		vec.into_iter()
-			.map(|result| {
-				let stats = Stats {
-					execution_time: Default::default(),
-				};
-				(stats, result)
+			.map(|result| match result {
+				Ok(result) => {
+					let stats = DbResultStats::default();
+					(stats, Ok(result))
+				}
+				Err(error) => {
+					let stats = DbResultStats::default();
+					(stats, Err(error))
+				}
 			})
 			.enumerate()
 			.collect()
@@ -756,47 +668,49 @@ mod tests {
 
 	#[test]
 	fn take_from_an_empty_response() {
-		let mut response = Response::new();
+		let mut response = IndexedResults::new();
 		let value: Value = response.take(0).unwrap();
-		assert!(value.into_inner().is_none());
+		assert!(value.is_none());
 
-		let mut response = Response::new();
+		let mut response = IndexedResults::new();
 		let option: Option<String> = response.take(0).unwrap();
 		assert!(option.is_none());
 
-		let mut response = Response::new();
+		let mut response = IndexedResults::new();
 		let vec: Vec<String> = response.take(0).unwrap();
 		assert!(vec.is_empty());
 	}
 
 	#[test]
 	fn take_from_an_errored_query() {
-		let mut response = Response {
-			results: to_map(vec![Err(Error::ConnectionUninitialised.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Err(DbResultError::InternalError(
+				"Unimportant error message".to_string(),
+			))]),
+			..IndexedResults::new()
 		};
 		response.take::<Option<()>>(0).unwrap_err();
 	}
 
 	#[test]
 	fn take_from_empty_records() {
-		let mut response = Response {
+		let mut response = IndexedResults {
 			results: to_map(vec![]),
-			..Response::new()
+			..IndexedResults::new()
 		};
 		let value: Value = response.take(0).unwrap();
-		assert_eq!(value, Default::default());
+		assert_eq!(value, Value::None);
 
-		let mut response = Response {
+		let mut response = IndexedResults {
 			results: to_map(vec![]),
-			..Response::new()
+			..IndexedResults::new()
 		};
 		let option: Option<String> = response.take(0).unwrap();
 		assert!(option.is_none());
 
-		let mut response = Response {
+		let mut response = IndexedResults {
 			results: to_map(vec![]),
-			..Response::new()
+			..IndexedResults::new()
 		};
 		let vec: Vec<String> = response.take(0).unwrap();
 		assert!(vec.is_empty());
@@ -806,46 +720,46 @@ mod tests {
 	fn take_from_a_scalar_response() {
 		let scalar = 265;
 
-		let mut response = Response {
-			results: to_map(vec![Ok(scalar.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_int(scalar))]),
+			..IndexedResults::new()
 		};
 		let value: Value = response.take(0).unwrap();
-		assert_eq!(value.into_inner(), CoreValue::from(scalar));
+		assert_eq!(value, Value::from_t(scalar));
 
-		let mut response = Response {
-			results: to_map(vec![Ok(scalar.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_int(scalar))]),
+			..IndexedResults::new()
 		};
 		let option: Option<_> = response.take(0).unwrap();
 		assert_eq!(option, Some(scalar));
 
-		let mut response = Response {
-			results: to_map(vec![Ok(scalar.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_int(scalar))]),
+			..IndexedResults::new()
 		};
 		let vec: Vec<i64> = response.take(0).unwrap();
 		assert_eq!(vec, vec![scalar]);
 
 		let scalar = true;
 
-		let mut response = Response {
-			results: to_map(vec![Ok(scalar.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_bool(scalar))]),
+			..IndexedResults::new()
 		};
 		let value: Value = response.take(0).unwrap();
-		assert_eq!(value.into_inner(), CoreValue::from(scalar));
+		assert_eq!(value, Value::from_t(scalar));
 
-		let mut response = Response {
-			results: to_map(vec![Ok(scalar.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_bool(scalar))]),
+			..IndexedResults::new()
 		};
 		let option: Option<_> = response.take(0).unwrap();
 		assert_eq!(option, Some(scalar));
 
-		let mut response = Response {
-			results: to_map(vec![Ok(scalar.into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_bool(scalar))]),
+			..IndexedResults::new()
 		};
 		let vec: Vec<bool> = response.take(0).unwrap();
 		assert_eq!(vec, vec![scalar]);
@@ -853,18 +767,18 @@ mod tests {
 
 	#[test]
 	fn take_preserves_order() {
-		let mut response = Response {
+		let mut response = IndexedResults {
 			results: to_map(vec![
-				Ok(0.into()),
-				Ok(1.into()),
-				Ok(2.into()),
-				Ok(3.into()),
-				Ok(4.into()),
-				Ok(5.into()),
-				Ok(6.into()),
-				Ok(7.into()),
+				Ok(Value::from_int(0)),
+				Ok(Value::from_int(1)),
+				Ok(Value::from_int(2)),
+				Ok(Value::from_int(3)),
+				Ok(Value::from_int(4)),
+				Ok(Value::from_int(5)),
+				Ok(Value::from_int(6)),
+				Ok(Value::from_int(7)),
 			]),
-			..Response::new()
+			..IndexedResults::new()
 		};
 		let Some(four): Option<i32> = response.take(4).unwrap() else {
 			panic!("query not found");
@@ -879,7 +793,7 @@ mod tests {
 		};
 		assert_eq!(zero, 0);
 		let one: Value = response.take(1).unwrap();
-		assert_eq!(one.into_inner(), CoreValue::from(1));
+		assert_eq!(one, Value::from_int(1));
 	}
 
 	#[test]
@@ -887,27 +801,27 @@ mod tests {
 		let summary = Summary {
 			title: "Lorem Ipsum".to_owned(),
 		};
-		let value = to_value(summary.clone()).unwrap();
+		let value = summary.clone().into_value();
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.clone().into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value.clone())]),
+			..IndexedResults::new()
 		};
 		let title: Value = response.take("title").unwrap();
-		assert_eq!(title.into_inner(), CoreValue::from(summary.title.as_str()));
+		assert_eq!(title, Value::String(summary.title.clone()));
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.clone().into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value.clone())]),
+			..IndexedResults::new()
 		};
 		let Some(title): Option<String> = response.take("title").unwrap() else {
 			panic!("title not found");
 		};
 		assert_eq!(title, summary.title);
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value)]),
+			..IndexedResults::new()
 		};
 		let vec: Vec<String> = response.take("title").unwrap();
 		assert_eq!(vec, vec![summary.title]);
@@ -916,11 +830,11 @@ mod tests {
 			title: "Lorem Ipsum".to_owned(),
 			body: "Lorem Ipsum Lorem Ipsum".to_owned(),
 		};
-		let value = to_value(article.clone()).unwrap();
+		let value = article.clone().into_value();
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.clone().into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value.clone())]),
+			..IndexedResults::new()
 		};
 		let Some(title): Option<String> = response.take("title").unwrap() else {
 			panic!("title not found");
@@ -931,19 +845,19 @@ mod tests {
 		};
 		assert_eq!(body, article.body);
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.clone().into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value.clone())]),
+			..IndexedResults::new()
 		};
 		let vec: Vec<String> = response.take("title").unwrap();
 		assert_eq!(vec, vec![article.title.clone()]);
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value)]),
+			..IndexedResults::new()
 		};
 		let value: Value = response.take("title").unwrap();
-		assert_eq!(value.into_inner(), CoreValue::from(article.title));
+		assert_eq!(value, Value::String(article.title));
 	}
 
 	#[test]
@@ -952,20 +866,20 @@ mod tests {
 			title: "Lorem Ipsum".to_owned(),
 			body: "Lorem Ipsum Lorem Ipsum".to_owned(),
 		};
-		let value = to_value(article.clone()).unwrap();
+		let value = article.clone().into_value();
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.clone().into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value.clone())]),
+			..IndexedResults::new()
 		};
 		let title: Vec<String> = response.take("title").unwrap();
 		assert_eq!(title, vec![article.title.clone()]);
 		let body: Vec<String> = response.take("body").unwrap();
 		assert_eq!(body, vec![article.body]);
 
-		let mut response = Response {
-			results: to_map(vec![Ok(value.clone().into_inner())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(value.clone())]),
+			..IndexedResults::new()
 		};
 		let vec: Vec<String> = response.take("title").unwrap();
 		assert_eq!(vec, vec![article.title]);
@@ -973,96 +887,103 @@ mod tests {
 
 	#[test]
 	fn take_partial_records() {
-		let mut response = Response {
-			results: to_map(vec![Ok(vec![true, false].into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_vec(vec![
+				Value::from_bool(true),
+				Value::from_bool(false),
+			]))]),
+			..IndexedResults::new()
 		};
 		let value: Value = response.take(0).unwrap();
-		assert_eq!(value.into_inner(), vec![CoreValue::from(true), CoreValue::from(false)].into());
+		assert_eq!(value, Value::from_vec(vec![Value::from_bool(true), Value::from_bool(false)]));
 
-		let mut response = Response {
-			results: to_map(vec![Ok(vec![true, false].into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_vec(vec![
+				Value::from_bool(true),
+				Value::from_bool(false),
+			]))]),
+			..IndexedResults::new()
 		};
 		let vec: Vec<bool> = response.take(0).unwrap();
 		assert_eq!(vec, vec![true, false]);
 
-		let mut response = Response {
-			results: to_map(vec![Ok(vec![true, false].into())]),
-			..Response::new()
+		let mut response = IndexedResults {
+			results: to_map(vec![Ok(Value::from_vec(vec![
+				Value::from_bool(true),
+				Value::from_bool(false),
+			]))]),
+			..IndexedResults::new()
 		};
-		let Err(Api(Error::LossyTake(Response {
-			results: mut map,
-			..
-		}))): Result<Option<bool>> = response.take(0)
-		else {
+
+		let Err(e) = response.take::<Option<bool>>(0) else {
 			panic!("silently dropping records not allowed");
 		};
+		let Error::LossyTake(boxed) = e else {
+			panic!("silently dropping records not allowed");
+		};
+		let IndexedResults {
+			results: mut map,
+			..
+		} = *boxed;
+
 		let records = map.swap_remove(&0).unwrap().1.unwrap();
-		assert_eq!(records, vec![true, false].into());
+		assert_eq!(records, Value::from_vec(vec![Value::from_bool(true), Value::from_bool(false)]));
 	}
 
 	#[test]
 	fn check_returns_the_first_error() {
 		let response = vec![
-			Ok(0.into()),
-			Ok(1.into()),
-			Ok(2.into()),
-			Err(Error::ConnectionUninitialised.into()),
-			Ok(3.into()),
-			Ok(4.into()),
-			Ok(5.into()),
-			Err(Error::BackupsNotSupported.into()),
-			Ok(6.into()),
-			Ok(7.into()),
-			Err(Error::DuplicateRequestId(0).into()),
+			Ok(Value::from_int(0)),
+			Ok(Value::from_int(1)),
+			Ok(Value::from_int(2)),
+			Err(DbResultError::InternalError("test".to_string())),
+			Ok(Value::from_int(3)),
+			Ok(Value::from_int(4)),
+			Ok(Value::from_int(5)),
+			Err(DbResultError::InternalError("test".to_string())),
+			Ok(Value::from_int(6)),
+			Ok(Value::from_int(7)),
+			Err(DbResultError::InternalError("test".to_string())),
 		];
-		let response = Response {
+		let response = IndexedResults {
 			results: to_map(response),
-			..Response::new()
+			..IndexedResults::new()
 		};
-		let crate::Error::Api(Error::ConnectionUninitialised) = response.check().unwrap_err()
-		else {
-			panic!("check did not return the first error");
-		};
+		let err = response.check().unwrap_err();
+
+		assert_eq!(err, DbResultError::InternalError("test".to_string()));
 	}
 
 	#[test]
 	fn take_errors() {
 		let response = vec![
-			Ok(0.into()),
-			Ok(1.into()),
-			Ok(2.into()),
-			Err(Error::ConnectionUninitialised.into()),
-			Ok(3.into()),
-			Ok(4.into()),
-			Ok(5.into()),
-			Err(Error::BackupsNotSupported.into()),
-			Ok(6.into()),
-			Ok(7.into()),
-			Err(Error::DuplicateRequestId(0).into()),
+			Ok(Value::from_int(0)),
+			Ok(Value::from_int(1)),
+			Ok(Value::from_int(2)),
+			Err(DbResultError::InternalError("test".to_string())),
+			Ok(Value::from_int(3)),
+			Ok(Value::from_int(4)),
+			Ok(Value::from_int(5)),
+			Err(DbResultError::InternalError("test".to_string())),
+			Ok(Value::from_int(6)),
+			Ok(Value::from_int(7)),
+			Err(DbResultError::InternalError("test".to_string())),
 		];
-		let mut response = Response {
+		let mut response = IndexedResults {
 			results: to_map(response),
-			..Response::new()
+			..IndexedResults::new()
 		};
 		let errors = response.take_errors();
 		assert_eq!(response.num_statements(), 8);
 		assert_eq!(errors.len(), 3);
-		let crate::Error::Api(Error::DuplicateRequestId(0)) = errors[&10] else {
-			panic!("index `10` is not `DuplicateRequestId`");
-		};
-		let crate::Error::Api(Error::BackupsNotSupported) = errors[&7] else {
-			panic!("index `7` is not `BackupsNotSupported`");
-		};
-		let crate::Error::Api(Error::ConnectionUninitialised) = errors[&3] else {
-			panic!("index `3` is not `ConnectionUninitialised`");
-		};
+		assert_eq!(errors[&10], DbResultError::InternalError("test".to_string()));
+		assert_eq!(errors[&7], DbResultError::InternalError("test".to_string()));
+		assert_eq!(errors[&3], DbResultError::InternalError("test".to_string()));
 		let Some(value): Option<i32> = response.take(2).unwrap() else {
 			panic!("statement not found");
 		};
 		assert_eq!(value, 2);
 		let value: Value = response.take(4).unwrap();
-		assert_eq!(value.into_inner(), CoreValue::from(3));
+		assert_eq!(value, Value::from_int(3));
 	}
 }

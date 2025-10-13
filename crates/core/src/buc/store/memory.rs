@@ -1,14 +1,14 @@
-use std::{future::Future, pin::Pin};
+use std::future::Future;
+use std::pin::Pin;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use url::Url;
 
-use crate::sql::Datetime;
-
 use super::{ListOptions, ObjectKey, ObjectMeta, ObjectStore};
+use crate::val::Datetime;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Entry {
 	bytes: Bytes,
 	updated: Datetime,
@@ -18,7 +18,7 @@ impl From<Bytes> for Entry {
 	fn from(bytes: Bytes) -> Self {
 		Self {
 			bytes,
-			..Default::default()
+			updated: Datetime::now(),
 		}
 	}
 }
@@ -121,10 +121,16 @@ impl ObjectStore for MemoryStore {
 		target: &'a ObjectKey,
 	) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
 		Box::pin(async move {
-			if let Some(x) = self.store.get(key) {
-				let data = x.clone();
-				self.store.insert(target.clone(), data);
-			}
+			// This is intentionally somewhat verbosely written to ensure the lock is being
+			// properly handled.
+			let entry = {
+				let Some(entry) = self.store.get(key) else {
+					return Ok(());
+				};
+				entry.clone()
+			};
+
+			self.store.insert(target.clone(), entry);
 
 			Ok(())
 		})
@@ -137,10 +143,16 @@ impl ObjectStore for MemoryStore {
 	) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
 		Box::pin(async move {
 			if !self.store.contains_key(target) {
-				if let Some(x) = self.store.get(key) {
-					let data = x.clone();
-					self.store.insert(target.clone(), data);
-				}
+				// This is intentionally somewhat verbosely written to ensure the lock is being
+				// properly handled.
+				let entry = {
+					let Some(entry) = self.store.get(key) else {
+						return Ok(());
+					};
+					entry.clone()
+				};
+
+				self.store.insert(target.clone(), entry);
 			}
 
 			Ok(())

@@ -1,27 +1,20 @@
-use ciborium::Value as Data;
-use geo::{LineString, Point, Polygon};
-use geo_types::{MultiLineString, MultiPoint, MultiPolygon};
-use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::iter::once;
 use std::ops::Bound;
-use std::ops::Deref;
 
-use crate::sql::id::range::IdRange;
-use crate::sql::Array;
-use crate::sql::Datetime;
-use crate::sql::DecimalExt;
-use crate::sql::Duration;
-use crate::sql::File;
-use crate::sql::Future;
-use crate::sql::Geometry;
-use crate::sql::Id;
-use crate::sql::Number;
-use crate::sql::Object;
-use crate::sql::Range;
-use crate::sql::Thing;
-use crate::sql::Uuid;
-use crate::sql::Value;
+use anyhow::{Context, Result, anyhow};
+use ciborium::Value as CborValue;
+use geo::{LineString, Point, Polygon};
+use geo_types::{MultiLineString, MultiPoint, MultiPolygon};
+use rust_decimal::Decimal;
+
+use crate::syn;
+use crate::types::{
+	PublicArray, PublicDatetime, PublicDuration, PublicFile, PublicGeometry, PublicNumber,
+	PublicObject, PublicRange, PublicRecordId, PublicRecordIdKey, PublicRecordIdKeyRange,
+	PublicUuid, PublicValue,
+};
+use crate::val::DecimalExt;
 
 // Tags from the spec - https://www.iana.org/assignments/cbor-tags/cbor-tags.xhtml
 const TAG_SPEC_DATETIME: u64 = 0;
@@ -37,7 +30,9 @@ const TAG_STRING_DECIMAL: u64 = 10;
 const TAG_CUSTOM_DATETIME: u64 = 12;
 const TAG_STRING_DURATION: u64 = 13;
 const TAG_CUSTOM_DURATION: u64 = 14;
-const TAG_FUTURE: u64 = 15;
+// unused but the for backwards compatibility kept around to maybe avoid using
+// that tag again.
+const _TAG_FUTURE: u64 = 15;
 
 // Ranges (49->51 is unassigned)
 const TAG_RANGE: u64 = 49;
@@ -56,592 +51,602 @@ const TAG_GEOMETRY_MULTILINE: u64 = 92;
 const TAG_GEOMETRY_MULTIPOLYGON: u64 = 93;
 const TAG_GEOMETRY_COLLECTION: u64 = 94;
 
-#[derive(Debug)]
-pub struct Cbor(pub Data);
-
-impl TryFrom<Cbor> for Value {
-	type Error = &'static str;
-	fn try_from(val: Cbor) -> Result<Self, &'static str> {
-		match val.0 {
-			Data::Null => Ok(Value::Null),
-			Data::Bool(v) => Ok(Value::from(v)),
-			Data::Integer(v) => Ok(Value::from(i128::from(v))),
-			Data::Float(v) => Ok(Value::from(v)),
-			Data::Bytes(v) => Ok(Value::Bytes(v.into())),
-			Data::Text(v) => Ok(Value::from(v)),
-			Data::Array(v) => Ok(Value::Array(Array::try_from(v)?)),
-			Data::Map(v) => Ok(Value::Object(Object::try_from(v)?)),
-			Data::Tag(t, v) => {
-				match t {
-					// A literal datetime
-					TAG_SPEC_DATETIME => match *v {
-						Data::Text(v) => match Datetime::try_from(v) {
-							Ok(v) => Ok(v.into()),
-							_ => Err("Expected a valid Datetime value"),
-						},
-						_ => Err("Expected a CBOR text data type"),
+pub fn to_value(val: CborValue) -> Result<PublicValue> {
+	match val {
+		CborValue::Null => Ok(PublicValue::Null),
+		CborValue::Bool(v) => Ok(PublicValue::Bool(v)),
+		CborValue::Integer(v) => Ok(PublicValue::Number(PublicNumber::Int(i128::from(v) as i64))),
+		CborValue::Float(v) => Ok(PublicValue::Number(PublicNumber::Float(v))),
+		CborValue::Bytes(v) => Ok(PublicValue::Bytes(v.into())),
+		CborValue::Text(v) => Ok(PublicValue::String(v)),
+		CborValue::Array(v) => Ok(PublicValue::Array(to_array(v)?)),
+		CborValue::Map(v) => Ok(PublicValue::Object(to_object(v)?)),
+		CborValue::Tag(t, v) => {
+			match t {
+				// A literal datetime
+				TAG_SPEC_DATETIME => match *v {
+					CborValue::Text(v) => match syn::datetime(v.as_str()) {
+						Ok(v) => Ok(PublicValue::Datetime(v)),
+						_ => Err(anyhow!("Expected a valid Datetime value")),
 					},
-					// A custom [seconds: i64, nanos: u32] datetime
-					TAG_CUSTOM_DATETIME => match *v {
-						Data::Array(v) if v.len() == 2 => {
-							let mut iter = v.into_iter();
+					_ => Err(anyhow!("Expected a CBOR text data type")),
+				},
+				// A custom [seconds: i64, nanos: u32] datetime
+				TAG_CUSTOM_DATETIME => match *v {
+					CborValue::Array(v) if v.len() == 2 => {
+						let mut iter = v.into_iter();
 
-							let seconds = match iter.next() {
-								Some(Data::Integer(v)) => match i64::try_from(v) {
-									Ok(v) => v,
-									_ => return Err("Expected a CBOR integer data type"),
-								},
-								_ => return Err("Expected a CBOR integer data type"),
-							};
+						let seconds = match iter.next() {
+							Some(CborValue::Integer(v)) => match i64::try_from(v) {
+								Ok(v) => v,
+								_ => return Err(anyhow!("Expected a CBOR integer data type")),
+							},
+							_ => return Err(anyhow!("Expected a CBOR integer data type")),
+						};
 
-							let nanos = match iter.next() {
-								Some(Data::Integer(v)) => match u32::try_from(v) {
-									Ok(v) => v,
-									_ => return Err("Expected a CBOR integer data type"),
-								},
-								_ => return Err("Expected a CBOR integer data type"),
-							};
+						let nanos = match iter.next() {
+							Some(CborValue::Integer(v)) => match u32::try_from(v) {
+								Ok(v) => v,
+								_ => return Err(anyhow!("Expected a CBOR integer data type")),
+							},
+							_ => return Err(anyhow!("Expected a CBOR integer data type")),
+						};
 
-							match Datetime::try_from((seconds, nanos)) {
-								Ok(v) => Ok(v.into()),
-								_ => Err("Expected a valid Datetime value"),
+						match PublicDatetime::try_from((seconds, nanos)) {
+							Ok(v) => Ok(PublicValue::Datetime(v)),
+							_ => Err(anyhow!("Expected a valid Datetime value")),
+						}
+					}
+					_ => Err(anyhow!("Expected a CBOR array with 2 elements")),
+				},
+				// A literal NONE
+				TAG_NONE => Ok(PublicValue::None),
+				// A literal uuid
+				TAG_STRING_UUID => match *v {
+					CborValue::Text(v) => match v.parse::<PublicUuid>() {
+						Ok(v) => Ok(PublicValue::Uuid(v)),
+						_ => Err(anyhow!("Expected a valid UUID value")),
+					},
+					_ => Err(anyhow!("Expected a CBOR text data type")),
+				},
+				// A byte string uuid
+				TAG_SPEC_UUID => to_uuid(*v).map(PublicValue::Uuid),
+				// A literal decimal
+				TAG_STRING_DECIMAL => match *v {
+					CborValue::Text(v) => match Decimal::from_str_normalized(v.as_str()) {
+						Ok(v) => Ok(PublicValue::Number(PublicNumber::Decimal(v))),
+						_ => Err(anyhow!("Expected a valid Decimal value")),
+					},
+					_ => Err(anyhow!("Expected a CBOR text data type")),
+				},
+				// A literal duration
+				TAG_STRING_DURATION => match *v {
+					CborValue::Text(v) => match v.parse::<PublicDuration>() {
+						Ok(v) => Ok(PublicValue::Duration(v)),
+						_ => Err(anyhow!("Expected a valid Duration value")),
+					},
+					_ => Err(anyhow!("Expected a CBOR text data type")),
+				},
+				// A custom [seconds: Option<u64>, nanos: Option<u32>] duration
+				TAG_CUSTOM_DURATION => match *v {
+					CborValue::Array(v) if v.len() <= 2 => {
+						let mut iter = v.into_iter();
+
+						let seconds = match iter.next() {
+							Some(CborValue::Integer(v)) => match u64::try_from(v) {
+								Ok(v) => v,
+								_ => return Err(anyhow!("Expected a CBOR integer data type")),
+							},
+							_ => 0,
+						};
+
+						let nanos = match iter.next() {
+							Some(CborValue::Integer(v)) => match u32::try_from(v) {
+								Ok(v) => v,
+								_ => return Err(anyhow!("Expected a CBOR integer data type")),
+							},
+							_ => 0,
+						};
+
+						Ok(PublicValue::Duration(PublicDuration::new(seconds, nanos)))
+					}
+					_ => Err(anyhow!("Expected a CBOR array with at most 2 elements")),
+				},
+				// A literal recordid
+				TAG_RECORDID => match *v {
+					CborValue::Text(v) => match syn::record_id(v.as_str()) {
+						Ok(v) => Ok(PublicValue::RecordId(v)),
+						_ => Err(anyhow!("Expected a valid RecordID value")),
+					},
+					CborValue::Array(v) => {
+						let mut v = v.into_iter();
+						let table = v.next().context(
+							"Expected a CBOR text data type, or a CBOR array with 2 elements: got empty array",
+						)?;
+						let key = v.next().context("Expected a CBOR text data type, or a CBOR array with 2 elements: got array with only one element")?;
+						if v.next().is_some() {
+							return Err(anyhow!(
+								"Expected a CBOR text data type, or a CBOR array with 2 elements: got array with more than two elements"
+							));
+						}
+
+						let table = to_value(table)?.into_string()?;
+
+						let key = to_record_id_key(key)?;
+
+						Ok(PublicValue::RecordId(PublicRecordId {
+							table,
+							key,
+						}))
+					}
+					_ => Err(anyhow!(
+						"Expected a CBOR text data type, or a CBOR array with 2 elements"
+					)),
+				},
+				// A literal table
+				TAG_TABLE => match *v {
+					CborValue::Text(v) => Ok(PublicValue::String(v)),
+					_ => Err(anyhow!("Expected a CBOR text data type")),
+				},
+				// A range
+				TAG_RANGE => Ok(PublicValue::Range(Box::new(to_range(*v)?))),
+				TAG_GEOMETRY_POINT => match *v {
+					CborValue::Array(v) => {
+						let err_msg = "Expected a CBOR array with 2 decimal values";
+						let mut iter = v.into_iter();
+						let x = iter.next().ok_or_else(|| anyhow!(err_msg))?;
+						let y = iter.next().ok_or_else(|| anyhow!(err_msg))?;
+						if iter.next().is_some() {
+							return Err(anyhow!(err_msg));
+						};
+
+						let x = to_value(x)?;
+						let y = to_value(y)?;
+
+						match (x, y) {
+							(PublicValue::Number(x), PublicValue::Number(y)) => {
+								Ok(PublicValue::Geometry(PublicGeometry::Point(
+									(
+										x.to_f64().unwrap_or_default(),
+										y.to_f64().unwrap_or_default(),
+									)
+										.into(),
+								)))
 							}
+							_ => Err(anyhow!("Expected a CBOR array with 2 decimal values")),
 						}
-						_ => Err("Expected a CBOR array with 2 elements"),
-					},
-					// A literal NONE
-					TAG_NONE => Ok(Value::None),
-					// A literal uuid
-					TAG_STRING_UUID => match *v {
-						Data::Text(v) => match Uuid::try_from(v) {
-							Ok(v) => Ok(v.into()),
-							_ => Err("Expected a valid UUID value"),
-						},
-						_ => Err("Expected a CBOR text data type"),
-					},
-					// A byte string uuid
-					TAG_SPEC_UUID => v.deref().to_owned().try_into().map(Value::Uuid),
-					// A literal decimal
-					TAG_STRING_DECIMAL => match *v {
-						Data::Text(v) => match Decimal::from_str_normalized(v.as_str()) {
-							Ok(v) => Ok(v.into()),
-							_ => Err("Expected a valid Decimal value"),
-						},
-						_ => Err("Expected a CBOR text data type"),
-					},
-					// A literal duration
-					TAG_STRING_DURATION => match *v {
-						Data::Text(v) => match Duration::try_from(v) {
-							Ok(v) => Ok(v.into()),
-							_ => Err("Expected a valid Duration value"),
-						},
-						_ => Err("Expected a CBOR text data type"),
-					},
-					// A custom [seconds: Option<u64>, nanos: Option<u32>] duration
-					TAG_CUSTOM_DURATION => match *v {
-						Data::Array(v) if v.len() <= 2 => {
-							let mut iter = v.into_iter();
+					}
+					_ => Err(anyhow!("Expected a CBOR array with 2 decimal values")),
+				},
+				TAG_GEOMETRY_LINE => match *v {
+					CborValue::Array(v) => {
+						let points = v
+							.into_iter()
+							.map(|v| match to_value(v)? {
+								PublicValue::Geometry(PublicGeometry::Point(v)) => Ok(v),
+								_ => {
+									Err(anyhow!("Expected a CBOR array with Geometry Point values"))
+								}
+							})
+							.collect::<Result<Vec<Point>>>()?;
 
-							let seconds = match iter.next() {
-								Some(Data::Integer(v)) => match u64::try_from(v) {
-									Ok(v) => v,
-									_ => return Err("Expected a CBOR integer data type"),
-								},
-								_ => 0,
-							};
+						Ok(PublicValue::Geometry(PublicGeometry::Line(LineString::from(points))))
+					}
+					_ => Err(anyhow!("Expected a CBOR array with Geometry Point values")),
+				},
+				TAG_GEOMETRY_POLYGON => match *v {
+					CborValue::Array(v) if !v.is_empty() => {
+						let lines = v
+							.into_iter()
+							.map(|v| match to_value(v)? {
+								PublicValue::Geometry(PublicGeometry::Line(v)) => Ok(v),
+								_ => {
+									Err(anyhow!("Expected a CBOR array with Geometry Line values"))
+								}
+							})
+							.collect::<Result<Vec<LineString>>>()?;
 
-							let nanos = match iter.next() {
-								Some(Data::Integer(v)) => match u32::try_from(v) {
-									Ok(v) => v,
-									_ => return Err("Expected a CBOR integer data type"),
-								},
-								_ => 0,
-							};
-
-							Ok(Duration::new(seconds, nanos).into())
-						}
-						_ => Err("Expected a CBOR array with at most 2 elements"),
-					},
-					// A literal recordid
-					TAG_RECORDID => match *v {
-						Data::Text(v) => match Thing::try_from(v) {
-							Ok(v) => Ok(v.into()),
-							_ => Err("Expected a valid RecordID value"),
-						},
-						Data::Array(mut v) if v.len() == 2 => {
-							let tb = match Value::try_from(Cbor(v.remove(0))) {
-								Ok(Value::Strand(tb)) => tb.0,
-								Ok(Value::Table(tb)) => tb.0,
-								_ => return Err(
-									"Expected the tb of a Record Id to be a String or Table value",
-								),
-							};
-
-							let id = Id::try_from(v.remove(0))?;
-
-							Ok(Value::Thing(Thing {
-								tb,
-								id,
-							}))
-						}
-						_ => Err("Expected a CBOR text data type, or a CBOR array with 2 elements"),
-					},
-					// A literal table
-					TAG_TABLE => match *v {
-						Data::Text(v) => Ok(Value::Table(v.into())),
-						_ => Err("Expected a CBOR text data type"),
-					},
-					// A range
-					TAG_RANGE => Ok(Value::Range(Box::new(Range::try_from(*v)?))),
-					TAG_FUTURE => match *v {
-						Data::Text(v) => {
-							let block = crate::syn::block(v.as_str())
-								.map_err(|_| "Failed to parse block")?;
-							Ok(Value::Future(Box::new(Future(block))))
-						}
-						_ => Err("Expected a CBOR text data type"),
-					},
-					TAG_GEOMETRY_POINT => match *v {
-						Data::Array(mut v) if v.len() == 2 => {
-							let x = Value::try_from(Cbor(v.remove(0)))?;
-							let y = Value::try_from(Cbor(v.remove(0)))?;
-
-							match (x, y) {
-								(Value::Number(x), Value::Number(y)) => Ok(Value::Geometry(
-									Geometry::Point((x.as_float(), y.as_float()).into()),
-								)),
-								_ => Err("Expected a CBOR array with 2 decimal values"),
-							}
-						}
-						_ => Err("Expected a CBOR array with 2 decimal values"),
-					},
-					TAG_GEOMETRY_LINE => match v.deref() {
-						Data::Array(v) => {
-							let points = v
-								.iter()
-								.map(|v| match Value::try_from(Cbor(v.clone()))? {
-									Value::Geometry(Geometry::Point(v)) => Ok(v),
-									_ => Err("Expected a CBOR array with Geometry Point values"),
-								})
-								.collect::<Result<Vec<Point>, &str>>()?;
-
-							Ok(Value::Geometry(Geometry::Line(LineString::from(points))))
-						}
-						_ => Err("Expected a CBOR array with Geometry Point values"),
-					},
-					TAG_GEOMETRY_POLYGON => match v.deref() {
-						Data::Array(v) if !v.is_empty() => {
-							let lines = v
-								.iter()
-								.map(|v| match Value::try_from(Cbor(v.clone()))? {
-									Value::Geometry(Geometry::Line(v)) => Ok(v),
-									_ => Err("Expected a CBOR array with Geometry Line values"),
-								})
-								.collect::<Result<Vec<LineString>, &str>>()?;
-
-							let exterior = match lines.first() {
-								Some(v) => v,
-								_ => return Err(
+						let exterior = match lines.first() {
+							Some(v) => v,
+							_ => {
+								return Err(anyhow!(
 									"Expected a CBOR array with at least one Geometry Line values",
-								),
-							};
-							let interiors = Vec::from(&lines[1..]);
+								));
+							}
+						};
+						let interiors = Vec::from(&lines[1..]);
 
-							Ok(Value::Geometry(Geometry::Polygon(Polygon::new(
-								exterior.clone(),
-								interiors,
-							))))
-						}
-						_ => Err("Expected a CBOR array with at least one Geometry Line values"),
-					},
-					TAG_GEOMETRY_MULTIPOINT => match v.deref() {
-						Data::Array(v) => {
-							let points = v
-								.iter()
-								.map(|v| match Value::try_from(Cbor(v.clone()))? {
-									Value::Geometry(Geometry::Point(v)) => Ok(v),
-									_ => Err("Expected a CBOR array with Geometry Point values"),
-								})
-								.collect::<Result<Vec<Point>, &str>>()?;
+						Ok(PublicValue::Geometry(PublicGeometry::Polygon(Polygon::new(
+							exterior.clone(),
+							interiors,
+						))))
+					}
+					_ => {
+						Err(anyhow!("Expected a CBOR array with at least one Geometry Line values"))
+					}
+				},
+				TAG_GEOMETRY_MULTIPOINT => match *v {
+					CborValue::Array(v) => {
+						let points = v
+							.into_iter()
+							.map(|v| match to_value(v)? {
+								PublicValue::Geometry(PublicGeometry::Point(v)) => Ok(v),
+								_ => {
+									Err(anyhow!("Expected a CBOR array with Geometry Point values"))
+								}
+							})
+							.collect::<Result<Vec<Point>>>()?;
 
-							Ok(Value::Geometry(Geometry::MultiPoint(MultiPoint::from(points))))
-						}
-						_ => Err("Expected a CBOR array with Geometry Point values"),
-					},
-					TAG_GEOMETRY_MULTILINE => match v.deref() {
-						Data::Array(v) => {
-							let lines = v
-								.iter()
-								.map(|v| match Value::try_from(Cbor(v.clone()))? {
-									Value::Geometry(Geometry::Line(v)) => Ok(v),
-									_ => Err("Expected a CBOR array with Geometry Line values"),
-								})
-								.collect::<Result<Vec<LineString>, &str>>()?;
+						Ok(PublicValue::Geometry(PublicGeometry::MultiPoint(MultiPoint::from(
+							points,
+						))))
+					}
+					_ => Err(anyhow!("Expected a CBOR array with Geometry Point values")),
+				},
+				TAG_GEOMETRY_MULTILINE => match *v {
+					CborValue::Array(v) => {
+						let lines = v
+							.into_iter()
+							.map(|v| match to_value(v)? {
+								PublicValue::Geometry(PublicGeometry::Line(v)) => Ok(v),
+								_ => {
+									Err(anyhow!("Expected a CBOR array with Geometry Line values"))
+								}
+							})
+							.collect::<Result<Vec<LineString>>>()?;
 
-							Ok(Value::Geometry(Geometry::MultiLine(MultiLineString::new(lines))))
-						}
-						_ => Err("Expected a CBOR array with Geometry Line values"),
-					},
-					TAG_GEOMETRY_MULTIPOLYGON => match v.deref() {
-						Data::Array(v) => {
-							let polygons = v
-								.iter()
-								.map(|v| match Value::try_from(Cbor(v.clone()))? {
-									Value::Geometry(Geometry::Polygon(v)) => Ok(v),
-									_ => Err("Expected a CBOR array with Geometry Polygon values"),
-								})
-								.collect::<Result<Vec<Polygon>, &str>>()?;
+						Ok(PublicValue::Geometry(PublicGeometry::MultiLine(MultiLineString::new(
+							lines,
+						))))
+					}
+					_ => Err(anyhow!("Expected a CBOR array with Geometry Line values")),
+				},
+				TAG_GEOMETRY_MULTIPOLYGON => match *v {
+					CborValue::Array(v) => {
+						let polygons = v
+							.into_iter()
+							.map(|v| match to_value(v)? {
+								PublicValue::Geometry(PublicGeometry::Polygon(v)) => Ok(v),
+								_ => Err(anyhow!(
+									"Expected a CBOR array with Geometry Polygon values"
+								)),
+							})
+							.collect::<Result<Vec<Polygon>>>()?;
 
-							Ok(Value::Geometry(Geometry::MultiPolygon(MultiPolygon::from(
-								polygons,
-							))))
-						}
-						_ => Err("Expected a CBOR array with Geometry Polygon values"),
-					},
-					TAG_GEOMETRY_COLLECTION => match v.deref() {
-						Data::Array(v) => {
-							let geometries = v
-								.iter()
-								.map(|v| match Value::try_from(Cbor(v.clone()))? {
-									Value::Geometry(v) => Ok(v),
-									_ => Err("Expected a CBOR array with Geometry values"),
-								})
-								.collect::<Result<Vec<Geometry>, &str>>()?;
+						Ok(PublicValue::Geometry(PublicGeometry::MultiPolygon(MultiPolygon::from(
+							polygons,
+						))))
+					}
+					_ => Err(anyhow!("Expected a CBOR array with Geometry Polygon values")),
+				},
+				TAG_GEOMETRY_COLLECTION => match *v {
+					CborValue::Array(v) => {
+						let geometries = v
+							.into_iter()
+							.map(|v| match to_value(v)? {
+								PublicValue::Geometry(v) => Ok(v),
+								_ => Err(anyhow!("Expected a CBOR array with Geometry values")),
+							})
+							.collect::<Result<Vec<PublicGeometry>>>()?;
 
-							Ok(Value::Geometry(Geometry::Collection(geometries)))
-						}
-						_ => Err("Expected a CBOR array with Geometry values"),
-					},
-					TAG_FILE => match *v {
-						Data::Array(mut v) if v.len() == 2 => {
-							let Data::Text(bucket) = v.remove(0) else {
-								return Err("Expected the bucket name to be a string value");
-							};
+						Ok(PublicValue::Geometry(PublicGeometry::Collection(geometries)))
+					}
+					_ => Err(anyhow!("Expected a CBOR array with Geometry values")),
+				},
+				TAG_FILE => match *v {
+					CborValue::Array(mut v) if v.len() == 2 => {
+						let CborValue::Text(bucket) = v.remove(0) else {
+							return Err(anyhow!("Expected the bucket name to be a string value"));
+						};
 
-							let Data::Text(key) = v.remove(0) else {
-								return Err("Expected the file key to be a string value");
-							};
+						let CborValue::Text(key) = v.remove(0) else {
+							return Err(anyhow!("Expected the file key to be a string value"));
+						};
 
-							Ok(Value::File(File {
-								bucket,
-								key,
-							}))
-						}
-						_ => Err("Expected a CBOR array with two String bucket and key values"),
-					},
-					// An unknown tag
-					_ => Err("Encountered an unknown CBOR tag"),
-				}
+						Ok(PublicValue::File(PublicFile::new(bucket, key)))
+					}
+					_ => {
+						Err(anyhow!("Expected a CBOR array with two String bucket and key values"))
+					}
+				},
+				// An unknown tag
+				_ => Err(anyhow!("Encountered an unknown CBOR tag")),
 			}
-			_ => Err("Encountered an unknown CBOR data type"),
 		}
+		_ => Err(anyhow!("Encountered an unknown CBOR data type")),
 	}
 }
 
-impl TryFrom<Value> for Cbor {
-	type Error = &'static str;
-	fn try_from(val: Value) -> Result<Self, &'static str> {
-		match val {
-			Value::None => Ok(Cbor(Data::Tag(TAG_NONE, Box::new(Data::Null)))),
-			Value::Null => Ok(Cbor(Data::Null)),
-			Value::Bool(v) => Ok(Cbor(Data::Bool(v))),
-			Value::Number(v) => match v {
-				Number::Int(v) => Ok(Cbor(Data::Integer(v.into()))),
-				Number::Float(v) => Ok(Cbor(Data::Float(v))),
-				Number::Decimal(v) => {
-					Ok(Cbor(Data::Tag(TAG_STRING_DECIMAL, Box::new(Data::Text(v.to_string())))))
-				}
-			},
-			Value::Strand(v) => Ok(Cbor(Data::Text(v.0))),
-			Value::Duration(v) => {
-				let seconds = v.secs();
-				let nanos = v.subsec_nanos();
-
-				let tag_value = match (seconds, nanos) {
-					(0, 0) => Box::new(Data::Array(vec![])),
-					(_, 0) => Box::new(Data::Array(vec![Data::Integer(seconds.into())])),
-					_ => Box::new(Data::Array(vec![
-						Data::Integer(seconds.into()),
-						Data::Integer(nanos.into()),
-					])),
-				};
-
-				Ok(Cbor(Data::Tag(TAG_CUSTOM_DURATION, tag_value)))
+pub fn from_value(val: PublicValue) -> Result<CborValue> {
+	match val {
+		PublicValue::None => Ok(CborValue::Tag(TAG_NONE, Box::new(CborValue::Null))),
+		PublicValue::Null => Ok(CborValue::Null),
+		PublicValue::Bool(v) => Ok(CborValue::Bool(v)),
+		PublicValue::Number(v) => match v {
+			PublicNumber::Int(v) => Ok(CborValue::Integer(v.into())),
+			PublicNumber::Float(v) => Ok(CborValue::Float(v)),
+			PublicNumber::Decimal(v) => {
+				Ok(CborValue::Tag(TAG_STRING_DECIMAL, Box::new(CborValue::Text(v.to_string()))))
 			}
-			Value::Datetime(v) => {
-				let seconds = v.timestamp();
-				let nanos = v.timestamp_subsec_nanos();
+		},
+		PublicValue::String(v) => Ok(CborValue::Text(v)),
+		PublicValue::Duration(v) => {
+			let seconds = v.secs();
+			let nanos = v.subsec_nanos();
 
-				Ok(Cbor(Data::Tag(
-					TAG_CUSTOM_DATETIME,
-					Box::new(Data::Array(vec![
-						Data::Integer(seconds.into()),
-						Data::Integer(nanos.into()),
-					])),
-				)))
-			}
-			Value::Uuid(v) => {
-				Ok(Cbor(Data::Tag(TAG_SPEC_UUID, Box::new(Data::Bytes(v.into_bytes().into())))))
-			}
-			Value::Array(v) => Ok(Cbor(Data::Array(
-				v.into_iter()
-					.map(|v| {
-						let v = Cbor::try_from(v)?.0;
-						Ok(v)
-					})
-					.collect::<Result<Vec<Data>, &str>>()?,
-			))),
-			Value::Object(v) => Ok(Cbor(Data::Map(
-				v.into_iter()
-					.map(|(k, v)| {
-						let k = Data::Text(k);
-						let v = Cbor::try_from(v)?.0;
-						Ok((k, v))
-					})
-					.collect::<Result<Vec<(Data, Data)>, &str>>()?,
-			))),
-			Value::Bytes(v) => Ok(Cbor(Data::Bytes(v.into_inner()))),
-			Value::Thing(v) => Ok(Cbor(Data::Tag(
-				TAG_RECORDID,
-				Box::new(Data::Array(vec![
-					Data::Text(v.tb),
-					match v.id {
-						Id::Number(v) => Data::Integer(v.into()),
-						Id::String(v) => Data::Text(v),
-						Id::Uuid(v) => Cbor::try_from(Value::from(v))?.0,
-						Id::Array(v) => Cbor::try_from(Value::from(v))?.0,
-						Id::Object(v) => Cbor::try_from(Value::from(v))?.0,
-						Id::Generate(_) => {
-							return Err("Cannot encode an ungenerated Record ID into CBOR")
-						}
-						Id::Range(v) => Data::Tag(TAG_RANGE, Box::new(Data::try_from(*v)?)),
-					},
+			let tag_value = match (seconds, nanos) {
+				(0, 0) => Box::new(CborValue::Array(vec![])),
+				(_, 0) => Box::new(CborValue::Array(vec![CborValue::Integer(seconds.into())])),
+				_ => Box::new(CborValue::Array(vec![
+					CborValue::Integer(seconds.into()),
+					CborValue::Integer(nanos.into()),
 				])),
-			))),
-			Value::Table(v) => Ok(Cbor(Data::Tag(TAG_TABLE, Box::new(Data::Text(v.0))))),
-			Value::Geometry(v) => Ok(Cbor(encode_geometry(v)?)),
-			Value::Range(v) => Ok(Cbor(Data::Tag(TAG_RANGE, Box::new(Data::try_from(*v)?)))),
-			Value::Future(v) => {
-				let bin = Data::Text(format!("{}", (*v).0));
-				Ok(Cbor(Data::Tag(TAG_FUTURE, Box::new(bin))))
-			}
-			Value::File(File {
-				bucket,
-				key,
-			}) => Ok(Cbor(Data::Tag(
-				TAG_FILE,
-				Box::new(Data::Array(vec![Data::Text(bucket), Data::Text(key)])),
-			))),
-			// We shouldn't reach here
-			_ => Err("Found unsupported SurrealQL value being encoded into a CBOR value"),
+			};
+
+			Ok(CborValue::Tag(TAG_CUSTOM_DURATION, tag_value))
 		}
+		PublicValue::Datetime(v) => {
+			let seconds = v.timestamp();
+			let nanos = v.timestamp_subsec_nanos();
+
+			Ok(CborValue::Tag(
+				TAG_CUSTOM_DATETIME,
+				Box::new(CborValue::Array(vec![
+					CborValue::Integer(seconds.into()),
+					CborValue::Integer(nanos.into()),
+				])),
+			))
+		}
+		PublicValue::Uuid(v) => {
+			Ok(CborValue::Tag(TAG_SPEC_UUID, Box::new(CborValue::Bytes(v.into_bytes().into()))))
+		}
+		PublicValue::Array(v) => from_array(v),
+		PublicValue::Object(v) => from_object(v),
+		PublicValue::Bytes(v) => Ok(CborValue::Bytes(v.into())),
+		PublicValue::RecordId(v) => Ok(CborValue::Tag(
+			TAG_RECORDID,
+			Box::new(CborValue::Array(vec![
+				CborValue::Text(v.table),
+				match v.key {
+					PublicRecordIdKey::Number(v) => CborValue::Integer(v.into()),
+					PublicRecordIdKey::String(v) => CborValue::Text(v),
+					PublicRecordIdKey::Uuid(v) => from_uuid(v),
+					PublicRecordIdKey::Array(v) => from_array(v)?,
+					PublicRecordIdKey::Object(v) => from_object(v)?,
+					PublicRecordIdKey::Range(v) => {
+						CborValue::Tag(TAG_RANGE, Box::new(from_record_id_key_range(*v)?))
+					}
+				},
+			])),
+		)),
+		PublicValue::Geometry(v) => from_geometry(v),
+		PublicValue::Range(v) => Ok(CborValue::Tag(TAG_RANGE, Box::new(from_range(*v)?))),
+		PublicValue::File(file) => Ok(CborValue::Tag(
+			TAG_FILE,
+			Box::new(CborValue::Array(vec![
+				CborValue::Text(file.bucket().to_string()),
+				CborValue::Text(file.key().to_string()),
+			])),
+		)),
+		// We shouldn't reach here
+		_ => Err(anyhow!("Found unsupported SurrealQL value being encoded into a CBOR value")),
 	}
 }
 
-fn encode_geometry(v: Geometry) -> Result<Data, &'static str> {
+fn from_geometry(v: PublicGeometry) -> Result<CborValue> {
 	match v {
-		Geometry::Point(v) => Ok(Data::Tag(
+		PublicGeometry::Point(v) => Ok(CborValue::Tag(
 			TAG_GEOMETRY_POINT,
-			Box::new(Data::Array(vec![Data::Float(v.x()), Data::Float(v.y())])),
+			Box::new(CborValue::Array(vec![CborValue::Float(v.x()), CborValue::Float(v.y())])),
 		)),
-		Geometry::Line(v) => {
+		PublicGeometry::Line(v) => {
 			let data = v
 				.points()
-				.map(|v| encode_geometry(v.into()))
-				.collect::<Result<Vec<Data>, &'static str>>()?;
+				.map(|v| from_geometry(PublicGeometry::Point(v)))
+				.collect::<Result<Vec<CborValue>>>()?;
 
-			Ok(Data::Tag(TAG_GEOMETRY_LINE, Box::new(Data::Array(data))))
+			Ok(CborValue::Tag(TAG_GEOMETRY_LINE, Box::new(CborValue::Array(data))))
 		}
-		Geometry::Polygon(v) => {
+		PublicGeometry::Polygon(v) => {
 			let data = once(v.exterior())
 				.chain(v.interiors())
-				.map(|v| encode_geometry(v.clone().into()))
-				.collect::<Result<Vec<Data>, &'static str>>()?;
+				.map(|v| from_geometry(PublicGeometry::Line(v.clone())))
+				.collect::<Result<Vec<CborValue>>>()?;
 
-			Ok(Data::Tag(TAG_GEOMETRY_POLYGON, Box::new(Data::Array(data))))
+			Ok(CborValue::Tag(TAG_GEOMETRY_POLYGON, Box::new(CborValue::Array(data))))
 		}
-		Geometry::MultiPoint(v) => {
+		PublicGeometry::MultiPoint(v) => {
 			let data = v
-				.iter()
-				.map(|v| encode_geometry((*v).into()))
-				.collect::<Result<Vec<Data>, &'static str>>()?;
+				.into_iter()
+				.map(|v| from_geometry(PublicGeometry::Point(v)))
+				.collect::<Result<Vec<CborValue>>>()?;
 
-			Ok(Data::Tag(TAG_GEOMETRY_MULTIPOINT, Box::new(Data::Array(data))))
+			Ok(CborValue::Tag(TAG_GEOMETRY_MULTIPOINT, Box::new(CborValue::Array(data))))
 		}
-		Geometry::MultiLine(v) => {
+		PublicGeometry::MultiLine(v) => {
 			let data = v
-				.iter()
-				.map(|v| encode_geometry(v.clone().into()))
-				.collect::<Result<Vec<Data>, &'static str>>()?;
+				.into_iter()
+				.map(|v| from_geometry(PublicGeometry::Line(v)))
+				.collect::<Result<Vec<CborValue>>>()?;
 
-			Ok(Data::Tag(TAG_GEOMETRY_MULTILINE, Box::new(Data::Array(data))))
+			Ok(CborValue::Tag(TAG_GEOMETRY_MULTILINE, Box::new(CborValue::Array(data))))
 		}
-		Geometry::MultiPolygon(v) => {
+		PublicGeometry::MultiPolygon(v) => {
 			let data = v
-				.iter()
-				.map(|v| encode_geometry(v.clone().into()))
-				.collect::<Result<Vec<Data>, &'static str>>()?;
+				.into_iter()
+				.map(|v| from_geometry(PublicGeometry::Polygon(v)))
+				.collect::<Result<Vec<CborValue>>>()?;
 
-			Ok(Data::Tag(TAG_GEOMETRY_MULTIPOLYGON, Box::new(Data::Array(data))))
+			Ok(CborValue::Tag(TAG_GEOMETRY_MULTIPOLYGON, Box::new(CborValue::Array(data))))
 		}
-		Geometry::Collection(v) => {
-			let data = v
-				.iter()
-				.map(|v| encode_geometry(v.clone()))
-				.collect::<Result<Vec<Data>, &'static str>>()?;
+		PublicGeometry::Collection(v) => {
+			let data = v.into_iter().map(from_geometry).collect::<Result<Vec<CborValue>>>()?;
 
-			Ok(Data::Tag(TAG_GEOMETRY_COLLECTION, Box::new(Data::Array(data))))
+			Ok(CborValue::Tag(TAG_GEOMETRY_COLLECTION, Box::new(CborValue::Array(data))))
 		}
 	}
 }
 
-impl TryFrom<Data> for Range {
-	type Error = &'static str;
-	fn try_from(val: Data) -> Result<Self, &'static str> {
-		fn decode_bound(v: Data) -> Result<Bound<Value>, &'static str> {
-			match v {
-				Data::Tag(TAG_BOUND_INCLUDED, v) => Ok(Bound::Included(Value::try_from(Cbor(*v))?)),
-				Data::Tag(TAG_BOUND_EXCLUDED, v) => Ok(Bound::Excluded(Value::try_from(Cbor(*v))?)),
-				Data::Null => Ok(Bound::Unbounded),
-				_ => Err("Expected a bound tag"),
-			}
-		}
-
-		match val {
-			Data::Array(v) if v.len() == 2 => {
-				let mut v = v;
-				let beg = decode_bound(v.remove(0).clone())?;
-				let end = decode_bound(v.remove(0).clone())?;
-				Ok(Range::new(beg, end))
-			}
-			_ => Err("Expected a CBOR array with 2 bounds"),
-		}
-	}
-}
-
-impl TryFrom<Range> for Data {
-	type Error = &'static str;
-	fn try_from(r: Range) -> Result<Data, &'static str> {
-		fn encode(b: Bound<Value>) -> Result<Data, &'static str> {
-			match b {
-				Bound::Included(v) => {
-					Ok(Data::Tag(TAG_BOUND_INCLUDED, Box::new(Cbor::try_from(v)?.0)))
-				}
-				Bound::Excluded(v) => {
-					Ok(Data::Tag(TAG_BOUND_EXCLUDED, Box::new(Cbor::try_from(v)?.0)))
-				}
-				Bound::Unbounded => Ok(Data::Null),
-			}
-		}
-
-		Ok(Data::Array(vec![encode(r.beg)?, encode(r.end)?]))
-	}
-}
-
-impl TryFrom<Data> for IdRange {
-	type Error = &'static str;
-	fn try_from(val: Data) -> Result<Self, &'static str> {
-		fn decode_bound(v: Data) -> Result<Bound<Id>, &'static str> {
-			match v {
-				Data::Tag(TAG_BOUND_INCLUDED, v) => Ok(Bound::Included(Id::try_from(*v)?)),
-				Data::Tag(TAG_BOUND_EXCLUDED, v) => Ok(Bound::Excluded(Id::try_from(*v)?)),
-				Data::Null => Ok(Bound::Unbounded),
-				_ => Err("Expected a bound tag"),
-			}
-		}
-
-		match val {
-			Data::Array(v) if v.len() == 2 => {
-				let mut v = v;
-				let beg = decode_bound(v.remove(0).clone())?;
-				let end = decode_bound(v.remove(0).clone())?;
-				Ok(IdRange::try_from((beg, end))
-					.map_err(|_| "Found an invalid range with ranges as bounds")?)
-			}
-			_ => Err("Expected a CBOR array with 2 bounds"),
-		}
-	}
-}
-
-impl TryFrom<IdRange> for Data {
-	type Error = &'static str;
-	fn try_from(r: IdRange) -> Result<Data, &'static str> {
-		fn encode(b: Bound<Id>) -> Result<Data, &'static str> {
-			match b {
-				Bound::Included(v) => Ok(Data::Tag(TAG_BOUND_INCLUDED, Box::new(v.try_into()?))),
-				Bound::Excluded(v) => Ok(Data::Tag(TAG_BOUND_EXCLUDED, Box::new(v.try_into()?))),
-				Bound::Unbounded => Ok(Data::Null),
-			}
-		}
-
-		Ok(Data::Array(vec![encode(r.beg)?, encode(r.end)?]))
-	}
-}
-
-impl TryFrom<Data> for Id {
-	type Error = &'static str;
-	fn try_from(val: Data) -> Result<Self, &'static str> {
-		match val {
-			Data::Integer(v) => Ok(Id::Number(i128::from(v) as i64)),
-			Data::Text(v) => Ok(Id::String(v)),
-			Data::Array(v) => Ok(Id::Array(v.try_into()?)),
-			Data::Map(v) => Ok(Id::Object(v.try_into()?)),
-			Data::Tag(TAG_RANGE, v) => Ok(Id::Range(Box::new(IdRange::try_from(*v)?))),
-			Data::Tag(TAG_STRING_UUID, v) => v.deref().to_owned().try_into().map(Id::Uuid),
-			Data::Tag(TAG_SPEC_UUID, v) => v.deref().to_owned().try_into().map(Id::Uuid),
-			_ => Err("Expected a CBOR integer, text, array or map"),
-		}
-	}
-}
-
-impl TryFrom<Id> for Data {
-	type Error = &'static str;
-	fn try_from(v: Id) -> Result<Data, &'static str> {
+fn to_range(val: CborValue) -> Result<PublicRange> {
+	fn decode_bound(v: CborValue) -> Result<Bound<PublicValue>> {
 		match v {
-			Id::Number(v) => Ok(Data::Integer(v.into())),
-			Id::String(v) => Ok(Data::Text(v)),
-			Id::Array(v) => Ok(Cbor::try_from(Value::from(v))?.0),
-			Id::Object(v) => Ok(Cbor::try_from(Value::from(v))?.0),
-			Id::Range(v) => Ok(Data::Tag(TAG_RANGE, Box::new(v.deref().to_owned().try_into()?))),
-			Id::Uuid(v) => {
-				Ok(Data::Tag(TAG_SPEC_UUID, Box::new(Data::Bytes(v.into_bytes().into()))))
+			CborValue::Tag(TAG_BOUND_INCLUDED, v) => Ok(Bound::Included(to_value(*v)?)),
+			CborValue::Tag(TAG_BOUND_EXCLUDED, v) => Ok(Bound::Excluded(to_value(*v)?)),
+			CborValue::Null => Ok(Bound::Unbounded),
+			_ => Err(anyhow!("Expected a bound tag")),
+		}
+	}
+
+	match val {
+		CborValue::Array(v) if v.len() == 2 => {
+			let mut v = v;
+			let beg = decode_bound(v.remove(0).clone())?;
+			let end = decode_bound(v.remove(0).clone())?;
+			Ok(PublicRange::new(beg, end))
+		}
+		_ => Err(anyhow!("Expected a CBOR array with 2 bounds")),
+	}
+}
+
+fn from_range(r: PublicRange) -> Result<CborValue> {
+	fn encode(b: Bound<PublicValue>) -> Result<CborValue> {
+		match b {
+			Bound::Included(v) => Ok(CborValue::Tag(TAG_BOUND_INCLUDED, Box::new(from_value(v)?))),
+			Bound::Excluded(v) => Ok(CborValue::Tag(TAG_BOUND_EXCLUDED, Box::new(from_value(v)?))),
+			Bound::Unbounded => Ok(CborValue::Null),
+		}
+	}
+
+	Ok(CborValue::Array(vec![encode(r.start)?, encode(r.end)?]))
+}
+
+fn from_record_id_key_range(r: PublicRecordIdKeyRange) -> Result<CborValue> {
+	fn encode(b: Bound<PublicRecordIdKey>) -> Result<CborValue> {
+		match b {
+			Bound::Included(v) => {
+				Ok(CborValue::Tag(TAG_BOUND_INCLUDED, Box::new(from_record_id_key(v)?)))
 			}
-			Id::Generate(_) => Err("Cannot encode an ungenerated Record ID into CBOR"),
+			Bound::Excluded(v) => {
+				Ok(CborValue::Tag(TAG_BOUND_EXCLUDED, Box::new(from_record_id_key(v)?)))
+			}
+			Bound::Unbounded => Ok(CborValue::Null),
+		}
+	}
+
+	Ok(CborValue::Array(vec![encode(r.start)?, encode(r.end)?]))
+}
+
+fn to_record_id_key_range(val: CborValue) -> Result<PublicRecordIdKeyRange> {
+	fn decode_bound(v: CborValue) -> Result<Bound<PublicRecordIdKey>> {
+		match v {
+			CborValue::Tag(TAG_BOUND_INCLUDED, v) => Ok(Bound::Included(to_record_id_key(*v)?)),
+			CborValue::Tag(TAG_BOUND_EXCLUDED, v) => Ok(Bound::Excluded(to_record_id_key(*v)?)),
+			CborValue::Null => Ok(Bound::Unbounded),
+			_ => Err(anyhow!("Expected a bound tag")),
+		}
+	}
+
+	match val {
+		CborValue::Array(v) if v.len() == 2 => {
+			let mut v = v;
+			let start = decode_bound(v.remove(0).clone())?;
+			let end = decode_bound(v.remove(0).clone())?;
+
+			Ok(PublicRecordIdKeyRange {
+				start,
+				end,
+			})
+		}
+		_ => Err(anyhow!("Expected a CBOR array with 2 bounds")),
+	}
+}
+
+fn from_record_id_key(v: PublicRecordIdKey) -> Result<CborValue> {
+	match v {
+		PublicRecordIdKey::Number(v) => Ok(CborValue::Integer(v.into())),
+		PublicRecordIdKey::String(v) => Ok(CborValue::Text(v)),
+		PublicRecordIdKey::Array(v) => from_array(v),
+		PublicRecordIdKey::Object(v) => from_object(v),
+		PublicRecordIdKey::Range(v) => {
+			Ok(CborValue::Tag(TAG_RANGE, Box::new(from_record_id_key_range(*v)?)))
+		}
+		PublicRecordIdKey::Uuid(v) => {
+			Ok(CborValue::Tag(TAG_SPEC_UUID, Box::new(CborValue::Bytes(v.into_bytes().into()))))
 		}
 	}
 }
 
-impl TryFrom<Vec<Data>> for Array {
-	type Error = &'static str;
-	fn try_from(val: Vec<Data>) -> Result<Self, &'static str> {
-		val.into_iter().map(|v| Value::try_from(Cbor(v))).collect::<Result<Array, &str>>()
-	}
-}
-
-impl TryFrom<Vec<(Data, Data)>> for Object {
-	type Error = &'static str;
-	fn try_from(val: Vec<(Data, Data)>) -> Result<Self, &'static str> {
-		Ok(Object(
-			val.into_iter()
-				.map(|(k, v)| {
-					let k = Value::try_from(Cbor(k)).map(|k| k.as_raw_string());
-					let v = Value::try_from(Cbor(v));
-					Ok((k?, v?))
-				})
-				.collect::<Result<BTreeMap<String, Value>, &str>>()?,
-		))
-	}
-}
-
-impl TryFrom<Data> for Uuid {
-	type Error = &'static str;
-	fn try_from(val: Data) -> Result<Self, &'static str> {
-		match val {
-			Data::Bytes(v) if v.len() == 16 => match v.as_slice().try_into() {
-				Ok(v) => Ok(Uuid::from(uuid::Uuid::from_bytes(v))),
-				Err(_) => Err("Expected a CBOR byte array with 16 elements"),
+fn to_record_id_key(val: CborValue) -> Result<PublicRecordIdKey> {
+	match val {
+		CborValue::Integer(v) => Ok(PublicRecordIdKey::Number(i128::from(v) as i64)),
+		CborValue::Text(v) => Ok(PublicRecordIdKey::String(v)),
+		CborValue::Array(v) => Ok(PublicRecordIdKey::Array(to_array(v)?)),
+		CborValue::Map(v) => Ok(PublicRecordIdKey::Object(to_object(v)?)),
+		CborValue::Tag(TAG_RANGE, v) => {
+			Ok(PublicRecordIdKey::Range(Box::new(to_record_id_key_range(*v)?)))
+		}
+		CborValue::Tag(TAG_STRING_UUID, v) => match *v {
+			CborValue::Text(v) => match PublicUuid::try_from(v) {
+				Ok(v) => Ok(PublicRecordIdKey::Uuid(v)),
+				_ => Err(anyhow!("Expected a valid UUID value")),
 			},
-			_ => Err("Expected a CBOR byte array with 16 elements"),
-		}
+			_ => Err(anyhow!("Expected a CBOR text data type")),
+		},
+		CborValue::Tag(TAG_SPEC_UUID, v) => to_uuid(*v).map(PublicRecordIdKey::Uuid),
+		_ => Err(anyhow!("Expected a CBOR integer, text, array or map")),
 	}
+}
+
+fn from_uuid(val: PublicUuid) -> CborValue {
+	CborValue::Tag(TAG_SPEC_UUID, Box::new(CborValue::Bytes(val.into_bytes().into())))
+}
+
+fn to_uuid(val: CborValue) -> Result<PublicUuid> {
+	match val {
+		CborValue::Bytes(v) if v.len() == 16 => match v.as_slice().try_into() {
+			Ok(v) => Ok(PublicUuid::from(uuid::Uuid::from_bytes(v))),
+			Err(_) => Err(anyhow!("Expected a CBOR byte array with 16 elements")),
+		},
+		_ => Err(anyhow!("Expected a CBOR byte array with 16 elements")),
+	}
+}
+
+fn from_array(array: PublicArray) -> Result<CborValue> {
+	array
+		.into_iter()
+		.map(|v| {
+			let v = from_value(v)?;
+			Ok(v)
+		})
+		.collect::<Result<Vec<CborValue>>>()
+		.map(CborValue::Array)
+}
+
+fn to_array(array: Vec<CborValue>) -> Result<PublicArray> {
+	Ok(array.into_iter().map(to_value).collect::<Result<Vec<PublicValue>, _>>()?.into())
+}
+
+fn from_object(obj: PublicObject) -> Result<CborValue> {
+	obj.into_iter()
+		.map(|(k, v)| {
+			let k = CborValue::Text(k);
+			let v = from_value(v)?;
+			Ok((k, v))
+		})
+		.collect::<Result<Vec<(CborValue, CborValue)>>>()
+		.map(CborValue::Map)
+}
+
+fn to_object(obj: Vec<(CborValue, CborValue)>) -> Result<PublicObject> {
+	let res = obj
+		.into_iter()
+		.map(|(k, v)| {
+			let CborValue::Text(k) = k else {
+				return Err(anyhow!("Expected object key to be a string"));
+			};
+			let v = to_value(v)?;
+			Ok((k, v))
+		})
+		.collect::<Result<BTreeMap<_, _>>>()?;
+	Ok(PublicObject::from(res))
 }

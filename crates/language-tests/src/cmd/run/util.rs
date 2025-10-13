@@ -1,17 +1,14 @@
-use crate::tests::schema::{BoolOr, SchemaTarget, TestConfig, TestLevel, TestLogin, TestRole};
-use surrealdb_core::{
-	dbs::{
-		capabilities::{Capabilities, Targets},
-		Session,
-	},
-	iam::{Level, Role},
-};
+use surrealdb_core::dbs::Session;
+use surrealdb_core::dbs::capabilities::{Capabilities, Targets};
+use surrealdb_types::Value as SurValue;
+
+use crate::tests::schema::{AuthLevel, BoolOr, SchemaTarget, TestAuth, TestConfig};
 
 /// Creates the right core capabilities from a test config.
 pub fn core_capabilities_from_test_config(config: &TestConfig) -> Capabilities {
 	/// Returns Targets::All if there is no value and none_on_missing is false,
-	/// Returns Targets::None if there is no value and none_on_missing is true ensuring the default behaviour
-	/// is to allow everything.
+	/// Returns Targets::None if there is no value and none_on_missing is true ensuring the default
+	/// behaviour is to allow everything.
 	///
 	/// If there is a value it will return Targets::All on the value true, Targets::None on the
 	/// value false, and otherwise the returns the specified values.
@@ -20,7 +17,7 @@ pub fn core_capabilities_from_test_config(config: &TestConfig) -> Capabilities {
 		none_on_missing: bool,
 	) -> Targets<T>
 	where
-		T: std::cmp::Eq + std::hash::Hash + Clone,
+		T: Eq + std::hash::Hash + Ord + Clone,
 	{
 		v.as_ref()
 			.map(|x| match x {
@@ -73,38 +70,52 @@ pub fn session_from_test_config(config: &TestConfig) -> Session {
 	let ns = env.namespace();
 	let db = env.database();
 
-	let mut session = if let Some(login) = env.login.as_ref() {
-		match login {
-			TestLogin::Leveled(test_leveled_login) => {
-				let role = match test_leveled_login.role {
-					Some(TestRole::Viewer) => Role::Viewer,
-					Some(TestRole::Editor) => Role::Editor,
-					Some(TestRole::Owner) | None => Role::Owner,
+	let mut session = if let Some(auth) = env.auth.as_ref() {
+		match auth {
+			TestAuth::Root {
+				level,
+			} => match level {
+				AuthLevel::Owner => Session::owner(),
+				AuthLevel::Editor => Session::editor(),
+				AuthLevel::Viewer => Session::viewer(),
+			},
+			TestAuth::Namespace {
+				namespace,
+				level,
+			} => {
+				let session = match level {
+					AuthLevel::Owner => Session::owner(),
+					AuthLevel::Editor => Session::editor(),
+					AuthLevel::Viewer => Session::viewer(),
 				};
-
-				match test_leveled_login.level {
-					TestLevel::Root => Session::for_level(Level::Root, role),
-					TestLevel::Namespace => {
-						Session::for_level(Level::Namespace(ns.unwrap_or("test").to_string()), role)
-					}
-					TestLevel::Database => Session::for_level(
-						Level::Database(
-							ns.unwrap_or("test").to_string(),
-							db.unwrap_or("test").to_string(),
-						),
-						role,
-					),
-				}
+				session.with_ns(&namespace)
 			}
-			TestLogin::Record(test_record_login) => Session::for_record(
-				ns.unwrap_or("test"),
-				db.unwrap_or("test"),
-				&test_record_login.access,
-				test_record_login.rid.0.clone().into(),
-			),
+			TestAuth::Database {
+				namespace,
+				database,
+				level,
+			} => {
+				let session = match level {
+					AuthLevel::Owner => Session::owner(),
+					AuthLevel::Editor => Session::editor(),
+					AuthLevel::Viewer => Session::viewer(),
+				};
+				session.with_ns(&namespace).with_db(&database)
+			}
+			TestAuth::Record {
+				namespace,
+				database,
+				access,
+				rid,
+			} => {
+				let v = SurValue::RecordId(rid.0.clone());
+				Session::for_record(&namespace, &database, &access, v.into())
+			}
 		}
-	} else {
+	} else if env.signin.is_none() && env.signin.is_none() {
 		Session::owner()
+	} else {
+		Session::default()
 	};
 
 	session.ns = ns.map(|x| x.to_owned());

@@ -87,6 +87,11 @@ who = "Micha de Vries <micha@devrie.sh>"
 criteria = "safe-to-deploy"
 version = "0.15.2"
 
+[[audits.ntapi]]
+who = "Emmanuel Keller <emmanuel.keller@surrealdb.com>"
+criteria = "safe-to-deploy"
+version = "0.4.1"
+
 [[audits.openssl]]
 who = "Micha de Vries <micha@devrie.sh>"
 criteria = "safe-to-deploy"
@@ -137,6 +142,11 @@ who = "Micha de Vries <micha@devrie.sh>"
 criteria = "safe-to-deploy"
 version = "1.0.1"
 
+[[audits.tracing-serde]]
+who = "Emmanuel Keller <emmanuel.keller@surrealdb.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+
 [[audits.trim-in-place]]
 who = "Micha de Vries <micha@devrie.sh>"
 criteria = "safe-to-deploy"
@@ -170,7 +180,7 @@ end = "2025-08-31"
 criteria = "safe-to-deploy"
 user-id = 3618 # David Tolnay (dtolnay)
 start = "2019-10-05"
-end = "2025-08-06"
+end = "2026-10-12"
 
 [[trusted.argon2]]
 criteria = "safe-to-deploy"
@@ -189,6 +199,12 @@ criteria = "safe-to-deploy"
 user-id = 267 # Tony Arcieri (tarcieri)
 start = "2021-01-21"
 end = "2026-05-06"
+
+[[trusted.bincode]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-08"
+end = "2026-10-13"
 
 [[trusted.bitcode]]
 criteria = "safe-to-deploy"
@@ -298,6 +314,12 @@ user-id = 176367 # Edoardo Morandi (dodomorandi)
 start = "2023-03-12"
 end = "2026-02-26"
 
+[[trusted.dtoa]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-02"
+end = "2026-10-12"
+
 [[trusted.echodb]]
 criteria = "safe-to-deploy"
 user-id = 145457 # Tobie Morgan Hitchcock (tobiemh)
@@ -309,6 +331,12 @@ criteria = "safe-to-deploy"
 user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-04-23"
 end = "2026-05-06"
+
+[[trusted.flatbuffers]]
+criteria = "safe-to-deploy"
+user-id = 178443 # Derek Bailey (dbaileychess)
+start = "2024-12-23"
+end = "2026-07-18"
 
 [[trusted.fslock]]
 criteria = "safe-to-deploy"
@@ -376,6 +404,12 @@ user-id = 359 # Sean McArthur (seanmonstar)
 start = "2019-07-03"
 end = "2025-08-06"
 
+[[trusted.humantime]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2025-03-12"
+end = "2026-10-09"
+
 [[trusted.hyper]]
 criteria = "safe-to-deploy"
 user-id = 359 # Sean McArthur (seanmonstar)
@@ -414,7 +448,7 @@ end = "2026-04-11"
 
 [[trusted.libc]]
 criteria = "safe-to-deploy"
-user-id = 51017 # Yuki Okushi (JohnTitor)
+user-id = 51017
 start = "2020-03-17"
 end = "2025-11-14"
 
@@ -659,10 +693,22 @@ start = "2025-02-22"
 end = "2026-02-26"
 
 [[trusted.rstest]]
+criteria = "safe-to-deploy"
+user-id = 30606 # Michele d'Amico (la10736)
+start = "2019-06-28"
+end = "2026-08-26"
+
+[[trusted.rstest]]
 criteria = "safe-to-run"
 user-id = 30606 # Michele d'Amico (la10736)
 start = "2019-06-28"
 end = "2026-05-01"
+
+[[trusted.rstest_macros]]
+criteria = "safe-to-deploy"
+user-id = 30606 # Michele d'Amico (la10736)
+start = "2022-05-15"
+end = "2026-08-26"
 
 [[trusted.rstest_macros]]
 criteria = "safe-to-run"
@@ -694,11 +740,17 @@ user-id = 267 # Tony Arcieri (tarcieri)
 start = "2020-08-18"
 end = "2026-05-06"
 
+[[trusted.semver]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2021-05-25"
+end = "2026-10-13"
+
 [[trusted.serde]]
 criteria = "safe-to-deploy"
 user-id = 3618 # David Tolnay (dtolnay)
 start = "2019-03-01"
-end = "2025-08-18"
+end = "2026-10-12"
 
 [[trusted.serde_bytes]]
 criteria = "safe-to-deploy"
@@ -706,11 +758,17 @@ user-id = 3618 # David Tolnay (dtolnay)
 start = "2019-02-25"
 end = "2025-08-06"
 
+[[trusted.serde_core]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2025-09-13"
+end = "2026-10-12"
+
 [[trusted.serde_derive]]
 criteria = "safe-to-deploy"
 user-id = 3618 # David Tolnay (dtolnay)
 start = "2019-03-01"
-end = "2025-08-18"
+end = "2026-10-12"
 
 [[trusted.serde_json]]
 criteria = "safe-to-deploy"
@@ -746,7 +804,13 @@ end = "2026-05-06"
 criteria = "safe-to-deploy"
 user-id = 145457 # Tobie Morgan Hitchcock (tobiemh)
 start = "2022-03-16"
-end = "2025-01-24"
+end = "2026-09-10"
+
+[[trusted.storekey-derive]]
+criteria = "safe-to-deploy"
+user-id = 145457 # Tobie Morgan Hitchcock (tobiemh)
+start = "2025-09-03"
+end = "2026-09-10"
 
 [[trusted.surrealdb]]
 criteria = "safe-to-deploy"
@@ -778,11 +842,29 @@ user-id = 3987 # Rushmore Mushambi (rushmorem)
 start = "2023-08-29"
 end = "2025-01-24"
 
+[[trusted.surrealdb-protocol]]
+criteria = "safe-to-deploy"
+user-id = 145457 # Tobie Morgan Hitchcock (tobiemh)
+start = "2025-07-04"
+end = "2026-07-18"
+
 [[trusted.surrealdb-tikv-client]]
 criteria = "safe-to-deploy"
 user-id = 217605 # Yusuke Kuoka (mumoshu)
 start = "2023-06-19"
 end = "2025-07-08"
+
+[[trusted.surrealdb-types]]
+criteria = "safe-to-deploy"
+user-id = 145457 # Tobie Morgan Hitchcock (tobiemh)
+start = "2025-09-16"
+end = "2026-09-23"
+
+[[trusted.surrealdb-types-derive]]
+criteria = "safe-to-deploy"
+user-id = 145457 # Tobie Morgan Hitchcock (tobiemh)
+start = "2025-09-16"
+end = "2026-09-23"
 
 [[trusted.surrealkv]]
 criteria = "safe-to-deploy"
@@ -804,13 +886,13 @@ end = "2025-08-06"
 
 [[trusted.system-configuration]]
 criteria = "safe-to-deploy"
-user-id = 1459 # Linus Färnstrand (faern)
+user-id = 1459
 start = "2019-10-16"
 end = "2026-05-06"
 
 [[trusted.system-configuration-sys]]
 criteria = "safe-to-deploy"
-user-id = 1459 # Linus Färnstrand (faern)
+user-id = 1459
 start = "2019-10-16"
 end = "2026-05-06"
 
@@ -819,6 +901,18 @@ criteria = "safe-to-deploy"
 user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2026-05-06"
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2026-10-12"
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2026-10-12"
 
 [[trusted.tokio]]
 criteria = "safe-to-deploy"
@@ -897,6 +991,12 @@ criteria = "safe-to-deploy"
 user-id = 1139 # Manish Goregaokar (Manishearth)
 start = "2020-01-01"
 end = "2026-05-06"
+
+[[trusted.uuid]]
+criteria = "safe-to-deploy"
+user-id = 3204 # Ashley Mannix (KodrAus)
+start = "2019-10-18"
+end = "2026-07-18"
 
 [[trusted.vart]]
 criteria = "safe-to-deploy"

@@ -22,13 +22,14 @@ mod ws_integration {
 	}
 }
 
-use assert_fs::TempDir;
-use common::{Format, Socket, StartServerArguments, DB, NS, PASS, USER};
-use http::header::{HeaderMap, HeaderValue};
-use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+
+use assert_fs::TempDir;
+use common::{DB, Format, NS, PASS, Socket, StartServerArguments, USER};
+use http::header::{HeaderMap, HeaderValue};
+use serde_json::json;
 
 const HDR_SURREAL: &str = "surreal-id";
 const HDR_REQUEST: &str = "x-request-id";
@@ -236,7 +237,7 @@ pub async fn invalidate(cfg_server: Option<Format>, cfg_format: Format) {
 	let res = socket.send_request("query", json!(["DEFINE NAMESPACE test"])).await.unwrap();
 	assert_eq!(
 		res["error"]["message"],
-		"There was a problem with the database: IAM error: Not enough permissions to perform this action",
+		"Anonymous access not allowed: Not enough permissions to perform this action",
 		"result: {res:?}"
 	);
 	// Test passed
@@ -710,7 +711,8 @@ pub async fn live_query(cfg_server: Option<Format>, cfg_format: Format) {
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs: Result<_, Box<dyn std::error::Error>> =
 		tokio::time::timeout(Duration::from_secs(1), async {
 			Ok(vec![
@@ -780,7 +782,8 @@ pub async fn live_rpc(cfg_server: Option<Format>, cfg_format: Format) {
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs: Result<_, Box<dyn std::error::Error>> =
 		tokio::time::timeout(Duration::from_secs(1), async {
 			Ok(vec![
@@ -851,7 +854,8 @@ pub async fn kill(cfg_server: Option<Format>, cfg_format: Format) {
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket.receive_all_other_messages(2, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Check for first live query notifcation
@@ -883,7 +887,8 @@ pub async fn kill(cfg_server: Option<Format>, cfg_format: Format) {
 	let res = socket.send_request("kill", json!([live1])).await.unwrap();
 	assert!(res.is_object(), "result: {res:?}");
 	assert!(res["result"].is_null(), "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket.receive_all_other_messages(1, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Check for second live query notifcation
@@ -902,7 +907,8 @@ pub async fn kill(cfg_server: Option<Format>, cfg_format: Format) {
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket.receive_all_other_messages(1, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Check for second live query notifcation
@@ -925,7 +931,8 @@ pub async fn kill(cfg_server: Option<Format>, cfg_format: Format) {
 	assert_eq!(res.len(), 1, "result: {res:?}");
 	assert!(res[0]["result"].is_null(), "result: {res:?}");
 	assert!(res[0]["type"].is_string(), "type: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket.receive_all_other_messages(1, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Check for second live query notifcation
@@ -944,7 +951,8 @@ pub async fn kill(cfg_server: Option<Format>, cfg_format: Format) {
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket.receive_all_other_messages(0, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Test passed
@@ -971,7 +979,8 @@ pub async fn live_table_removal(cfg_server: Option<Format>, cfg_format: Format) 
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket.receive_all_other_messages(1, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Check for second live query notifcation
@@ -1014,7 +1023,8 @@ pub async fn live_second_connection(cfg_server: Option<Format>, cfg_format: Form
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs = socket1.receive_all_other_messages(1, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
 	// Check for live query notifcation
@@ -1093,7 +1103,8 @@ pub async fn variable_auth_live_query(cfg_server: Option<Format>, cfg_format: Fo
 	assert!(res["result"].is_array(), "result: {res:?}");
 	let res = res["result"].as_array().unwrap();
 	assert_eq!(res.len(), 1, "result: {res:?}");
-	// Wait some time for all messages to arrive, and then search for the notification message
+	// Wait some time for all messages to arrive, and then search for the
+	// notification message
 	let msgs =
 		socket_expiring_auth.receive_all_other_messages(0, Duration::from_secs(1)).await.unwrap();
 	assert!(msgs.iter().all(|v| v["error"].is_null()), "Unexpected error received: {msgs:?}");
@@ -1178,10 +1189,7 @@ pub async fn session_expiration(cfg_server: Option<Format>, cfg_format: Format) 
 	let res = res.unwrap();
 	assert!(res.is_object(), "result: {res:?}");
 	let res = res.as_object().unwrap();
-	assert_eq!(
-		res["error"],
-		json!({"code": -32000, "message": "There was a problem with the database: The session has expired"})
-	);
+	assert_eq!(res["error"], json!({"code": -32000, "message": "The session has expired"}));
 	// Sign in again using the same session
 	let res = socket
 		.send_request(
@@ -1288,10 +1296,7 @@ pub async fn session_expiration_operations(cfg_server: Option<Format>, cfg_forma
 	let res = res.unwrap();
 	assert!(res.is_object(), "result: {res:?}");
 	let res = res.as_object().unwrap();
-	assert_eq!(
-		res["error"],
-		json!({"code": -32000, "message": "There was a problem with the database: The session has expired"})
-	);
+	assert_eq!(res["error"], json!({"code": -32000, "message": "The session has expired"}));
 	// Test operations that SHOULD NOT work with an expired session
 	let operations_ko = vec![
 		socket.send_request("let", json!(["let_var", "let_value",])),
@@ -1356,17 +1361,17 @@ pub async fn session_expiration_operations(cfg_server: Option<Format>, cfg_forma
 		socket.send_request("live", json!(["tester"])),
 		socket.send_request("kill", json!(["tester"])),
 	];
-	// Futures are executed sequentially as some operations rely on the previous state
-	for operation in operations_ko {
+	// Futures are executed sequentially as some operations rely on the previous
+	// state
+	for (idx, operation) in operations_ko.into_iter().enumerate() {
+		println!("Operation: {idx}");
 		let res = operation.await;
+		println!("res: {res:?}");
 		assert!(res.is_ok(), "result: {res:?}");
 		let res = res.unwrap();
 		assert!(res.is_object(), "result: {res:?}");
 		let res = res.as_object().unwrap();
-		assert_eq!(
-			res["error"],
-			json!({"code": -32000, "message": "There was a problem with the database: The session has expired"})
-		);
+		assert_eq!(res["error"]["message"], "The session has expired");
 	}
 
 	// Test operations that SHOULD work with an expired session
@@ -1376,8 +1381,10 @@ pub async fn session_expiration_operations(cfg_server: Option<Format>, cfg_forma
 		socket.send_request("version", json!([])),
 		socket.send_request("invalidate", json!([])),
 	];
-	// Futures are executed sequentially as some operations rely on the previous state
-	for operation in operations_ok {
+	// Futures are executed sequentially as some operations rely on the previous
+	// state
+	for (idx, operation) in operations_ok.into_iter().enumerate() {
+		println!("operation: {idx}");
 		let res = operation.await;
 		assert!(res.is_ok(), "result: {res:?}");
 		let res = res.unwrap();
@@ -1415,10 +1422,7 @@ pub async fn session_expiration_operations(cfg_server: Option<Format>, cfg_forma
 	let res = res.unwrap();
 	assert!(res.is_object(), "result: {res:?}");
 	let res = res.as_object().unwrap();
-	assert_eq!(
-		res["error"],
-		json!({"code": -32000, "message": "There was a problem with the database: The session has expired"})
-	);
+	assert_eq!(res["error"], json!({"code": -32000, "message": "The session has expired"}));
 	let res = socket
 		.send_request(
 			"signin",
@@ -1447,12 +1451,10 @@ pub async fn session_expiration_operations(cfg_server: Option<Format>, cfg_forma
 	let res = res.unwrap();
 	assert!(res.is_object(), "result: {res:?}");
 	let res = res.as_object().unwrap();
-	assert_eq!(
-		res["error"],
-		json!({"code": -32000, "message": "There was a problem with the database: The session has expired"})
-	);
+	assert_eq!(res["error"], json!({"code": -32000, "message": "The session has expired"}));
 
-	// This needs to be last operation as the session will no longer expire afterwards
+	// This needs to be last operation as the session will no longer expire
+	// afterwards
 	let res = socket.send_request("authenticate", json!([root_token,])).await;
 	assert!(res.is_ok(), "result: {res:?}");
 	let res = res.unwrap();
@@ -1628,10 +1630,7 @@ pub async fn session_reauthentication_expired(cfg_server: Option<Format>, cfg_fo
 	let res = res.unwrap();
 	assert!(res.is_object(), "result: {res:?}");
 	let res = res.as_object().unwrap();
-	assert_eq!(
-		res["error"],
-		json!({"code": -32000, "message": "There was a problem with the database: The session has expired"})
-	);
+	assert_eq!(res["error"], json!({"code": -32000, "message": "The session has expired"}));
 	// Authenticate using the root token, which has not expired yet
 	socket.send_request("authenticate", json!([root_token,])).await.unwrap();
 	// Check that we have root access and the session is not expired
@@ -1744,7 +1743,8 @@ pub async fn session_use_change_database(cfg_server: Option<Format>, cfg_format:
 	socket.send_message_use(Some(NS), Some("different")).await.unwrap();
 	// Verify that the authenticated session is unable to query data
 	let res = socket.send_message_query("SELECT VALUE name FROM user:1").await.unwrap();
-	// The query succeeds but the results does not contain the value with permissions
+	// The query succeeds but the results does not contain the value with
+	// permissions
 	assert_eq!(res[0]["status"], "OK", "result: {:?}", res);
 	assert_eq!(res[0]["result"], json!([]), "result: {:?}", res);
 	// Test passed
@@ -2098,7 +2098,7 @@ pub async fn rpc_capability(cfg_server: Option<Format>, cfg_format: Format) {
 			let res = res.unwrap();
 			assert!(res.is_object(), "result: {res:?}");
 			let res = res.as_object().unwrap();
-			assert_eq!(res["error"], json!({"code": -32000, "message": "Method not allowed"}));
+			assert_eq!(res["error"], json!({"code": -32602, "message": "Method not allowed"}));
 		}
 
 		// Test operations that SHOULD work with the provided capabilities
@@ -2146,34 +2146,20 @@ pub async fn rpc_capability(cfg_server: Option<Format>, cfg_format: Format) {
 					}
 				]),
 			),
-			socket.send_request(
-				"patch",
-				json!([
-					"tester:id",
-					[
-						{
-							"op": "add",
-							"path": "value",
-							"value": "bar"
-						},
-						{
-							"op": "remove",
-							"path": "name",
-						}
-					]
-				]),
-			),
 			socket.send_request("delete", json!(["tester"])),
 			socket.send_request("invalidate", json!([])),
 		];
-		for operation in operations_ok {
+		for (idx, operation) in operations_ok.into_iter().enumerate() {
 			let res = operation.await;
 			assert!(res.is_ok(), "result: {res:?}");
 			let res = res.unwrap();
 			assert!(res.is_object(), "result: {res:?}");
 			let res = res.as_object().unwrap();
 			// Verify response contains no error
-			assert!(res.keys().all(|k| ["id", "result"].contains(&k.as_str())), "result: {res:?}");
+			assert!(
+				res.keys().all(|k| ["id", "result"].contains(&k.as_str())),
+				"[{idx}] result: {res:?}"
+			);
 		}
 
 		// Test passed
@@ -2267,7 +2253,7 @@ pub async fn rpc_capability(cfg_server: Option<Format>, cfg_format: Format) {
 			let res = res.unwrap();
 			assert!(res.is_object(), "result: {res:?}");
 			let res = res.as_object().unwrap();
-			assert_eq!(res["error"], json!({"code": -32000, "message": "Method not allowed"}));
+			assert_eq!(res["error"], json!({"code": -32602, "message": "Method not allowed"}));
 		}
 
 		// Test operations that SHOULD work with the provided capabilities
@@ -2290,12 +2276,12 @@ pub async fn rpc_capability(cfg_server: Option<Format>, cfg_format: Format) {
 	}
 }
 
-/// A macro which defines a macro which can be used to define tests running the above functions
-/// with a set of given paramenters.
+/// A macro which defines a macro which can be used to define tests running the
+/// above functions with a set of given paramenters.
 macro_rules! define_include_tests {
 	( $( $( #[$m:meta] )* $test_name:ident),* $(,)? ) => {
 		macro_rules! include_tests {
-			($server:expr, $format:expr) => {
+			($server:expr_2021, $format:expr_2021) => {
 				$(
 					$(#[$m])*
 					async fn $test_name(){

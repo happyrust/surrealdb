@@ -1,6 +1,8 @@
+use anyhow::Result;
+
+use crate::catalog::providers::TableProvider;
 use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::dbs::Statement;
+use crate::dbs::{Options, Statement};
 use crate::doc::Document;
 use crate::err::Error;
 
@@ -10,7 +12,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Check if changed
 		if !self.changed() {
 			return Ok(());
@@ -22,9 +24,8 @@ impl Document {
 		// Get the record id
 		let rid = self.id()?;
 		// Get NS & DB
-		let (ns, db) = opt.ns_db()?;
-		// Store the record data
-		let key = crate::key::thing::new(ns, db, &rid.tb, &rid.id);
+		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
+
 		// Remove the id field from the doc so that it's not duplicated,
 		// because it's always present as a key in the underlying key-value
 		// datastore. When the doc is read from the datastore, the key is set
@@ -32,7 +33,7 @@ impl Document {
 		// The cloning of the doc is required because the resulting doc
 		// must be returned to the caller with the id present.
 		let mut doc_without_id = self.current.doc.clone();
-		if let crate::sql::Value::Object(obj) = doc_without_id.to_mut() {
+		if let crate::val::Value::Object(obj) = doc_without_id.to_mut() {
 			obj.0.remove("id");
 		}
 		// Match the statement type
@@ -49,13 +50,26 @@ impl Document {
 			Statement::Insert(_) if self.is_iteration_initial() => {
 				match ctx
 					.tx()
-					.put(key, revision::to_vec(doc_without_id.as_ref())?, opt.version)
+					.put_record(
+						ns,
+						db,
+						&rid.table,
+						&rid.key,
+						doc_without_id.into_read_only(),
+						opt.version,
+					)
 					.await
 				{
 					// The key already exists, so return an error
-					Err(Error::TxKeyAlreadyExists) => Err(Error::RecordExists {
-						thing: rid.as_ref().to_owned(),
-					}),
+					Err(e) => {
+						if matches!(e.downcast_ref(), Some(Error::TxKeyAlreadyExists)) {
+							Err(anyhow::Error::new(Error::RecordExists {
+								thing: rid.as_ref().to_owned(),
+							}))
+						} else {
+							Err(e)
+						}
+					}
 					// Return other values
 					x => x,
 				}
@@ -69,13 +83,26 @@ impl Document {
 			Statement::Upsert(_) if self.is_iteration_initial() => {
 				match ctx
 					.tx()
-					.put(key, revision::to_vec(doc_without_id.as_ref())?, opt.version)
+					.put_record(
+						ns,
+						db,
+						&rid.table,
+						&rid.key,
+						doc_without_id.into_read_only(),
+						opt.version,
+					)
 					.await
 				{
 					// The key already exists, so return an error
-					Err(Error::TxKeyAlreadyExists) => Err(Error::RecordExists {
-						thing: rid.as_ref().to_owned(),
-					}),
+					Err(e) => {
+						if matches!(e.downcast_ref(), Some(Error::TxKeyAlreadyExists)) {
+							Err(anyhow::Error::new(Error::RecordExists {
+								thing: rid.as_ref().to_owned(),
+							}))
+						} else {
+							Err(e)
+						}
+					}
 					// Return other values
 					x => x,
 				}
@@ -89,21 +116,43 @@ impl Document {
 			Statement::Create(_) => {
 				match ctx
 					.tx()
-					.put(key, revision::to_vec(doc_without_id.as_ref())?, opt.version)
+					.put_record(
+						ns,
+						db,
+						&rid.table,
+						&rid.key,
+						doc_without_id.into_read_only(),
+						opt.version,
+					)
 					.await
 				{
 					// The key already exists, so return an error
-					Err(Error::TxKeyAlreadyExists) => Err(Error::RecordExists {
-						thing: rid.as_ref().to_owned(),
-					}),
+					Err(e) => {
+						if matches!(e.downcast_ref(), Some(Error::TxKeyAlreadyExists)) {
+							Err(anyhow::Error::new(Error::RecordExists {
+								thing: rid.as_ref().to_owned(),
+							}))
+						} else {
+							Err(e)
+						}
+					}
 					x => x,
 				}
 			}
 			// Let's update the stored value for the specified key
-			_ => ctx.tx().set(key, revision::to_vec(doc_without_id.as_ref())?, opt.version).await,
+			_ => {
+				ctx.tx()
+					.set_record(
+						ns,
+						db,
+						&rid.table,
+						&rid.key,
+						doc_without_id.into_read_only(),
+						opt.version,
+					)
+					.await
+			}
 		}?;
-		// Update the cache
-		ctx.tx().set_record_cache(ns, db, &rid.tb, &rid.id, doc_without_id.as_arc())?;
 		// Carry on
 		Ok(())
 	}

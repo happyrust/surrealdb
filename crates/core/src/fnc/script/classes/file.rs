@@ -1,13 +1,13 @@
-use js::{class::Trace, JsLifetime};
+use js::JsLifetime;
+use js::class::Trace;
 
-use crate::sql::file;
+use crate::val;
 
 #[derive(Clone, Trace, JsLifetime)]
 #[js::class]
-#[non_exhaustive]
 pub struct File {
 	#[qjs(skip_trace)]
-	pub(crate) value: file::File,
+	pub(crate) value: val::File,
 }
 
 #[js::methods]
@@ -15,7 +15,7 @@ impl File {
 	#[qjs(constructor)]
 	pub fn new(bucket: String, key: String) -> Self {
 		Self {
-			value: file::File::new(bucket, key),
+			value: val::File::new(bucket, key),
 		}
 	}
 

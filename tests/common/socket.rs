@@ -1,26 +1,25 @@
-use super::format::Format;
-use crate::common::error::TestError;
+use std::collections::HashMap;
+use std::error::Error;
+use std::result::Result as StdResult;
+use std::time::Duration;
+
 use futures::channel::oneshot::channel;
 use futures_util::{SinkExt, TryStreamExt};
 use http::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
-use std::error::Error;
-use std::result::Result as StdResult;
-use std::time::Duration;
-use surrealdb::sql::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{
-	mpsc::{self, Receiver, Sender},
-	oneshot,
-};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::time;
 use tokio_stream::StreamExt;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, error};
+
+use super::format::Format;
+use crate::common::error::TestError;
 
 type Result<T> = StdResult<T, Box<dyn Error>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -105,7 +104,8 @@ impl Socket {
 		})
 	}
 
-	/// Connect to a WebSocket server using a specific format with custom headers
+	/// Connect to a WebSocket server using a specific format with custom
+	/// headers
 	pub async fn connect_with_headers(
 		addr: &str,
 		format: Option<Format>,
@@ -140,23 +140,19 @@ impl Socket {
 
 	fn to_msg(format: Format, message: &serde_json::Value) -> Result<Message> {
 		match format {
-			Format::Json => Ok(Message::Text(serde_json::to_string(message)?)),
+			Format::Json => Ok(Message::Text(serde_json::to_string(message)?.into())),
 			Format::Cbor => {
-				use surrealdb::rpc::format::cbor::Cbor;
 				// For tests we need to convert the serde_json::Value
 				// to a SurrealQL value, so that record ids, uuids,
 				// datetimes, and durations are stored properly.
 				// First of all we convert the JSON type to a string.
 				let json = message.to_string();
 				// Then we parse the JSON in to SurrealQL.
-				let surrealql = surrealdb::syn::value_legacy_strand(&json)?;
+				let surrealql = surrealdb_core::syn::value_legacy_strand(&json)?;
 				// Then we convert the SurrealQL in to CBOR.
-				let cbor = Cbor::try_from(surrealql)?;
-				// Then serialize the CBOR as binary data.
-				let mut output = Vec::new();
-				ciborium::into_writer(&cbor.0, &mut output).unwrap();
+				let cbor = surrealdb_core::rpc::format::cbor::encode(surrealql)?;
 				// THen output the message.
-				Ok(Message::Binary(output))
+				Ok(Message::Binary(cbor.into()))
 			}
 		}
 	}
@@ -178,15 +174,13 @@ impl Socket {
 				debug!("Response {msg:?}");
 				match format {
 					Format::Cbor => {
-						use surrealdb::rpc::format::cbor::Cbor;
 						// For tests we need to convert the binary data to
 						// a serde_json::Value so that test assertions work.
 						// First of all we deserialize the CBOR data.
-						let msg: ciborium::Value = ciborium::from_reader(&mut msg.as_slice())?;
 						// Then we convert it to a SurrealQL Value.
-						let msg: Value = Cbor(msg).try_into()?;
+						let msg = surrealdb_core::rpc::format::cbor::decode(msg.as_ref())?;
 						// Then we convert the SurrealQL to JSON.
-						let msg = msg.into_json();
+						let msg = msg.into_json_value();
 						// Then output the response.
 						debug!("Received message: {msg:?}");
 						Ok(Some(msg))
@@ -266,22 +260,24 @@ impl Socket {
 					};
 
 					// does the response have an id.
-					if let Some(sender) = res.get("id").and_then(|x| x.as_u64()).and_then(|x| awaiting.remove(&x)){
+					match res.get("id").and_then(|x| x.as_u64()).and_then(|x| awaiting.remove(&x)){ Some(sender) => {
 						let _ = sender.send(res);
-					}else if (other.send(res).await).is_err(){
+					} _ => if (other.send(res).await).is_err(){
 						 return Err("main thread quit unexpectedly".to_string().into())
-					 }
+					 }}
 				}
 			}
 		}
 	}
 
-	/// Send a text or binary message and receive a reponse from the WebSocket server
+	/// Send a text or binary message and receive a reponse from the WebSocket
+	/// server
 	pub async fn send_request(
 		&self,
 		method: &str,
 		params: serde_json::Value,
 	) -> Result<serde_json::Value> {
+		tracing::info!("Sending request: {method} {params:?}");
 		let (send, recv) = oneshot::channel();
 		if (self
 			.sender
@@ -303,7 +299,8 @@ impl Socket {
 	}
 
 	/// When testing Live Queries, we may receive multiple messages unordered.
-	/// This method captures all the expected messages before the given timeout. The result can be inspected later on to find the desired message.
+	/// This method captures all the expected messages before the given timeout.
+	/// The result can be inspected later on to find the desired message.
 	pub async fn receive_other_message(&mut self) -> Result<serde_json::Value> {
 		match self.other_messages.recv().await {
 			Some(x) => Ok(x),
@@ -380,7 +377,8 @@ impl Socket {
 		}
 	}
 
-	/// Send a signin authentication query message to the server and check the response
+	/// Send a signin authentication query message to the server and check the
+	/// response
 	pub async fn send_message_signin(
 		&mut self,
 		user: &str,

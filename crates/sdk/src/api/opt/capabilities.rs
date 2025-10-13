@@ -1,6 +1,7 @@
 //! The capabilities that can be enabled for a database instance
 
-use std::{collections::HashSet, mem};
+use std::collections::HashSet;
+use std::mem;
 
 use surrealdb_core::dbs::capabilities::{
 	Capabilities as CoreCapabilities, ExperimentalTarget, FuncTarget, ParseFuncTargetError,
@@ -38,43 +39,49 @@ impl From<&ExperimentalFeature> for ExperimentalTarget {
 /// - Functions: Whether or not users can execute certain functions
 /// - Network: Whether or not users can connect to certain network addresses
 ///
-/// Capabilities are configured globally. By default, capabilities are configured as:
+/// Capabilities are configured globally. By default, capabilities are
+/// configured as:
 /// - Scripting: false
 /// - Guest access: false
 /// - Functions: All functions are allowed
 /// - Network: No network address is allowed, all are impliticly denied
 ///
-/// The capabilities are defined using allow/deny lists for fine-grained control.
+/// The capabilities are defined using allow/deny lists for fine-grained
+/// control.
 ///
 /// # Filtering functions and net-targets.
 ///
 /// The filtering of net targets and functions is done with an allow/deny list.
 /// These list can either match everything, nothing or a given list.
 ///
-/// By default every function and net-target is disallowed. For a function or net target to be
-/// allowed it must match the allow-list and not match the deny-list. This means that if for
-/// example a function is both in the allow-list and in the deny-list it will be disallowed.
+/// By default every function and net-target is disallowed. For a function or
+/// net target to be allowed it must match the allow-list and not match the
+/// deny-list. This means that if for example a function is both in the
+/// allow-list and in the deny-list it will be disallowed.
 ///
-/// With the combination of both these lists you can filter subgroups. For example:
+/// With the combination of both these lists you can filter subgroups. For
+/// example:
 /// ```
 /// # use surrealdb::opt::capabilities::Capabilities;
 /// # fn cap() -> surrealdb::Result<Capabilities>{
 /// # let cap =
 /// Capabilities::none()
-///     .with_allow_function("http::*")?
-///     .with_deny_function("http::post")?
+///     .with_function_allowed("http::*")?
+///     .with_function_denied("http::post")?
 ///
 ///  # ;
 ///  # Ok(cap)
 /// # }
 /// ```
 ///
-/// Will allow all and only all `http::*` functions except the function `http::post`.
+/// Will allow all and only all `http::*` functions except the function
+/// `http::post`.
 ///
 /// Examples:
 /// - Allow all functions: `--allow-funcs`
 /// - Allow all functions except `http.*`: `--allow-funcs --deny-funcs 'http.*'`
-/// - Allow all network addresses except AWS metadata endpoint: `--allow-net --deny-net='169.254.169.254'`
+/// - Allow all network addresses except AWS metadata endpoint: `--allow-net
+///   --deny-net='169.254.169.254'`
 ///
 /// # Examples
 ///
@@ -84,12 +91,12 @@ impl From<&ExperimentalFeature> for ExperimentalTarget {
 /// # use surrealdb::opt::capabilities::Capabilities;
 /// # use surrealdb::opt::Config;
 /// # use surrealdb::Surreal;
-/// # use surrealdb::engine::local::File;
+/// # use surrealdb::engine::local::RocksDb;
 /// # #[tokio::main]
 /// # async fn main() -> surrealdb::Result<()> {
 /// let capabilities = Capabilities::all();
 /// let config = Config::default().capabilities(capabilities);
-/// let db = Surreal::new::<File>(("temp.db", config)).await?;
+/// let db = Surreal::new::<RocksDb>(("temp.db", config)).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -97,16 +104,16 @@ impl From<&ExperimentalFeature> for ExperimentalTarget {
 #[cfg_attr(feature = "kv-rocksdb", doc = "```no_run")]
 #[cfg_attr(not(feature = "kv-rocksdb"), doc = "```ignore")]
 /// # use std::str::FromStr;
-/// # use surrealdb::engine::local::File;
+/// # use surrealdb::engine::local::RocksDb;
 /// # use surrealdb::opt::capabilities::Capabilities;
 /// # use surrealdb::opt::Config;
 /// # use surrealdb::Surreal;
 /// # #[tokio::main]
 /// # async fn main() -> surrealdb::Result<()> {
 /// let capabilities = Capabilities::default()
-///     .with_deny_function("http::*")?;
+///     .with_function_denied("http::*")?;
 /// let config = Config::default().capabilities(capabilities);
-/// let db = Surreal::new::<File>(("temp.db", config)).await?;
+/// let db = Surreal::new::<RocksDb>(("temp.db", config)).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -125,7 +132,8 @@ impl Default for Capabilities {
 impl Capabilities {
 	/// Create a builder with default capabilities enabled.
 	///
-	/// Default capabilities enables live query notifications and all (non-scripting) functions.
+	/// Default capabilities enables live query notifications and all
+	/// (non-scripting) functions.
 	pub fn new() -> Self {
 		Capabilities {
 			cap: CoreCapabilities::default()
@@ -165,8 +173,8 @@ impl Capabilities {
 		}
 	}
 
-	/// Set whether to allow non-authenticated users to execute queries when authentication is
-	/// enabled.
+	/// Set whether to allow non-authenticated users to execute queries when
+	/// authentication is enabled.
 	pub fn with_guest_access(self, enabled: bool) -> Self {
 		Self {
 			cap: self.cap.with_guest_access(enabled),
@@ -192,12 +200,6 @@ impl Capabilities {
 		self
 	}
 
-	/// Set the allow list to allow all functions
-	#[deprecated(since = "2.3.0", note = "Use `with_all_functions_allowed` instead")]
-	pub fn with_allow_all_functions(self) -> Self {
-		self.with_all_functions_allowed()
-	}
-
 	/// Set the deny list to deny all functions
 	pub fn deny_all_functions(&mut self) -> &mut Self {
 		*self.cap.denied_functions_mut() = Targets::All;
@@ -210,12 +212,6 @@ impl Capabilities {
 		self
 	}
 
-	/// Set the deny list to deny all functions
-	#[deprecated(since = "2.3.0", note = "Use `with_all_functions_denied` instead")]
-	pub fn with_deny_all_functions(self) -> Self {
-		self.with_all_functions_denied()
-	}
-
 	/// Set the allow list to allow no function
 	pub fn allow_no_functions(&mut self) -> &mut Self {
 		*self.cap.allowed_functions_mut() = Targets::None;
@@ -223,21 +219,9 @@ impl Capabilities {
 	}
 
 	/// Set the allow list to allow no function
-	#[deprecated(since = "2.3.0", note = "Use `allow_no_functions` instead")]
-	pub fn allow_none_functions(&mut self) -> &mut Self {
-		self.allow_no_functions()
-	}
-
-	/// Set the allow list to allow no function
 	pub fn with_no_functions_allowed(mut self) -> Self {
 		self.allow_no_functions();
 		self
-	}
-
-	/// Set the allow list to allow no function
-	#[deprecated(since = "2.3.0", note = "Use `with_no_functions_allowed` instead")]
-	pub fn with_allow_none_functions(self) -> Self {
-		self.with_no_functions_allowed()
 	}
 
 	/// Set the deny list to deny no function
@@ -247,27 +231,15 @@ impl Capabilities {
 	}
 
 	/// Set the deny list to deny no function
-	#[deprecated(since = "2.3.0", note = "Use `deny_no_functions` instead")]
-	pub fn deny_none_functions(&mut self) -> &mut Self {
-		self.deny_no_functions()
-	}
-
-	/// Set the deny list to deny no function
 	pub fn with_no_functions_denied(mut self) -> Self {
 		self.deny_no_functions();
 		self
 	}
 
-	/// Set the deny list to deny no function
-	#[deprecated(since = "2.3.0", note = "Use `with_no_functions_denied` instead")]
-	pub fn with_deny_none_function(self) -> Self {
-		self.with_no_functions_denied()
-	}
-
 	/// Add a function to the allow lists
 	///
-	/// Adding a function to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding a function to the allow list overwrites previously set allow-all
+	/// or allow-none filters.
 	pub fn allow_function<S: AsRef<str>>(
 		&mut self,
 		func: S,
@@ -277,23 +249,14 @@ impl Capabilities {
 
 	/// Add a function to the allow lists
 	///
-	/// Adding a function to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding a function to the allow list overwrites previously set allow-all
+	/// or allow-none filters.
 	pub fn with_function_allowed<S: AsRef<str>>(
 		mut self,
 		func: S,
 	) -> Result<Self, ParseFuncTargetError> {
 		self.allow_function(func)?;
 		Ok(self)
-	}
-
-	/// Add a function to the allow lists
-	///
-	/// Adding a function to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
-	#[deprecated(since = "2.3.0", note = "Use `with_function_allowed` instead")]
-	pub fn with_allow_function<S: AsRef<str>>(self, func: S) -> Result<Self, ParseFuncTargetError> {
-		self.with_function_allowed(func)
 	}
 
 	fn allow_function_str(&mut self, s: &str) -> Result<&mut Self, ParseFuncTargetError> {
@@ -304,18 +267,17 @@ impl Capabilities {
 				set.insert(target);
 				self.cap = mem::take(&mut self.cap).with_functions(Targets::Some(set));
 			}
-			Targets::Some(ref mut x) => {
+			Targets::Some(x) => {
 				x.insert(target);
 			}
-			_ => unreachable!(),
 		}
 		Ok(self)
 	}
 
 	/// Add a function to the deny lists
 	///
-	/// Adding a function to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding a function to the deny list overwrites previously set deny-all or
+	/// deny-none filters.
 	pub fn deny_function<S: AsRef<str>>(
 		&mut self,
 		func: S,
@@ -325,23 +287,14 @@ impl Capabilities {
 
 	/// Add a function to the deny lists
 	///
-	/// Adding a function to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding a function to the deny list overwrites previously set deny-all or
+	/// deny-none filters.
 	pub fn with_function_denied<S: AsRef<str>>(
 		mut self,
 		func: S,
 	) -> Result<Self, ParseFuncTargetError> {
 		self.deny_function(func)?;
 		Ok(self)
-	}
-
-	/// Add a function to the deny lists
-	///
-	/// Adding a function to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
-	#[deprecated(since = "2.3.0", note = "Use `with_function_denied` instead")]
-	pub fn with_deny_function<S: AsRef<str>>(self, func: S) -> Result<Self, ParseFuncTargetError> {
-		self.with_function_denied(func)
 	}
 
 	fn deny_function_str(&mut self, s: &str) -> Result<&mut Self, ParseFuncTargetError> {
@@ -352,10 +305,9 @@ impl Capabilities {
 				set.insert(target);
 				*self.cap.denied_functions_mut() = Targets::Some(set);
 			}
-			Targets::Some(ref mut x) => {
+			Targets::Some(x) => {
 				x.insert(target);
 			}
-			_ => unreachable!(),
 		}
 		Ok(self)
 	}
@@ -372,12 +324,6 @@ impl Capabilities {
 		self
 	}
 
-	/// Set the allow list to allow all net targets
-	#[deprecated(since = "2.3.0", note = "Use `with_all_net_targets_allowed` instead")]
-	pub fn with_allow_all_net_targets(self) -> Self {
-		self.with_all_net_targets_allowed()
-	}
-
 	/// Set the deny list to deny all net targets
 	pub fn deny_all_net_targets(&mut self) -> &mut Self {
 		*self.cap.denied_network_targets_mut() = Targets::All;
@@ -390,12 +336,6 @@ impl Capabilities {
 		self
 	}
 
-	/// Set the deny list to deny all net targets
-	#[deprecated(since = "2.3.0", note = "Use `with_all_net_targets_denied` instead")]
-	pub fn with_deny_all_net_targets(self) -> Self {
-		self.with_all_net_targets_denied()
-	}
-
 	/// Set the allow list to allow no net targets
 	pub fn allow_no_net_targets(&mut self) -> &mut Self {
 		*self.cap.allowed_network_targets_mut() = Targets::None;
@@ -403,21 +343,9 @@ impl Capabilities {
 	}
 
 	/// Set the allow list to allow no net targets
-	#[deprecated(since = "2.3.0", note = "Use `allow_no_net_targets` instead")]
-	pub fn allow_none_net_targets(&mut self) -> &mut Self {
-		self.allow_no_net_targets()
-	}
-
-	/// Set the allow list to allow no net targets
 	pub fn with_no_net_targets_allowed(mut self) -> Self {
 		self.allow_no_net_targets();
 		self
-	}
-
-	/// Set the allow list to allow no net targets
-	#[deprecated(since = "2.3.0", note = "Use `with_no_net_targets_allowed` instead")]
-	pub fn with_allow_none_net_targets(self) -> Self {
-		self.with_no_net_targets_allowed()
 	}
 
 	/// Set the deny list to deny no net targets
@@ -427,28 +355,15 @@ impl Capabilities {
 	}
 
 	/// Set the deny list to deny no net targets
-	#[deprecated(since = "2.3.0", note = "Use `deny_no_net_targets` instead")]
-	pub fn deny_none_net_targets(&mut self) -> &mut Self {
-		self.deny_no_net_targets()
-	}
-
-	/// Set the deny list to deny no net targets
 	pub fn with_no_net_targets_denied(mut self) -> Self {
-		self.deny_no_net_targets();
-		self
-	}
-
-	/// Set the deny list to deny no net targets
-	#[deprecated(since = "2.3.0", note = "Use `with_no_net_targets_denied` instead")]
-	pub fn with_deny_none_net_target(mut self) -> Self {
 		self.deny_no_net_targets();
 		self
 	}
 
 	/// Add a net target to the allow lists
 	///
-	/// Adding a net target to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding a net target to the allow list overwrites previously set
+	/// allow-all or allow-none filters.
 	pub fn allow_net_target<S: AsRef<str>>(
 		&mut self,
 		func: S,
@@ -458,26 +373,14 @@ impl Capabilities {
 
 	/// Add a net target to the allow lists
 	///
-	/// Adding a net target to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding a net target to the allow list overwrites previously set
+	/// allow-all or allow-none filters.
 	pub fn with_net_target_allowed<S: AsRef<str>>(
 		mut self,
 		func: S,
 	) -> Result<Self, ParseNetTargetError> {
 		self.allow_net_target(func)?;
 		Ok(self)
-	}
-
-	/// Add a net target to the allow lists
-	///
-	/// Adding a net target to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
-	#[deprecated(since = "2.3.0", note = "Use `with_net_target_allowed` instead")]
-	pub fn with_allow_net_target<S: AsRef<str>>(
-		self,
-		func: S,
-	) -> Result<Self, ParseNetTargetError> {
-		self.with_net_target_allowed(func)
 	}
 
 	fn allow_net_target_str(&mut self, s: &str) -> Result<&mut Self, ParseNetTargetError> {
@@ -488,18 +391,17 @@ impl Capabilities {
 				set.insert(target);
 				*self.cap.allowed_network_targets_mut() = Targets::Some(set);
 			}
-			Targets::Some(ref mut x) => {
+			Targets::Some(x) => {
 				x.insert(target);
 			}
-			_ => unreachable!(),
 		}
 		Ok(self)
 	}
 
 	/// Add a net target to the deny lists
 	///
-	/// Adding a net target to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding a net target to the deny list overwrites previously set deny-all
+	/// or deny-none filters.
 	pub fn deny_net_target<S: AsRef<str>>(
 		&mut self,
 		func: S,
@@ -509,23 +411,14 @@ impl Capabilities {
 
 	/// Add a net target to the deny lists
 	///
-	/// Adding a net target to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding a net target to the deny list overwrites previously set deny-all
+	/// or deny-none filters.
 	pub fn with_net_target_denied<S: AsRef<str>>(
 		mut self,
 		func: S,
 	) -> Result<Self, ParseNetTargetError> {
 		self.deny_net_target(func)?;
 		Ok(self)
-	}
-
-	/// Add a net target to the deny lists
-	///
-	/// Adding a net target to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
-	#[deprecated(since = "2.3.0", note = "Use `with_net_target_denied` instead")]
-	pub fn with_deny_net_target<S: AsRef<str>>(self, func: S) -> Result<Self, ParseNetTargetError> {
-		self.with_net_target_denied(func)
 	}
 
 	fn deny_net_target_str(&mut self, s: &str) -> Result<&mut Self, ParseNetTargetError> {
@@ -536,10 +429,9 @@ impl Capabilities {
 				set.insert(target);
 				*self.cap.denied_network_targets_mut() = Targets::Some(set);
 			}
-			Targets::Some(ref mut x) => {
+			Targets::Some(x) => {
 				x.insert(target);
 			}
-			_ => unreachable!(),
 		}
 		Ok(self)
 	}
@@ -558,8 +450,8 @@ impl Capabilities {
 
 	/// Add a list of experimental features to the allow lists
 	///
-	/// Adding features to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding features to the allow list overwrites previously set allow-all or
+	/// allow-none filters.
 	pub fn allow_experimental_features(&mut self, features: &[ExperimentalFeature]) -> &mut Self {
 		let features = features.iter().map(ExperimentalTarget::from);
 		match self.cap.allowed_experimental_features_mut() {
@@ -571,15 +463,14 @@ impl Capabilities {
 			Targets::Some(set) => {
 				set.extend(features);
 			}
-			_ => unreachable!(),
 		}
 		self
 	}
 
 	/// Add a list of experimental features to the allow lists
 	///
-	/// Adding features to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding features to the allow list overwrites previously set allow-all or
+	/// allow-none filters.
 	pub fn with_experimental_features_allowed(mut self, features: &[ExperimentalFeature]) -> Self {
 		self.allow_experimental_features(features);
 		self
@@ -587,8 +478,8 @@ impl Capabilities {
 
 	/// Add an experimental feature to the allow lists
 	///
-	/// Adding a feature to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding a feature to the allow list overwrites previously set allow-all
+	/// or allow-none filters.
 	pub fn allow_experimental_feature(&mut self, feature: ExperimentalFeature) -> &mut Self {
 		let feature = ExperimentalTarget::from(&feature);
 		match self.cap.allowed_experimental_features_mut() {
@@ -600,15 +491,14 @@ impl Capabilities {
 			Targets::Some(set) => {
 				set.insert(feature);
 			}
-			_ => unreachable!(),
 		}
 		self
 	}
 
 	/// Add an experimental feature to the allow lists
 	///
-	/// Adding a feature to the allow list overwrites previously set allow-all or allow-none
-	/// filters.
+	/// Adding a feature to the allow list overwrites previously set allow-all
+	/// or allow-none filters.
 	pub fn with_experimental_feature_allowed(mut self, feature: ExperimentalFeature) -> Self {
 		self.allow_experimental_feature(feature);
 		self
@@ -640,8 +530,8 @@ impl Capabilities {
 
 	/// Add a list of experimental features to the deny lists
 	///
-	/// Adding features to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding features to the deny list overwrites previously set deny-all or
+	/// deny-none filters.
 	pub fn deny_experimental_features(&mut self, features: &[ExperimentalFeature]) -> &mut Self {
 		let features = features.iter().map(ExperimentalTarget::from);
 		match self.cap.denied_experimental_features_mut() {
@@ -653,15 +543,14 @@ impl Capabilities {
 			Targets::Some(set) => {
 				set.extend(features);
 			}
-			_ => unreachable!(),
 		}
 		self
 	}
 
 	/// Add a list of experimental features to the deny lists
 	///
-	/// Adding features to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding features to the deny list overwrites previously set deny-all or
+	/// deny-none filters.
 	pub fn with_experimental_features_denied(mut self, features: &[ExperimentalFeature]) -> Self {
 		self.deny_experimental_features(features);
 		self
@@ -669,8 +558,8 @@ impl Capabilities {
 
 	/// Add an experimental feature to the deny lists
 	///
-	/// Adding a feature to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding a feature to the deny list overwrites previously set deny-all or
+	/// deny-none filters.
 	pub fn deny_experimental_feature(&mut self, feature: ExperimentalFeature) -> &mut Self {
 		let feature = ExperimentalTarget::from(&feature);
 		match self.cap.denied_experimental_features_mut() {
@@ -682,15 +571,14 @@ impl Capabilities {
 			Targets::Some(set) => {
 				set.insert(feature);
 			}
-			_ => unreachable!(),
 		}
 		self
 	}
 
 	/// Add an experimental feature to the deny lists
 	///
-	/// Adding a feature to the deny list overwrites previously set deny-all or deny-none
-	/// filters.
+	/// Adding a feature to the deny list overwrites previously set deny-all or
+	/// deny-none filters.
 	pub fn with_experimental_feature_denied(mut self, feature: ExperimentalFeature) -> Self {
 		self.deny_experimental_feature(feature);
 		self

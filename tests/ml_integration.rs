@@ -4,15 +4,17 @@ mod common;
 #[cfg(feature = "ml")]
 mod ml_integration {
 
-	use super::*;
-	use http::{header, StatusCode};
-	use reqwest::Body;
-	use serde::{Deserialize, Serialize};
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
-	use surrealdb::ml::storage::stream_adapter::StreamAdapter;
+
+	use http::{StatusCode, header};
+	use reqwest::Body;
+	use serde::{Deserialize, Serialize};
+	use surrealdb_core::ml::storage::stream_adapter::StreamAdapter;
 	use test_log::test;
 	use ulid::Ulid;
+
+	use super::*;
 
 	#[derive(Serialize, Deserialize, Debug)]
 	struct ErrorResponse {

@@ -1,8 +1,9 @@
-use crate::cli::abstraction::OptionalDatabaseConnectionArguments;
-use crate::env::RELEASE;
-use crate::err::Error;
+use anyhow::Result;
 use clap::Args;
 use surrealdb::engine::any::connect;
+
+use crate::cli::abstraction::OptionalDatabaseConnectionArguments;
+use crate::env::RELEASE;
 
 #[derive(Args, Debug)]
 pub struct VersionCommandArguments {
@@ -16,7 +17,7 @@ pub async fn init(
 			endpoint,
 		},
 	}: VersionCommandArguments,
-) -> Result<(), Error> {
+) -> Result<()> {
 	// Print server version if endpoint supplied else CLI version
 	if let Some(e) = endpoint {
 		// Print remote server version
@@ -29,7 +30,7 @@ pub async fn init(
 	Ok(())
 }
 
-async fn get_server_version_string(endpoint: String) -> Result<String, Error> {
+async fn get_server_version_string(endpoint: String) -> Result<String> {
 	// Connect to the database engine
 	let client = connect(endpoint).await?;
 	// Query database version info

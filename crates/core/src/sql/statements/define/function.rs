@@ -1,94 +1,35 @@
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::doc::CursorDoc;
-use crate::err::Error;
-use crate::iam::{Action, ResourceKind};
-use crate::sql::fmt::{is_pretty, pretty_indent};
-use crate::sql::statements::info::InfoStructure;
-use crate::sql::{Base, Block, Ident, Kind, Permission, Strand, Value};
-
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Write};
 
-#[revisioned(revision = 4)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct DefineFunctionStatement {
-	pub name: Ident,
-	pub args: Vec<(Ident, Kind)>,
-	pub block: Block,
-	pub comment: Option<Strand>,
-	pub permissions: Permission,
-	#[revision(start = 2)]
-	pub if_not_exists: bool,
-	#[revision(start = 3)]
-	pub overwrite: bool,
-	#[revision(start = 4)]
-	pub returns: Option<Kind>,
-}
+use super::DefineKind;
+use crate::fmt::{EscapeIdent, is_pretty, pretty_indent};
+use crate::sql::{Block, Expr, Kind, Permission};
 
-impl DefineFunctionStatement {
-	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-		_doc: Option<&CursorDoc>,
-	) -> Result<Value, Error> {
-		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Function, &Base::Db)?;
-		// Fetch the transaction
-		let txn = ctx.tx();
-		// Check if the definition exists
-		let (ns, db) = opt.ns_db()?;
-		if txn.get_db_function(ns, db, &self.name).await.is_ok() {
-			if self.if_not_exists {
-				return Ok(Value::None);
-			} else if !self.overwrite {
-				return Err(Error::FcAlreadyExists {
-					name: self.name.to_string(),
-				});
-			}
-		}
-		// Process the statement
-		let key = crate::key::database::fc::new(ns, db, &self.name);
-		txn.get_or_add_ns(ns, opt.strict).await?;
-		txn.get_or_add_db(ns, db, opt.strict).await?;
-		txn.set(
-			key,
-			revision::to_vec(&DefineFunctionStatement {
-				// Don't persist the `IF NOT EXISTS` clause to schema
-				if_not_exists: false,
-				overwrite: false,
-				..self.clone()
-			})?,
-			None,
-		)
-		.await?;
-		// Clear the cache
-		txn.clear();
-		// Ok all good
-		Ok(Value::None)
-	}
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub(crate) struct DefineFunctionStatement {
+	pub kind: DefineKind,
+	pub name: String,
+	pub args: Vec<(String, Kind)>,
+	pub block: Block,
+	pub comment: Option<Expr>,
+	pub permissions: Permission,
+	pub returns: Option<Kind>,
 }
 
 impl fmt::Display for DefineFunctionStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "DEFINE FUNCTION")?;
-		if self.if_not_exists {
-			write!(f, " IF NOT EXISTS")?
+		match self.kind {
+			DefineKind::Default => {}
+			DefineKind::Overwrite => write!(f, " OVERWRITE")?,
+			DefineKind::IfNotExists => write!(f, " IF NOT EXISTS")?,
 		}
-		if self.overwrite {
-			write!(f, " OVERWRITE")?
-		}
-		write!(f, " fn::{}(", self.name.0)?;
+		write!(f, " fn::{}(", &self.name)?;
 		for (i, (name, kind)) in self.args.iter().enumerate() {
 			if i > 0 {
 				f.write_str(", ")?;
 			}
-			write!(f, "${name}: {kind}")?;
+			write!(f, "${}: {kind}", EscapeIdent(name))?;
 		}
 		f.write_str(") ")?;
 		if let Some(ref v) = self.returns {
@@ -96,7 +37,7 @@ impl fmt::Display for DefineFunctionStatement {
 		}
 		Display::fmt(&self.block, f)?;
 		if let Some(ref v) = self.comment {
-			write!(f, " COMMENT {v}")?
+			write!(f, " COMMENT {}", v)?
 		}
 		let _indent = if is_pretty() {
 			Some(pretty_indent())
@@ -109,19 +50,30 @@ impl fmt::Display for DefineFunctionStatement {
 	}
 }
 
-impl InfoStructure for DefineFunctionStatement {
-	fn structure(self) -> Value {
-		Value::from(map! {
-			"name".to_string() => self.name.structure(),
-			"args".to_string() => self.args
-				.into_iter()
-				.map(|(n, k)| vec![n.structure(), k.structure()].into())
-				.collect::<Vec<Value>>()
-				.into(),
-			"block".to_string() => self.block.structure(),
-			"permissions".to_string() => self.permissions.structure(),
-			"comment".to_string(), if let Some(v) = self.comment => v.into(),
-			"returns".to_string(), if let Some(v) = self.returns => v.structure(),
-		})
+impl From<DefineFunctionStatement> for crate::expr::statements::DefineFunctionStatement {
+	fn from(v: DefineFunctionStatement) -> Self {
+		Self {
+			kind: v.kind.into(),
+			name: v.name,
+			args: v.args.into_iter().map(|(i, k)| (i, k.into())).collect(),
+			block: v.block.into(),
+			comment: v.comment.map(|x| x.into()),
+			permissions: v.permissions.into(),
+			returns: v.returns.map(Into::into),
+		}
+	}
+}
+
+impl From<crate::expr::statements::DefineFunctionStatement> for DefineFunctionStatement {
+	fn from(v: crate::expr::statements::DefineFunctionStatement) -> Self {
+		Self {
+			kind: v.kind.into(),
+			name: v.name,
+			args: v.args.into_iter().map(|(i, k)| (i, k.into())).collect(),
+			block: v.block.into(),
+			comment: v.comment.map(|x| x.into()),
+			permissions: v.permissions.into(),
+			returns: v.returns.map(Into::into),
+		}
 	}
 }

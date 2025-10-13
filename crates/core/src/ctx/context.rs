@@ -1,49 +1,62 @@
-use crate::buc::store::ObjectStore;
-use crate::buc::{self, BucketConnectionKey, BucketConnections};
-use crate::cnf::PROTECTED_PARAM_NAMES;
-use crate::ctx::canceller::Canceller;
-use crate::ctx::reason::Reason;
-#[cfg(feature = "http")]
-use crate::dbs::capabilities::NetTarget;
-use crate::dbs::{Capabilities, Notification};
-use crate::err::Error;
-use crate::idx::planner::executor::QueryExecutor;
-use crate::idx::planner::{IterationStage, QueryPlanner};
-use crate::idx::trees::store::IndexStores;
-use crate::kvs::cache::ds::DatastoreCache;
-use crate::kvs::sequences::Sequences;
-#[cfg(not(target_family = "wasm"))]
-use crate::kvs::IndexBuilder;
-use crate::kvs::Transaction;
-use crate::mem::ALLOC;
-use crate::sql::value::Value;
-use async_channel::Sender;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 #[cfg(storage)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use anyhow::{Result, bail};
+use async_channel::Sender;
 use trice::Instant;
 #[cfg(feature = "http")]
 use url::Url;
 
+use crate::buc::store::ObjectStore;
+use crate::buc::{self, BucketConnectionKey, BucketConnections};
+use crate::catalog::providers::{
+	BucketProvider, CatalogProvider, DatabaseProvider, NamespaceProvider,
+};
+use crate::catalog::{DatabaseDefinition, DatabaseId, NamespaceId};
+use crate::cnf::PROTECTED_PARAM_NAMES;
+use crate::ctx::canceller::Canceller;
+use crate::ctx::reason::Reason;
+#[cfg(feature = "http")]
+use crate::dbs::capabilities::NetTarget;
+use crate::dbs::{Capabilities, Options, Session, Variables};
+use crate::err::Error;
+use crate::idx::planner::executor::QueryExecutor;
+use crate::idx::planner::{IterationStage, QueryPlanner};
+use crate::idx::trees::store::IndexStores;
+#[cfg(not(target_family = "wasm"))]
+use crate::kvs::IndexBuilder;
+use crate::kvs::Transaction;
+use crate::kvs::cache::ds::DatastoreCache;
+use crate::kvs::sequences::Sequences;
+use crate::kvs::slowlog::SlowLog;
+use crate::mem::ALLOC;
+use crate::sql::expression::convert_public_value_to_internal;
+use crate::types::{PublicNotification, PublicVariables};
+use crate::val::Value;
+
 pub type Context = Arc<MutableContext>;
 
-#[non_exhaustive]
 pub struct MutableContext {
 	// An optional parent context.
 	parent: Option<Context>,
 	// An optional deadline.
 	deadline: Option<Instant>,
+	// An optional slow log configuration used by the executor to log statements
+	// that exceed a given duration threshold. This configuration is propagated
+	// from the datastore into the context for the lifetime of a request.
+	slow_log: Option<SlowLog>,
 	// Whether or not this context is cancelled.
 	cancelled: Arc<AtomicBool>,
 	// A collection of read only values stored in this context.
 	values: HashMap<Cow<'static, str>, Arc<Value>>,
 	// Stores the notification channel if available
-	notifications: Option<Sender<Notification>>,
+	notifications: Option<Sender<PublicNotification>>,
 	// An optional query planner
 	query_planner: Option<Arc<QueryPlanner>>,
 	// An optional query executor
@@ -104,6 +117,7 @@ impl MutableContext {
 			values: HashMap::default(),
 			parent: None,
 			deadline: None,
+			slow_log: None,
 			cancelled: Arc::new(AtomicBool::new(false)),
 			notifications: None,
 			query_planner: None,
@@ -128,6 +142,7 @@ impl MutableContext {
 		MutableContext {
 			values: HashMap::default(),
 			deadline: parent.deadline,
+			slow_log: parent.slow_log.clone(),
 			cancelled: Arc::new(AtomicBool::new(false)),
 			notifications: parent.notifications.clone(),
 			query_planner: parent.query_planner.clone(),
@@ -155,6 +170,7 @@ impl MutableContext {
 		Self {
 			values: HashMap::default(),
 			deadline: parent.deadline,
+			slow_log: parent.slow_log.clone(),
 			cancelled: Arc::new(AtomicBool::new(false)),
 			notifications: parent.notifications.clone(),
 			query_planner: parent.query_planner.clone(),
@@ -183,6 +199,7 @@ impl MutableContext {
 		Self {
 			values: HashMap::default(),
 			deadline: None,
+			slow_log: from.slow_log.clone(),
 			cancelled: Arc::new(AtomicBool::new(false)),
 			notifications: from.notifications.clone(),
 			query_planner: from.query_planner.clone(),
@@ -203,9 +220,10 @@ impl MutableContext {
 	}
 
 	/// Creates a new context from a configured datastore.
-	#[allow(clippy::too_many_arguments)]
+	#[expect(clippy::too_many_arguments)]
 	pub(crate) fn from_ds(
 		time_out: Option<Duration>,
+		slow_log: Option<SlowLog>,
 		capabilities: Arc<Capabilities>,
 		index_stores: IndexStores,
 		#[cfg(not(target_family = "wasm"))] index_builder: IndexBuilder,
@@ -213,11 +231,12 @@ impl MutableContext {
 		cache: Arc<DatastoreCache>,
 		#[cfg(storage)] temporary_directory: Option<Arc<PathBuf>>,
 		buckets: Arc<BucketConnections>,
-	) -> Result<MutableContext, Error> {
+	) -> Result<MutableContext> {
 		let mut ctx = Self {
 			values: HashMap::default(),
 			parent: None,
 			deadline: None,
+			slow_log,
 			cancelled: Arc::new(AtomicBool::new(false)),
 			notifications: None,
 			query_planner: None,
@@ -247,9 +266,78 @@ impl MutableContext {
 	}
 
 	/// Unfreezes this context, allowing it to be edited and configured.
-	pub(crate) fn unfreeze(ctx: Context) -> Result<MutableContext, Error> {
-		Arc::into_inner(ctx)
-			.ok_or_else(|| fail!("Tried to unfreeze a Context with multiple references"))
+	pub(crate) fn unfreeze(ctx: Context) -> Result<MutableContext> {
+		let Some(x) = Arc::into_inner(ctx) else {
+			fail!("Tried to unfreeze a Context with multiple references")
+		};
+		Ok(x)
+	}
+
+	/// Get the namespace id for the current context.
+	/// If the namespace does not exist, it will be try to be created based on
+	/// the `strict` option.
+	pub(crate) async fn get_ns_id(&self, opt: &Options) -> Result<NamespaceId> {
+		let ns = opt.ns()?;
+		let ns_def = self.tx().get_or_add_ns(ns, opt.strict).await?;
+		Ok(ns_def.namespace_id)
+	}
+
+	/// Get the namespace id for the current context.
+	/// If the namespace does not exist, it will return an error.
+	pub(crate) async fn expect_ns_id(&self, opt: &Options) -> Result<NamespaceId> {
+		let ns = opt.ns()?;
+		let Some(ns_def) = self.tx().get_ns_by_name(ns).await? else {
+			return Err(Error::NsNotFound {
+				name: ns.to_string(),
+			}
+			.into());
+		};
+		Ok(ns_def.namespace_id)
+	}
+
+	/// Get the namespace and database ids for the current context.
+	/// If the namespace or database does not exist, it will be try to be
+	/// created based on the `strict` option.
+	pub(crate) async fn get_ns_db_ids(&self, opt: &Options) -> Result<(NamespaceId, DatabaseId)> {
+		let (ns, db) = opt.ns_db()?;
+		let db_def = self.tx().ensure_ns_db(ns, db, opt.strict).await?;
+		Ok((db_def.namespace_id, db_def.database_id))
+	}
+
+	/// Get the namespace and database ids for the current context.
+	/// If the namespace or database does not exist, it will be try to be
+	/// created based on the `strict` option.
+	pub(crate) async fn try_ns_db_ids(
+		&self,
+		opt: &Options,
+	) -> Result<Option<(NamespaceId, DatabaseId)>> {
+		let (ns, db) = opt.ns_db()?;
+		let Some(db_def) = self.tx().get_db_by_name(ns, db).await? else {
+			return Ok(None);
+		};
+		Ok(Some((db_def.namespace_id, db_def.database_id)))
+	}
+
+	/// Get the namespace and database ids for the current context.
+	/// If the namespace or database does not exist, it will return an error.
+	pub(crate) async fn expect_ns_db_ids(
+		&self,
+		opt: &Options,
+	) -> Result<(NamespaceId, DatabaseId)> {
+		let (ns, db) = opt.ns_db()?;
+		let Some(db_def) = self.tx().get_db_by_name(ns, db).await? else {
+			return Err(Error::DbNotFound {
+				name: db.to_string(),
+			}
+			.into());
+		};
+		Ok((db_def.namespace_id, db_def.database_id))
+	}
+
+	pub(crate) async fn get_db(&self, opt: &Options) -> Result<Arc<DatabaseDefinition>> {
+		let (ns, db) = opt.ns_db()?;
+		let db_def = self.tx().ensure_ns_db(ns, db, opt.strict).await?;
+		Ok(db_def)
 	}
 
 	/// Add a value to the context. It overwrites any previously set values
@@ -303,7 +391,7 @@ impl MutableContext {
 
 	/// Add the LIVE query notification channel to the context, so that we
 	/// can send notifications to any subscribers.
-	pub(crate) fn add_notifications(&mut self, chn: Option<&Sender<Notification>>) {
+	pub(crate) fn add_notifications(&mut self, chn: Option<&Sender<PublicNotification>>) {
 		self.notifications = chn.cloned()
 	}
 
@@ -311,6 +399,11 @@ impl MutableContext {
 		self.query_planner = Some(Arc::new(qp));
 	}
 
+	/// Cache a table-specific QueryExecutor in the Context.
+	///
+	/// This is set by the collector/processor when iterating over a specific
+	/// table or index so that downstream per-record operations can access the
+	/// executor without repeatedly looking it up from the QueryPlanner.
 	pub(crate) fn set_query_executor(&mut self, qe: QueryExecutor) {
 		self.query_executor = Some(qe);
 	}
@@ -335,7 +428,13 @@ impl MutableContext {
 		self.deadline.map(|v| v.saturating_duration_since(Instant::now()))
 	}
 
-	pub(crate) fn notifications(&self) -> Option<Sender<Notification>> {
+	/// Returns the slow log configuration, if any, attached to this context.
+	/// The executor consults this to decide whether to emit slow-query log lines.
+	pub(crate) fn slow_log(&self) -> Option<&SlowLog> {
+		self.slow_log.as_ref()
+	}
+
+	pub(crate) fn notifications(&self) -> Option<Sender<PublicNotification>> {
 		self.notifications.clone()
 	}
 
@@ -347,6 +446,8 @@ impl MutableContext {
 		self.query_planner.as_ref().map(|qp| qp.as_ref())
 	}
 
+	/// Get the cached QueryExecutor (if any) attached by the current iteration
+	/// context.
 	pub(crate) fn get_query_executor(&self) -> Option<&QueryExecutor> {
 		self.query_executor.as_ref()
 	}
@@ -371,6 +472,14 @@ impl MutableContext {
 		self.sequences.as_ref()
 	}
 
+	pub(crate) fn try_get_sequences(&self) -> Result<&Sequences> {
+		if let Some(sqs) = self.get_sequences() {
+			Ok(sqs)
+		} else {
+			bail!(Error::Internal("Sequences are not supported in this context.".to_string(),))
+		}
+	}
+
 	// Get the current datastore cache
 	pub(crate) fn get_cache(&self) -> Option<Arc<DatastoreCache>> {
 		self.cache.clone()
@@ -384,7 +493,7 @@ impl MutableContext {
 	/// We may not want to check for the deadline on every call.
 	/// An iteration loop may want to check it every 10 or 100 calls.
 	/// Eg.: ctx.done(count % 100 == 0)
-	pub(crate) fn done(&self, deep_check: bool) -> Result<Option<Reason>, Error> {
+	pub(crate) fn done(&self, deep_check: bool) -> Result<Option<Reason>> {
 		match self.deadline {
 			Some(deadline) if deep_check && deadline <= Instant::now() => {
 				Ok(Some(Reason::Timedout))
@@ -392,7 +501,7 @@ impl MutableContext {
 			_ if self.cancelled.load(Ordering::Relaxed) => Ok(Some(Reason::Canceled)),
 			_ => {
 				if deep_check && ALLOC.is_beyond_threshold() {
-					return Err(Error::QueryBeyondMemoryThreshold);
+					bail!(Error::QueryBeyondMemoryThreshold);
 				}
 				match &self.parent {
 					Some(ctx) => ctx.done(deep_check),
@@ -403,7 +512,7 @@ impl MutableContext {
 	}
 
 	/// Check if the context is ok to continue.
-	pub(crate) async fn is_ok(&self, deep_check: bool) -> Result<bool, Error> {
+	pub(crate) async fn is_ok(&self, deep_check: bool) -> Result<bool> {
 		if deep_check {
 			yield_now!();
 		}
@@ -412,9 +521,9 @@ impl MutableContext {
 
 	/// Check if there is some reason to stop processing the current query.
 	///
-	/// Returns true when the query is canceled or if check_deadline is true when the query
-	/// deadline is met.
-	pub(crate) async fn is_done(&self, deep_check: bool) -> Result<bool, Error> {
+	/// Returns true when the query is canceled or if check_deadline is true
+	/// when the query deadline is met.
+	pub(crate) async fn is_done(&self, deep_check: bool) -> Result<bool> {
 		if deep_check {
 			yield_now!();
 		}
@@ -422,7 +531,7 @@ impl MutableContext {
 	}
 
 	/// Check if the context is not ok to continue, because it timed out.
-	pub(crate) async fn is_timedout(&self) -> Result<bool, Error> {
+	pub(crate) async fn is_timedout(&self) -> Result<bool> {
 		yield_now!();
 		Ok(matches!(self.done(true)?, Some(Reason::Timedout)))
 	}
@@ -457,6 +566,43 @@ impl MutableContext {
 		)
 	}
 
+	/// Attach a session to the context and add any session variables to the
+	/// context.
+	pub(crate) fn attach_session(&mut self, session: &Session) -> Result<(), Error> {
+		self.add_values(session.values());
+		if !session.variables.is_empty() {
+			self.attach_variables(session.variables.clone().into())?;
+		}
+		Ok(())
+	}
+
+	/// Attach variables to the context.
+	pub(crate) fn attach_variables(&mut self, vars: Variables) -> Result<(), Error> {
+		for (key, val) in vars {
+			if PROTECTED_PARAM_NAMES.contains(&key.as_str()) {
+				return Err(Error::InvalidParam {
+					name: key.clone(),
+				});
+			}
+			self.add_value(key, val.into());
+		}
+		Ok(())
+	}
+
+	pub(crate) fn attach_public_variables(&mut self, vars: PublicVariables) -> Result<(), Error> {
+		for (key, val) in vars {
+			if PROTECTED_PARAM_NAMES.contains(&key.as_str()) {
+				return Err(Error::InvalidParam {
+					name: key.clone(),
+				});
+			}
+
+			let internal_val = convert_public_value_to_internal(val);
+			self.add_value(key, Arc::new(internal_val));
+		}
+		Ok(())
+	}
+
 	//
 	// Capabilities
 	//
@@ -473,41 +619,96 @@ impl MutableContext {
 
 	/// Check if scripting is allowed
 	#[cfg_attr(not(feature = "scripting"), expect(dead_code))]
-	pub(crate) fn check_allowed_scripting(&self) -> Result<(), Error> {
+	pub(crate) fn check_allowed_scripting(&self) -> Result<()> {
 		if !self.capabilities.allows_scripting() {
 			warn!("Capabilities denied scripting attempt");
-			return Err(Error::ScriptingNotAllowed);
+			bail!(Error::ScriptingNotAllowed);
 		}
 		trace!("Capabilities allowed scripting");
 		Ok(())
 	}
 
 	/// Check if a function is allowed
-	pub(crate) fn check_allowed_function(&self, target: &str) -> Result<(), Error> {
+	pub(crate) fn check_allowed_function(&self, target: &str) -> Result<()> {
 		if !self.capabilities.allows_function_name(target) {
 			warn!("Capabilities denied function execution attempt, target: '{target}'");
-			return Err(Error::FunctionNotAllowed(target.to_string()));
+			bail!(Error::FunctionNotAllowed(target.to_string()));
 		}
 		trace!("Capabilities allowed function execution, target: '{target}'");
 		Ok(())
 	}
 
-	/// Check if a network target is allowed
+	/// Checks if the provided URL's network target is allowed based on current
+	/// capabilities.
+	///
+	/// This function performs a validation to ensure that the outgoing network
+	/// connection specified by the provided `url` is permitted. It checks the
+	/// resolved network targets associated with the URL and ensures that all
+	/// targets adhere to the configured capabilities.
+	///
+	/// # Features
+	/// The function is only available if the `http` feature is enabled.
+	///
+	/// # Parameters
+	/// - `url`: A reference to a [`Url`] object representing the target endpoint to check.
+	///
+	/// # Returns
+	/// This function returns a [`Result<()>`]:
+	/// - On success, it returns `Ok(())` indicating the network target is allowed.
+	/// - On failure, it returns an error wrapped in the [`Error`] type:
+	///   - `NetTargetNotAllowed` if the target is not permitted.
+	///   - `InvalidUrl` if the provided URL is invalid.
+	///
+	/// # Behavior
+	/// 1. Extracts the host and port information from the URL.
+	/// 2. Constructs a [`NetTarget`] object and checks if it is allowed by the current network
+	///    capabilities.
+	/// 3. If the network target resolves to multiple targets (e.g., DNS resolution), each target is
+	///    validated individually.
+	/// 4. Logs a warning and prevents the connection if the target is denied by the capabilities.
+	///
+	/// # Logging
+	/// - Logs a warning message if the network target is denied.
+	/// - Logs a trace message if the network target is permitted.
+	///
+	/// # Errors
+	/// - `NetTargetNotAllowed`: Returned if any of the resolved targets are not allowed.
+	/// - `InvalidUrl`: Returned if the URL does not have a valid host.
 	#[cfg(feature = "http")]
-	pub(crate) fn check_allowed_net(&self, url: &Url) -> Result<(), Error> {
+	pub(crate) async fn check_allowed_net(&self, url: &Url) -> Result<()> {
+		let match_any_deny_net = |t| {
+			if self.capabilities.matches_any_deny_net(t) {
+				warn!("Capabilities denied outgoing network connection attempt, target: '{t}'");
+				bail!(Error::NetTargetNotAllowed(t.to_string()));
+			}
+			Ok(())
+		};
 		match url.host() {
 			Some(host) => {
-				let target = &NetTarget::Host(host.to_owned(), url.port_or_known_default());
-				if !self.capabilities.allows_network_target(target) {
+				let target = NetTarget::Host(host.to_owned(), url.port_or_known_default());
+				// Check the domain name (if any) matches the allow list
+				let host_allowed = self.capabilities.matches_any_allow_net(&target);
+				if !host_allowed {
 					warn!(
 						"Capabilities denied outgoing network connection attempt, target: '{target}'"
 					);
-					return Err(Error::NetTargetNotAllowed(target.to_string()));
+					bail!(Error::NetTargetNotAllowed(target.to_string()));
+				}
+				// Check against the deny list
+				match_any_deny_net(&target)?;
+				// Resolve the domain name to a vector of IP addresses
+				#[cfg(not(target_family = "wasm"))]
+				let targets = target.resolve().await?;
+				#[cfg(target_family = "wasm")]
+				let targets = target.resolve()?;
+				for t in &targets {
+					// For each IP address resolved, check it is allowed
+					match_any_deny_net(t)?;
 				}
 				trace!("Capabilities allowed outgoing network connection, target: '{target}'");
 				Ok(())
 			}
-			_ => Err(Error::InvalidUrl(url.to_string())),
+			_ => bail!(Error::InvalidUrl(url.to_string())),
 		}
 	}
 
@@ -518,10 +719,10 @@ impl MutableContext {
 	/// Obtain the connection for a bucket
 	pub(crate) async fn get_bucket_store(
 		&self,
-		ns: &str,
-		db: &str,
+		ns: NamespaceId,
+		db: DatabaseId,
 		bu: &str,
-	) -> Result<Arc<dyn ObjectStore>, Error> {
+	) -> Result<Arc<dyn ObjectStore>> {
 		// Do we have a buckets context?
 		if let Some(buckets) = &self.buckets {
 			// Attempt to obtain an existing bucket connection
@@ -531,7 +732,7 @@ impl MutableContext {
 			} else {
 				// Obtain the bucket definition
 				let tx = self.tx();
-				let bd = tx.get_db_bucket(ns, db, bu).await?;
+				let bd = tx.expect_db_bucket(ns, db, bu).await?;
 
 				// Connect to the bucket
 				let store = if let Some(ref backend) = bd.backend {
@@ -545,7 +746,39 @@ impl MutableContext {
 				Ok(store)
 			}
 		} else {
-			Err(Error::BucketUnavailable(bu.into()))
+			bail!(Error::BucketUnavailable(bu.into()))
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	#[cfg(feature = "http")]
+	use std::str::FromStr;
+
+	#[cfg(feature = "http")]
+	use url::Url;
+
+	#[cfg(feature = "http")]
+	use crate::ctx::MutableContext;
+	#[cfg(feature = "http")]
+	use crate::dbs::Capabilities;
+	#[cfg(feature = "http")]
+	use crate::dbs::capabilities::{NetTarget, Targets};
+
+	#[cfg(feature = "http")]
+	#[tokio::test]
+	async fn test_context_check_allowed_net() {
+		let cap = Capabilities::all().without_network_targets(Targets::Some(
+			[NetTarget::from_str("127.0.0.1").unwrap()].into(),
+		));
+		let mut ctx = MutableContext::background();
+		ctx.capabilities = cap.into();
+		let ctx = ctx.freeze();
+		let r = ctx.check_allowed_net(&Url::parse("http://localhost").unwrap()).await;
+		assert_eq!(
+			r.err().unwrap().to_string(),
+			"Access to network target '127.0.0.1/32' is not allowed"
+		);
 	}
 }

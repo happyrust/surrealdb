@@ -1,17 +1,15 @@
 use std::any::Any;
-use std::collections::BTreeMap;
 
-use super::cmp::{RoughlyEq, RoughlyEqConfig};
-use crate::tests::schema::{self, TestConfig};
-use crate::tests::{
-	schema::{BoolOr, TestDetailsResults},
-	set::TestId,
-	TestSet,
-};
 use surrealdb_core::dbs::Session;
 use surrealdb_core::kvs::Datastore;
-use surrealdb_core::sql::Value as SurValue;
 use surrealdb_core::syn::error::RenderedError;
+use surrealdb_types::Variables;
+use surrealdb_types::Value as SurValue;
+
+use super::cmp::{RoughlyEq, RoughlyEqConfig};
+use crate::tests::TestSet;
+use crate::tests::schema::{self, BoolOr, TestConfig, TestDetailsResults};
+use crate::tests::set::TestId;
 
 mod display;
 mod update;
@@ -20,6 +18,8 @@ mod update;
 pub enum TestTaskResult {
 	ParserError(RenderedError),
 	RunningError(anyhow::Error),
+	SignupError(anyhow::Error),
+	SigninError(anyhow::Error),
 	Import(String, String),
 	Timeout,
 	Results(Vec<Result<SurValue, String>>),
@@ -48,19 +48,13 @@ pub enum TestError {
 pub enum TestOutputs {
 	Values(Vec<Result<SurValue, String>>),
 	ParsingError(String),
+	SigninError(String),
+	SignupError(String),
 }
 
-pub enum TypeMismatchReport {
-	/// Expected a parsing error but got values
-	ExpectedParsingError {
-		got: Vec<Result<SurValue, String>>,
-		expected: Option<String>,
-	},
-	/// Expected a value but got a parsing error.
-	ExpectedValues {
-		got: String,
-		expected: Option<Vec<TestValueExpectation>>,
-	},
+pub struct ResultTypeMismatchReport {
+	pub got: TestOutputs,
+	pub expected: TestExpectation,
 }
 
 pub struct Mismatch {
@@ -115,7 +109,7 @@ pub enum MatcherMismatch {
 	},
 	/// Running the matcher returned false
 	Failed {
-		matcher: SurValue,
+		matcher: String,
 		value: Result<SurValue, String>,
 	},
 	/// The test returned a value when an error was expected
@@ -142,9 +136,17 @@ pub enum TestReportKind {
 	/// Test completed and results matched,
 	Valid,
 	/// Test return the wrong type of output.
-	MismatchedType(TypeMismatchReport),
+	MismatchedType(ResultTypeMismatchReport),
 	/// Test returned an invalid parsing output.
 	MismatchedParsing {
+		got: String,
+		expected: String,
+	},
+	MismatchedSignin {
+		got: String,
+		expected: String,
+	},
+	MismatchedSignup {
 		got: String,
 		expected: String,
 	},
@@ -167,7 +169,7 @@ pub enum MatchValueType {
 #[derive(Clone)]
 pub struct MatcherExpectation {
 	matcher_value_type: MatchValueType,
-	value: SurValue,
+	value_str: String,
 }
 
 #[derive(Clone)]
@@ -178,22 +180,23 @@ pub enum TestValueExpectation {
 }
 
 pub enum TestExpectation {
-	Unspecified,
 	Parsing(Option<String>),
 	Values(Option<Vec<TestValueExpectation>>),
+	Signin(Option<String>),
+	Signup(Option<String>),
 }
 
 impl TestExpectation {
-	pub fn from_test_config(config: &TestConfig) -> Self {
+	pub fn from_test_config(config: &TestConfig) -> Option<Self> {
 		let Some(details) = config.test.as_ref() else {
-			return TestExpectation::Unspecified;
+			return None;
 		};
 
 		let Some(results) = details.results.as_ref() else {
-			return TestExpectation::Unspecified;
+			return None;
 		};
 
-		match results {
+		let res = match results {
 			TestDetailsResults::QueryResult(r) => {
 				let v = r
 					.iter()
@@ -230,7 +233,7 @@ impl TestExpectation {
 							};
 							TestValueExpectation::Matcher(MatcherExpectation {
 								matcher_value_type: ty,
-								value: x._match.0.clone(),
+								value_str: x._match.0.clone(),
 							})
 						}
 					})
@@ -242,7 +245,18 @@ impl TestExpectation {
 				BoolOr::Bool(true) => TestExpectation::Parsing(None),
 				BoolOr::Bool(false) => TestExpectation::Values(None),
 			},
-		}
+			TestDetailsResults::SigninError(x) => match x.signin_error {
+				BoolOr::Value(ref x) => TestExpectation::Signin(Some(x.clone())),
+				BoolOr::Bool(true) => TestExpectation::Signin(None),
+				BoolOr::Bool(false) => TestExpectation::Values(None),
+			},
+			TestDetailsResults::SignupError(x) => match x.signup_error {
+				BoolOr::Value(ref x) => TestExpectation::Signup(Some(x.clone())),
+				BoolOr::Bool(true) => TestExpectation::Signup(None),
+				BoolOr::Bool(false) => TestExpectation::Values(None),
+			},
+		};
+		Some(res)
 	}
 }
 
@@ -260,6 +274,12 @@ impl TestReport {
 			TestReportKind::Valid => TestGrade::Success,
 			TestReportKind::MismatchedType(_)
 			| TestReportKind::MismatchedParsing {
+				..
+			}
+			| TestReportKind::MismatchedSignup {
+				..
+			}
+			| TestReportKind::MismatchedSignin {
 				..
 			}
 			| TestReportKind::MismatchedValues(_) => {
@@ -297,6 +317,8 @@ impl TestReport {
 	) -> Self {
 		let outputs = match job_result {
 			TestTaskResult::ParserError(ref e) => Some(TestOutputs::ParsingError(e.to_string())),
+			TestTaskResult::SignupError(ref e) => Some(TestOutputs::SignupError(e.to_string())),
+			TestTaskResult::SigninError(ref e) => Some(TestOutputs::SigninError(e.to_string())),
 			TestTaskResult::RunningError(_) => None,
 			TestTaskResult::Timeout => None,
 			TestTaskResult::Import(_, _) => None,
@@ -335,22 +357,93 @@ impl TestReport {
 
 				TestReportKind::Error(TestError::Paniced(error))
 			}
+			TestTaskResult::SignupError(err) => {
+				let expectation = TestExpectation::from_test_config(config);
+
+				// ensure we expect a parsing error.
+				let expected_error = match expectation {
+					None => {
+						return TestReportKind::NoExpectation {
+							output: TestOutputs::SignupError(err.to_string()),
+						};
+					}
+					Some(TestExpectation::Signup(x)) => x,
+					Some(x) => {
+						return TestReportKind::MismatchedType(ResultTypeMismatchReport {
+							got: TestOutputs::SignupError(err.to_string()),
+							expected: x,
+						});
+					}
+				};
+
+				let Some(expected_error) = expected_error else {
+					// No specified parsing error, results is valid.
+					return TestReportKind::Valid;
+				};
+
+				let results = err.to_string();
+
+				if expected_error == results {
+					return TestReportKind::Valid;
+				}
+
+				TestReportKind::MismatchedSignup {
+					got: results,
+					expected: expected_error,
+				}
+			}
+
+			TestTaskResult::SigninError(err) => {
+				let expectation = TestExpectation::from_test_config(config);
+
+				// ensure we expect a parsing error.
+				let expected_parsing_error = match expectation {
+					None => {
+						return TestReportKind::NoExpectation {
+							output: TestOutputs::SigninError(err.to_string()),
+						};
+					}
+					Some(TestExpectation::Signin(x)) => x,
+					Some(x) => {
+						return TestReportKind::MismatchedType(ResultTypeMismatchReport {
+							got: TestOutputs::SigninError(err.to_string()),
+							expected: x,
+						});
+					}
+				};
+
+				let Some(expected_error) = expected_parsing_error else {
+					// No specified parsing error, results is valid.
+					return TestReportKind::Valid;
+				};
+
+				let results = err.to_string();
+
+				if expected_error == results {
+					return TestReportKind::Valid;
+				}
+
+				TestReportKind::MismatchedSignin {
+					got: results,
+					expected: expected_error,
+				}
+			}
 			TestTaskResult::ParserError(results) => {
 				let expectation = TestExpectation::from_test_config(config);
 
 				// ensure we expect a parsing error.
 				let expected_parsing_error = match expectation {
-					TestExpectation::Unspecified => {
+					None => {
 						return TestReportKind::NoExpectation {
 							output: TestOutputs::ParsingError(results.to_string()),
-						}
+						};
 					}
-					TestExpectation::Parsing(x) => x,
-					TestExpectation::Values(x) => {
-						return TestReportKind::MismatchedType(TypeMismatchReport::ExpectedValues {
-							got: results.to_string(),
+					Some(TestExpectation::Parsing(x)) => x,
+					Some(x) => {
+						return TestReportKind::MismatchedType(ResultTypeMismatchReport {
+							got: TestOutputs::ParsingError(results.to_string()),
 							expected: x,
-						})
+						});
 					}
 				};
 
@@ -378,25 +471,25 @@ impl TestReport {
 	}
 
 	async fn grade_value_results(
-		expectation: TestExpectation,
+		expectation: Option<TestExpectation>,
 		results: Vec<Result<SurValue, String>>,
 		matcher_datastore: &Datastore,
 	) -> TestReportKind {
 		// Ensure we expect a value.
 		let expected_values = match expectation {
-			TestExpectation::Unspecified => {
+			None => {
 				return TestReportKind::NoExpectation {
 					output: TestOutputs::Values(results),
-				}
+				};
 			}
-			TestExpectation::Parsing(expected) => {
-				return TestReportKind::MismatchedType(TypeMismatchReport::ExpectedParsingError {
-					got: results,
-					expected,
-				})
+			Some(TestExpectation::Values(None)) => return TestReportKind::Valid,
+			Some(TestExpectation::Values(Some(ref x))) => x,
+			Some(x) => {
+				return TestReportKind::MismatchedType(ResultTypeMismatchReport {
+					got: TestOutputs::Values(results),
+					expected: x,
+				});
 			}
-			TestExpectation::Values(None) => return TestReportKind::Valid,
-			TestExpectation::Values(Some(ref x)) => x,
 		};
 
 		let mut expected = expected_values.iter();
@@ -529,23 +622,34 @@ impl TestReport {
 		};
 
 		let run_vars = match value {
-			Ok(ref x) => BTreeMap::from([("result".to_string(), x.clone())]),
-			Err(ref e) => {
-				BTreeMap::from([("error".to_string(), SurValue::Strand(e.clone().into()).clone())])
-			}
+			Ok(ref x) => Variables::from_iter([("result".to_string(), x.clone())]),
+			Err(ref e) => Variables::from_iter([(
+				"error".to_string(),
+				SurValue::String(e.clone().into()).clone(),
+			)]),
 		};
 
 		let session = Session::viewer().with_ns("match").with_db("match");
 
-		let res =
-			matcher_datastore.compute(expectation.value.clone(), &session, Some(run_vars)).await;
+		// Instead of creating an Ast directly, we'll execute the expression as a query string
+		let query = format!("RETURN {}", expectation.value_str);
+		let res = matcher_datastore.execute(&query, &session, Some(run_vars)).await;
 
 		let x = match res {
 			Err(e) => {
 				return Some(MatcherMismatch::Error {
 					error: e.to_string(),
 					got: value,
-				})
+				});
+			}
+			Ok(x) => x,
+		};
+		let x = match x.into_iter().next().unwrap().result {
+			Err(e) => {
+				return Some(MatcherMismatch::Error {
+					error: e.to_string(),
+					got: value,
+				});
 			}
 			Ok(x) => x,
 		};
@@ -555,7 +659,7 @@ impl TestReport {
 			got => {
 				return Some(MatcherMismatch::OutputType {
 					got,
-				})
+				});
 			}
 		};
 
@@ -564,7 +668,7 @@ impl TestReport {
 		}
 
 		Some(MatcherMismatch::Failed {
-			matcher: expectation.value.clone(),
+			matcher: expectation.value_str.clone(),
 			value,
 		})
 	}

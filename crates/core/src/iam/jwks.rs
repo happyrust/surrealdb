@@ -1,19 +1,21 @@
-use crate::dbs::capabilities::NetTarget;
-use crate::err::Error;
-use crate::kvs::Datastore;
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+
+use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::jwk::{
-	AlgorithmParameters::*, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
-};
-use jsonwebtoken::{Algorithm::*, DecodingKey, Validation};
+use jsonwebtoken::Algorithm::*;
+use jsonwebtoken::jwk::AlgorithmParameters::*;
+use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse};
+use jsonwebtoken::{DecodingKey, Validation};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::LazyLock;
 use tokio::sync::RwLock;
+
+use crate::dbs::capabilities::NetTarget;
+use crate::err::Error;
+use crate::kvs::Datastore;
 
 pub(crate) type JwksCache = HashMap<String, JwksCacheEntry>;
 #[derive(Clone, Serialize, Deserialize)]
@@ -58,9 +60,9 @@ static CACHE_COOLDOWN: LazyLock<chrono::Duration> =
 static REMOTE_TIMEOUT: LazyLock<chrono::Duration> =
 	LazyLock::new(|| match std::env::var("SURREAL_JWKS_REMOTE_TIMEOUT_MILLISECONDS") {
 		Ok(milliseconds_str) => {
-			let milliseconds = milliseconds_str
-				.parse::<u64>()
-				.expect("Expected a valid number of milliseconds for SURREAL_JWKS_REMOTE_TIMEOUT_MILLISECONDS");
+			let milliseconds = milliseconds_str.parse::<u64>().expect(
+				"Expected a valid number of milliseconds for SURREAL_JWKS_REMOTE_TIMEOUT_MILLISECONDS",
+			);
 			Duration::milliseconds(milliseconds as i64)
 		}
 		Err(_) => {
@@ -68,20 +70,21 @@ static REMOTE_TIMEOUT: LazyLock<chrono::Duration> =
 		}
 	});
 
-// Generates a verification configuration from a JWKS object hosted in a remote location
-// Performs local caching of all JWKS objects to prevent unnecessary network requests
-// Implements checks to prevent denial of service and unauthorized network requests
-// Validates the JWK objects found in the JWKS object according to RFC 7517
-// Source: https://datatracker.ietf.org/doc/html/rfc7517
+// Generates a verification configuration from a JWKS object hosted in a remote
+// location Performs local caching of all JWKS objects to prevent unnecessary
+// network requests Implements checks to prevent denial of service and
+// unauthorized network requests Validates the JWK objects found in the JWKS
+// object according to RFC 7517 Source: https://datatracker.ietf.org/doc/html/rfc7517
 pub(super) async fn config(
 	kvs: &Datastore,
 	kid: &str,
 	url: &str,
 	token_alg: jsonwebtoken::Algorithm,
-) -> Result<(DecodingKey, Validation), Error> {
+) -> Result<(DecodingKey, Validation)> {
 	// Retrieve JWKS cache
 	let cache = kvs.jwks_cache();
-	// Attempt to fetch relevant JWK object either from local cache or remote location
+	// Attempt to fetch relevant JWK object either from local cache or remote
+	// location
 	let jwk = match fetch_jwks_from_cache(cache, url).await {
 		Some(jwks) => {
 			trace!("Successfully fetched JWKS object from local cache");
@@ -91,11 +94,13 @@ pub(super) async fn config(
 				match jwks.jwks.find(kid) {
 					Some(jwk) => jwk.to_owned(),
 					_ => {
-						trace!("Could not find valid JWK object with key identifier '{kid}' in cached JWKS object");
+						trace!(
+							"Could not find valid JWK object with key identifier '{kid}' in cached JWKS object"
+						);
 						// Check that the cached JWKS object has not been recently updated
 						if Utc::now().signed_duration_since(jwks.time) < *CACHE_COOLDOWN {
 							debug!("Refused to refresh cache before cooldown period is over");
-							return Err(Error::InvalidAuth); // Return opaque error
+							bail!(Error::InvalidAuth); // Return opaque error
 						}
 						find_jwk_from_url(kvs, url, kid).await?
 					}
@@ -113,9 +118,9 @@ pub(super) async fn config(
 
 	// Use algorithm provided, if specified
 	// This parameter is not required to be present, although is usually expected
-	// When missing, tokens must be validated using only the required key type parameter
-	// This is discouraged, as it requires relying on the algorithm specified in the token
-	// Source: https://datatracker.ietf.org/doc/html/rfc7517#section-4.4
+	// When missing, tokens must be validated using only the required key type
+	// parameter This is discouraged, as it requires relying on the algorithm
+	// specified in the token Source: https://datatracker.ietf.org/doc/html/rfc7517#section-4.4
 	let alg = match jwk.common.key_algorithm {
 		Some(alg) => match alg {
 			KeyAlgorithm::HS256 => HS256,
@@ -132,7 +137,7 @@ pub(super) async fn config(
 			KeyAlgorithm::RS512 => RS512,
 			_ => {
 				warn!("Unspported value for parameter 'alg' in JWK object: '{:?}'", alg);
-				return Err(Error::InvalidAuth); // Return opaque error
+				bail!(Error::InvalidAuth); // Return opaque error
 			}
 		},
 		// If not specified, use the algorithm provided in the token header
@@ -142,7 +147,8 @@ pub(super) async fn config(
 		// Source: https://docs.rs/jsonwebtoken/latest/jsonwebtoken/enum.Algorithm.html
 		// Confirmation: https://github.com/Keats/jsonwebtoken/issues/381
 		_ => {
-			// Ensure that the algorithm specified in the token matches the key type defined in the JWK
+			// Ensure that the algorithm specified in the token matches the key type defined
+			// in the JWK
 			match (&jwk.algorithm, token_alg) {
 				(RSA(_), RS256 | RS384 | RS512 | PS256 | PS384 | PS512) => token_alg,
 				(RSA(key), _) => {
@@ -150,7 +156,7 @@ pub(super) async fn config(
 						"Algorithm from token '{:?}' does not match JWK key type '{:?}'",
 						token_alg, key.key_type
 					);
-					return Err(Error::InvalidAuth); // Return opaque error
+					bail!(Error::InvalidAuth); // Return opaque error
 				}
 				(EllipticCurve(_), ES256 | ES384) => token_alg,
 				(EllipticCurve(key), _) => {
@@ -158,7 +164,7 @@ pub(super) async fn config(
 						"Algorithm from token '{:?}' does not match JWK key type '{:?}'",
 						token_alg, key.key_type
 					);
-					return Err(Error::InvalidAuth); // Return opaque error
+					bail!(Error::InvalidAuth); // Return opaque error
 				}
 				(OctetKey(_), HS256 | HS384 | HS512) => token_alg,
 				(OctetKey(key), _) => {
@@ -166,7 +172,7 @@ pub(super) async fn config(
 						"Algorithm from token '{:?}' does not match JWK key type '{:?}'",
 						token_alg, key.key_type
 					);
-					return Err(Error::InvalidAuth); // Return opaque error
+					bail!(Error::InvalidAuth); // Return opaque error
 				}
 				(OctetKeyPair(_), EdDSA) => token_alg,
 				(OctetKeyPair(key), _) => {
@@ -174,7 +180,7 @@ pub(super) async fn config(
 						"Algorithm from token '{:?}' does not match JWK key type '{:?}'",
 						token_alg, key.key_type
 					);
-					return Err(Error::InvalidAuth); // Return opaque error
+					bail!(Error::InvalidAuth); // Return opaque error
 				}
 			}
 		}
@@ -185,49 +191,52 @@ pub(super) async fn config(
 		Some(PublicKeyUse::Signature) => (),
 		Some(key_use) => {
 			warn!("Invalid value for parameter 'use' in JWK object: '{:?}'", key_use);
-			return Err(Error::InvalidAuth); // Return opaque error
+			bail!(Error::InvalidAuth); // Return opaque error
 		}
 		None => (),
 	}
 	// Check if the key operations (if specified) include verification
 	// Source: https://datatracker.ietf.org/doc/html/rfc7517#section-4.3
 	if let Some(ops) = &jwk.common.key_operations {
-		if !ops.iter().any(|op| *op == KeyOperations::Verify) {
+		if !ops.contains(&KeyOperations::Verify) {
 			warn!(
 				"Invalid values for parameter 'key_ops' in JWK object: '{:?}'",
 				jwk.common.key_operations
 			);
-			return Err(Error::InvalidAuth); // Return opaque error
+			bail!(Error::InvalidAuth); // Return opaque error
 		}
 	}
 
-	// Return verification configuration if a decoding key can be retrieved from the JWK object
+	// Return verification configuration if a decoding key can be retrieved from the
+	// JWK object
 	match DecodingKey::from_jwk(&jwk) {
 		Ok(dec) => {
 			let mut val = Validation::new(alg);
 
-			// TODO(gguillemas): This keeps the existing behavior as of SurrealDB 2.0.0-alpha.9.
-			// Up to that point, a fork of the "jsonwebtoken" crate in version 8.3.0 was being used.
-			// Now that the audience claim is validated by default, we could allow users to leverage this.
-			// This will most likely involve defining an audience string via "DEFINE ACCESS ... TYPE JWT".
+			// TODO(gguillemas): This keeps the existing behavior as of SurrealDB
+			// 2.0.0-alpha.9. Up to that point, a fork of the "jsonwebtoken" crate in
+			// version 8.3.0 was being used. Now that the audience claim is validated by
+			// default, we could allow users to leverage this. This will most likely
+			// involve defining an audience string via "DEFINE ACCESS ... TYPE JWT".
 			val.validate_aud = false;
 
 			Ok((dec, val))
 		}
 		Err(err) => {
 			warn!("Failed to retrieve decoding key from JWK object: '{}'", err);
-			Err(Error::InvalidAuth) // Return opaque error
+			Err(anyhow::Error::new(Error::InvalidAuth)) // Return opaque error
 		}
 	}
 }
 
-// Checks if network access to a remote location is allowed by the datastore capabilities
-// Attempts to find a relevant JWK object inside a JWKS object fetched from the remote location
-async fn find_jwk_from_url(kvs: &Datastore, url: &str, kid: &str) -> Result<Jwk, Error> {
+// Checks if network access to a remote location is allowed by the datastore
+// capabilities Attempts to find a relevant JWK object inside a JWKS object
+// fetched from the remote location
+async fn find_jwk_from_url(kvs: &Datastore, url: &str, kid: &str) -> Result<Jwk> {
 	// Check that the datastore capabilities allow connections to the URL host
 	if let Err(err) = check_capabilities_url(kvs, url) {
 		warn!("Network access to JWKS location is not allowed: '{}'", err);
-		return Err(Error::InvalidAuth); // Return opaque error
+		bail!(Error::InvalidAuth); // Return opaque error
 	}
 
 	// Retrieve JWKS cache
@@ -240,24 +249,27 @@ async fn find_jwk_from_url(kvs: &Datastore, url: &str, kid: &str) -> Result<Jwk,
 			match jwks.find(kid) {
 				Some(jwk) => Ok(jwk.to_owned()),
 				_ => {
-					debug!("Failed to find JWK object with key identifier '{kid}' in remote JWKS object");
-					Err(Error::InvalidAuth) // Return opaque error
+					debug!(
+						"Failed to find JWK object with key identifier '{kid}' in remote JWKS object"
+					);
+					Err(anyhow::Error::new(Error::InvalidAuth)) // Return opaque error
 				}
 			}
 		}
 		Err(err) => {
 			warn!("Failed to fetch JWKS object from remote location: '{}'", err);
-			Err(Error::InvalidAuth) // Return opaque error
+			Err(anyhow::Error::new(Error::InvalidAuth)) // Return opaque error
 		}
 	}
 }
 
-// Returns an error if network access to the address from a given URL string is not allowed
-fn check_capabilities_url(kvs: &Datastore, url: &str) -> Result<(), Error> {
+// Returns an error if network access to the address from a given URL string is
+// not allowed
+fn check_capabilities_url(kvs: &Datastore, url: &str) -> Result<()> {
 	let url_parsed = match Url::parse(url) {
 		Ok(url) => url,
 		Err(_) => {
-			return Err(Error::InvalidUrl(url.to_string()));
+			bail!(Error::InvalidUrl(url.to_string()));
 		}
 	};
 	let addr = match url_parsed.host_str() {
@@ -269,34 +281,42 @@ fn check_capabilities_url(kvs: &Datastore, url: &str) -> Result<(), Error> {
 			}
 		}
 		None => {
-			return Err(Error::InvalidUrl(url.to_string()));
+			bail!(Error::InvalidUrl(url.to_string()));
 		}
 	};
 	let target = match NetTarget::from_str(&addr) {
 		Ok(host) => host,
 		Err(_) => {
-			return Err(Error::InvalidUrl(url.to_string()));
+			bail!(Error::InvalidUrl(url.to_string()));
 		}
 	};
 	if !kvs.allows_network_target(&target) {
 		warn!("Capabilities denied outgoing network connection attempt, target: '{target}'");
-		return Err(Error::InvalidUrl(url.to_string()));
+		bail!(Error::InvalidUrl(url.to_string()));
 	}
 	trace!("Capabilities allowed outgoing network connection, target: '{target}'");
 
 	Ok(())
 }
 
-// Attempts to fetch a JWKS object from a remote location and stores it in the cache if successful
-async fn fetch_jwks_from_url(cache: &Arc<RwLock<JwksCache>>, url: &str) -> Result<JwkSet, Error> {
+// Attempts to fetch a JWKS object from a remote location and stores it in the
+// cache if successful
+async fn fetch_jwks_from_url(cache: &Arc<RwLock<JwksCache>>, url: &str) -> Result<JwkSet> {
 	let client = Client::new();
+	let req = client.get(url);
+	// Add a User-Agent header so that WAF rules don't reject the request
 	#[cfg(not(target_family = "wasm"))]
-	let res = client.get(url).timeout((*REMOTE_TIMEOUT).to_std().unwrap()).send().await?;
+	let req = req.header(reqwest::header::USER_AGENT, &*crate::cnf::SURREALDB_USER_AGENT);
+	#[cfg(not(target_family = "wasm"))]
+	let res = req.timeout((*REMOTE_TIMEOUT).to_std().unwrap()).send().await?;
 	#[cfg(target_family = "wasm")]
-	let res = client.get(url).send().await?;
+	let res = req.send().await?;
 	if !res.status().is_success() {
-		warn!("Unsuccessful HTTP status code received when fetching JWKS object from remote location: '{:?}'", res.status());
-		return Err(Error::InvalidAuth); // Return opaque error
+		warn!(
+			"Unsuccessful HTTP status code received when fetching JWKS object from remote location: '{:?}'",
+			res.status()
+		);
+		bail!(Error::InvalidAuth); // Return opaque error
 	}
 	let jwks = res.bytes().await?;
 
@@ -312,7 +332,7 @@ async fn fetch_jwks_from_url(cache: &Arc<RwLock<JwksCache>>, url: &str) -> Resul
 		}
 		Err(err) => {
 			warn!("Failed to parse malformed JWKS object: '{}'", err);
-			Err(Error::InvalidAuth) // Return opaque error
+			Err(anyhow::Error::new(Error::InvalidAuth)) // Return opaque error
 		}
 	}
 }
@@ -355,11 +375,13 @@ fn cache_key_from_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+	use rand::Rng;
+	use rand::distributions::Alphanumeric;
+	use wiremock::matchers::{header, method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
 	use super::*;
 	use crate::dbs::capabilities::{Capabilities, NetTarget, Targets};
-	use rand::{distributions::Alphanumeric, Rng};
-	use wiremock::matchers::{method, path};
-	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	// Use unique path to prevent accidental cache reuse
 	fn random_path() -> String {
@@ -429,6 +451,7 @@ mod tests {
 		let response = ResponseTemplate::new(200).set_body_json(jwks);
 		Mock::given(method("GET"))
 			.and(path(&jwks_path))
+			.and(header("user-agent", "SurrealDB"))
 			.respond_with(response)
 			.mount(&mock_server)
 			.await;
@@ -489,7 +512,8 @@ mod tests {
 	async fn test_capabilities_specific_port() {
 		let ds = Datastore::new("memory").await.unwrap().with_capabilities(
 			Capabilities::default().with_network_targets(Targets::<NetTarget>::Some(
-				[NetTarget::from_str("127.0.0.1:443").unwrap()].into(), // Different port from server
+				[NetTarget::from_str("127.0.0.1:443").unwrap()].into(), /* Different port from
+				                                                         * server */
 			)),
 		);
 		let jwks = DEFAULT_JWKS.clone();
@@ -559,7 +583,8 @@ mod tests {
 		.await;
 		assert!(res.is_ok(), "Failed to validate token the second time: {:?}", res.err());
 
-		// The server will panic if it does not receive exactly two expected requests
+		// The server will panic if it does not receive exactly two expected
+		// requests
 	}
 
 	#[tokio::test]
@@ -592,7 +617,8 @@ mod tests {
 		.await;
 		assert!(res.is_err(), "Unexpected success validating token with invalid key identifier");
 
-		// Use token with invalid key identifier claim to force cache refresh again before cooldown
+		// Use token with invalid key identifier claim to force cache refresh again
+		// before cooldown
 		let res = config(
 			&ds,
 			"invalid",
@@ -602,7 +628,8 @@ mod tests {
 		.await;
 		assert!(res.is_err(), "Unexpected success validating token with invalid key identifier");
 
-		// The server will panic if it receives more than the single expected request
+		// The server will panic if it receives more than the single expected
+		// request
 	}
 
 	#[tokio::test]
@@ -687,10 +714,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	// An attacker can issue token indicating that it has been signed with an HMAC algorithm
-	// If the original issuer was trusted using RSA, this may allow the attacker to sign the token with the public key
-	// This test verifies that SurrealDB will not trust a token specifying an algorithm that does not match the key type
-	// Reference: https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/#RSA-or-HMAC
+	// An attacker can issue token indicating that it has been signed with an HMAC
+	// algorithm If the original issuer was trusted using RSA, this may allow the
+	// attacker to sign the token with the public key This test verifies that
+	// SurrealDB will not trust a token specifying an algorithm that does not match
+	// the key type Reference: https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/#RSA-or-HMAC
 	async fn test_no_algorithm_invalid() {
 		let ds = Datastore::new("memory").await.unwrap().with_capabilities(
 			Capabilities::default().with_network_targets(Targets::<NetTarget>::Some(
@@ -875,7 +903,8 @@ mod tests {
 
 		let url = mock_server.uri();
 
-		// Get token configuration from remote location responding with Internal Server Error
+		// Get token configuration from remote location responding with Internal Server
+		// Error
 		let res = config(
 			&ds,
 			"test_1",

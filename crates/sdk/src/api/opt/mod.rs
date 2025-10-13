@@ -1,67 +1,104 @@
 //! The different options and types for use in API functions
 
-use serde::Serialize;
-use std::borrow::Cow;
-
 pub mod auth;
 pub mod capabilities;
 
 mod config;
-mod endpoint;
+pub(crate) mod endpoint;
 mod export;
-mod query;
+pub(crate) mod query;
 mod resource;
 mod tls;
+mod websocket;
 
 pub use config::*;
 pub use endpoint::*;
 pub use export::*;
 pub use query::*;
 pub use resource::*;
-use serde_content::Serializer;
-use serde_content::Value as Content;
+use surrealdb_types::{SurrealValue, Value};
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 pub use tls::*;
+pub use websocket::*;
 
-type UnitOp<'a> = InnerOp<'a, ()>;
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "op", rename_all = "lowercase")]
-enum InnerOp<'a, T> {
+#[derive(Debug, SurrealValue)]
+#[surreal(untagged, lowercase)]
+pub enum PatchOp {
 	Add {
-		path: &'a str,
-		value: T,
+		path: String,
+		value: Value,
 	},
 	Remove {
-		path: &'a str,
+		path: String,
 	},
 	Replace {
-		path: &'a str,
-		value: T,
+		path: String,
+		value: Value,
 	},
 	Change {
-		path: &'a str,
+		path: String,
 		value: String,
 	},
 }
 
-/// A [JSON Patch] operation
-///
-/// From the official website:
-///
-/// > JSON Patch is a format for describing changes to a JSON document.
-/// > It can be used to avoid sending a whole document when only a part has changed.
-///
-/// [JSON Patch]: https://jsonpatch.com/
-#[derive(Debug)]
-#[must_use]
-pub struct PatchOp(pub(crate) serde_content::Result<Content<'static>>);
+impl From<PatchOp> for Value {
+	fn from(op: PatchOp) -> Value {
+		let mut obj = surrealdb_types::Object::new();
+		match op {
+			PatchOp::Add {
+				path,
+				value,
+			} => {
+				obj.insert("op".to_string(), Value::String("add".to_string()));
+				obj.insert("path".to_string(), Value::String(path));
+				obj.insert("value".to_string(), value);
+			}
+			PatchOp::Remove {
+				path,
+			} => {
+				obj.insert("op".to_string(), Value::String("remove".to_string()));
+				obj.insert("path".to_string(), Value::String(path));
+			}
+			PatchOp::Replace {
+				path,
+				value,
+			} => {
+				obj.insert("op".to_string(), Value::String("replace".to_string()));
+				obj.insert("path".to_string(), Value::String(path));
+				obj.insert("value".to_string(), value);
+			}
+			PatchOp::Change {
+				path,
+				value,
+			} => {
+				obj.insert("op".to_string(), Value::String("change".to_string()));
+				obj.insert("path".to_string(), Value::String(path));
+				obj.insert("value".to_string(), Value::String(value));
+			}
+		}
+		Value::Object(obj)
+	}
+}
+
+// /// A [JSON Patch] operation
+// ///
+// /// From the official website:
+// ///
+// /// > JSON Patch is a format for describing changes to a JSON document.
+// /// > It can be used to avoid sending a whole document when only a part has
+// /// > changed.
+// ///
+// /// [JSON Patch]: https://jsonpatch.com/
+// #[derive(Debug)]
+// #[must_use]
+// pub struct PatchOp(pub(crate) Value);
 
 impl PatchOp {
 	/// Adds a value to an object or inserts it into an array.
 	///
 	/// In the case of an array, the value is inserted before the given index.
-	/// The `-` character can be used instead of an index to insert at the end of an array.
+	/// The `-` character can be used instead of an index to insert at the end
+	/// of an array.
 	///
 	/// # Examples
 	///
@@ -71,14 +108,11 @@ impl PatchOp {
 	/// PatchOp::add("/biscuits/1", json!({ "name": "Ginger Nut" }))
 	/// # ;
 	/// ```
-	pub fn add<T>(path: &str, value: T) -> Self
-	where
-		T: Serialize,
-	{
-		Self(Serializer::new().serialize(InnerOp::Add {
-			path,
-			value,
-		}))
+	pub fn add(path: impl Into<String>, value: impl SurrealValue) -> Self {
+		PatchOp::Add {
+			path: path.into(),
+			value: value.into_value(),
+		}
 	}
 
 	/// Removes a value from an object or array.
@@ -99,10 +133,10 @@ impl PatchOp {
 	/// PatchOp::remove("/biscuits/0")
 	/// # ;
 	/// ```
-	pub fn remove(path: &str) -> Self {
-		Self(Serializer::new().serialize(UnitOp::Remove {
-			path,
-		}))
+	pub fn remove(path: impl Into<String>) -> Self {
+		PatchOp::Remove {
+			path: path.into(),
+		}
 	}
 
 	/// Replaces a value.
@@ -116,46 +150,48 @@ impl PatchOp {
 	/// PatchOp::replace("/biscuits/0/name", "Chocolate Digestive")
 	/// # ;
 	/// ```
-	pub fn replace<T>(path: &str, value: T) -> Self
-	where
-		T: Serialize,
-	{
-		Self(Serializer::new().serialize(InnerOp::Replace {
-			path,
-			value,
-		}))
+	pub fn replace(path: impl Into<String>, value: impl SurrealValue) -> Self {
+		PatchOp::Replace {
+			path: path.into(),
+			value: value.into_value(),
+		}
 	}
 
 	/// Changes a value
-	pub fn change(path: &str, diff: String) -> Self {
-		Self(Serializer::new().serialize(UnitOp::Change {
-			path,
+	pub fn change(path: impl Into<String>, diff: String) -> Self {
+		PatchOp::Change {
+			path: path.into(),
 			value: diff,
-		}))
+		}
 	}
 }
 
 /// Multiple patch operations
 #[derive(Debug, Default)]
 #[must_use]
-pub struct PatchOps(Vec<PatchOp>);
+pub struct PatchOps(pub(crate) Vec<PatchOp>);
 
-impl From<PatchOps> for PatchOp {
-	fn from(ops: PatchOps) -> Self {
-		let mut merged = PatchOp(Ok(Content::Seq(Vec::with_capacity(ops.0.len()))));
-		for PatchOp(result) in ops.0 {
-			if let Ok(Content::Seq(value)) = &mut merged.0 {
-				match result {
-					Ok(op) => value.push(op),
-					Err(error) => {
-						merged.0 = Err(error);
-						// This operation produced an error, no need to continue
-						break;
-					}
-				}
-			}
-		}
-		merged
+// impl From<PatchOps> for PatchOp {
+// 	fn from(ops: PatchOps) -> Self {
+// 		let mut merged = PatchOp(Value::Array(Array::with_capacity(ops.0.len())));
+// 		for PatchOp(result) in ops.0 {
+// 			if let Value::Array(value) = &mut merged.0 {
+// 				value.push(result);
+// 			}
+// 		}
+// 		merged
+// 	}
+// }
+
+impl From<PatchOp> for PatchOps {
+	fn from(op: PatchOp) -> Self {
+		Self(vec![op])
+	}
+}
+
+impl From<Vec<PatchOp>> for PatchOps {
+	fn from(ops: Vec<PatchOp>) -> Self {
+		Self(ops)
 	}
 }
 
@@ -165,10 +201,24 @@ impl PatchOps {
 		Self(Vec::new())
 	}
 
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	pub fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	pub fn push(mut self, patch: PatchOp) -> Self {
+		self.0.push(patch);
+		self
+	}
+
 	/// Adds a value to an object or inserts it into an array.
 	///
 	/// In the case of an array, the value is inserted before the given index.
-	/// The `-` character can be used instead of an index to insert at the end of an array.
+	/// The `-` character can be used instead of an index to insert at the end
+	/// of an array.
 	///
 	/// # Examples
 	///
@@ -180,7 +230,7 @@ impl PatchOps {
 	/// ```
 	pub fn add<T>(mut self, path: &str, value: T) -> Self
 	where
-		T: Serialize,
+		T: SurrealValue,
 	{
 		self.0.push(PatchOp::add(path, value));
 		self
@@ -222,7 +272,7 @@ impl PatchOps {
 	/// ```
 	pub fn replace<T>(mut self, path: &str, value: T) -> Self
 	where
-		T: Serialize,
+		T: SurrealValue,
 	{
 		self.0.push(PatchOp::replace(path, value));
 		self
@@ -235,7 +285,24 @@ impl PatchOps {
 	}
 }
 
-/// Makes the client wait for a certain event or call to happen before continuing
+impl IntoIterator for PatchOps {
+	type Item = PatchOp;
+	type IntoIter = std::vec::IntoIter<PatchOp>;
+	fn into_iter(self) -> Self::IntoIter {
+		self.0.into_iter()
+	}
+}
+
+// impl IntoIterator for PatchOps {
+// 	type Item = Value;
+// 	type IntoIter = std::vec::IntoIter<Value>;
+// 	fn into_iter(self) -> Self::IntoIter {
+// 		self.0.into_iter()
+// 	}
+// }
+
+/// Makes the client wait for a certain event or call to happen before
+/// continuing
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum WaitFor {
@@ -243,21 +310,4 @@ pub enum WaitFor {
 	Connection,
 	/// Waits for the desired database to be selected
 	Database,
-}
-
-/// Forwards a raw query without trying to parse for live select statements
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[doc(hidden)]
-pub struct Raw(pub(crate) Cow<'static, str>);
-
-impl From<&'static str> for Raw {
-	fn from(query: &'static str) -> Self {
-		Self(Cow::Borrowed(query))
-	}
-}
-
-impl From<String> for Raw {
-	fn from(query: String) -> Self {
-		Self(Cow::Owned(query))
-	}
 }

@@ -1,10 +1,8 @@
 //! stub implementations for the fetch API when `http` is not enabled.
 
-use js::{
-	class::{JsClass, Trace, Tracer},
-	function::Constructor,
-	Class, Ctx, Exception, Function, Object, Result,
-};
+use js::class::{JsClass, Trace, Tracer};
+use js::function::Constructor;
+use js::{Class, Ctx, Exception, Function, Object, Result};
 
 #[cfg(test)]
 mod test;
@@ -22,7 +20,10 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
 
 #[js::function]
 fn fetch<'js>(ctx: Ctx<'js>) -> Result<()> {
-	Err(Exception::throw_internal(&ctx,"The 'fetch' function is not available in this build of SurrealDB. In order to use 'fetch', enable the 'http' feature."))
+	Err(Exception::throw_internal(
+		&ctx,
+		"The 'fetch' function is not available in this build of SurrealDB. In order to use 'fetch', enable the 'http' feature.",
+	))
 }
 
 macro_rules! impl_stub_class {
@@ -33,7 +34,7 @@ macro_rules! impl_stub_class {
 			mod $module{
 				use super::*;
 
-				#[non_exhaustive] pub struct $name;
+				pub struct $name;
 
 				unsafe impl<'js> js::JsLifetime<'js> for $name{
 					type Changed<'to> = $name;

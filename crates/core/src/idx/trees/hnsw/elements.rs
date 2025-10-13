@@ -1,10 +1,11 @@
-use crate::err::Error;
+use anyhow::Result;
+use dashmap::DashMap;
+
+use crate::catalog::Distance;
+use crate::idx::IndexKeyBase;
 use crate::idx::trees::hnsw::ElementId;
 use crate::idx::trees::vector::{SerializedVector, SharedVector, Vector};
-use crate::idx::{IndexKeyBase, VersionedStore};
 use crate::kvs::Transaction;
-use crate::sql::index::Distance;
-use dashmap::DashMap;
 
 pub(super) struct HnswElements {
 	ikb: IndexKeyBase,
@@ -52,10 +53,9 @@ impl HnswElements {
 		id: ElementId,
 		vec: Vector,
 		ser_vec: &SerializedVector,
-	) -> Result<SharedVector, Error> {
-		let key = self.ikb.new_he_key(id)?;
-		let val = VersionedStore::try_into(ser_vec)?;
-		tx.set(key, val, None).await?;
+	) -> Result<SharedVector> {
+		let key = self.ikb.new_he_key(id);
+		tx.set(&key, ser_vec, None).await?;
 		let pt: SharedVector = vec.into();
 		self.elements.insert(id, pt.clone());
 		Ok(pt)
@@ -65,15 +65,14 @@ impl HnswElements {
 		&self,
 		tx: &Transaction,
 		e_id: &ElementId,
-	) -> Result<Option<SharedVector>, Error> {
+	) -> Result<Option<SharedVector>> {
 		if let Some(r) = self.elements.get(e_id) {
 			return Ok(Some(r.value().clone()));
 		}
-		let key = self.ikb.new_he_key(*e_id)?;
-		match tx.get(key, None).await? {
+		let key = self.ikb.new_he_key(*e_id);
+		match tx.get(&key, None).await? {
 			None => Ok(None),
-			Some(val) => {
-				let vec: SerializedVector = VersionedStore::try_from(val)?;
+			Some(vec) => {
 				let vec = Vector::from(vec);
 				let vec: SharedVector = vec.into();
 				self.elements.insert(*e_id, vec.clone());
@@ -91,14 +90,14 @@ impl HnswElements {
 		tx: &Transaction,
 		q: &SharedVector,
 		e_id: &ElementId,
-	) -> Result<Option<f64>, Error> {
+	) -> Result<Option<f64>> {
 		Ok(self.get_vector(tx, e_id).await?.map(|r| self.dist.calculate(&r, q)))
 	}
 
-	pub(super) async fn remove(&mut self, tx: &Transaction, e_id: ElementId) -> Result<(), Error> {
+	pub(super) async fn remove(&mut self, tx: &Transaction, e_id: ElementId) -> Result<()> {
 		self.elements.remove(&e_id);
-		let key = self.ikb.new_he_key(e_id)?;
-		tx.del(key).await?;
+		let key = self.ikb.new_he_key(e_id);
+		tx.del(&key).await?;
 		Ok(())
 	}
 }

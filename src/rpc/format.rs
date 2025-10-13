@@ -1,14 +1,13 @@
-use crate::net::headers::{Accept, ContentType};
-use crate::rpc::failure::Failure;
-use crate::rpc::response::Response;
 use axum::extract::ws::Message;
-use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
 use bytes::Bytes;
-use http::header::{HeaderValue, CONTENT_TYPE};
-use surrealdb::rpc::format::Format;
-use surrealdb::rpc::request::Request;
-use surrealdb::rpc::RpcError;
+use http::header::CONTENT_TYPE;
+use surrealdb::types::{SurrealValue, Value};
+use surrealdb_core::rpc::format::Format;
+use surrealdb_core::rpc::request::Request;
+use surrealdb_core::rpc::{DbResponse, DbResultError, RpcError};
+
+use crate::net::headers::{Accept, ContentType};
 
 impl From<&Accept> for Format {
 	fn from(value: &Accept) -> Self {
@@ -17,7 +16,7 @@ impl From<&Accept> for Format {
 			Accept::ApplicationJson => Format::Json,
 			Accept::ApplicationCbor => Format::Cbor,
 			Accept::ApplicationOctetStream => Format::Unsupported,
-			Accept::Surrealdb => Format::Bincode,
+			Accept::ApplicationFlatbuffers => Format::Flatbuffers,
 		}
 	}
 }
@@ -29,7 +28,7 @@ impl From<&ContentType> for Format {
 			ContentType::ApplicationJson => Format::Json,
 			ContentType::ApplicationCbor => Format::Cbor,
 			ContentType::ApplicationOctetStream => Format::Unsupported,
-			ContentType::Surrealdb => Format::Bincode,
+			ContentType::ApplicationSurrealDBFlatbuffers => Format::Flatbuffers,
 		}
 	}
 }
@@ -39,37 +38,75 @@ impl From<&Format> for ContentType {
 		match format {
 			Format::Json => ContentType::ApplicationJson,
 			Format::Cbor => ContentType::ApplicationCbor,
+			Format::Flatbuffers => ContentType::ApplicationSurrealDBFlatbuffers,
 			Format::Unsupported => ContentType::ApplicationOctetStream,
-			Format::Bincode => ContentType::Surrealdb,
-			_ => ContentType::TextPlain,
 		}
 	}
 }
 
 pub trait WsFormat {
 	/// Process a WebSocket RPC request
-	fn req_ws(&self, msg: Message) -> Result<Request, Failure>;
+	fn req_ws(&self, msg: Message) -> Result<Request, DbResultError>;
 	/// Process a WebSocket RPC response
-	fn res_ws(&self, res: Response) -> Result<(usize, Message), Failure>;
+	fn res_ws(&self, res: DbResponse) -> Result<(usize, Message), DbResultError>;
 }
 
 impl WsFormat for Format {
 	/// Process a WebSocket RPC request
-	fn req_ws(&self, msg: Message) -> Result<Request, Failure> {
+	fn req_ws(&self, msg: Message) -> Result<Request, DbResultError> {
 		let val = msg.into_data();
-		self.req(val).map_err(Into::into)
+		match self {
+			Format::Json => {
+				let val = surrealdb_core::rpc::format::json::decode(&val)
+					.map_err(|_| RpcError::ParseError)?;
+				if let Value::Object(obj) = val {
+					Ok(Request::from_object(obj)?)
+				} else {
+					Err(DbResultError::from(RpcError::ParseError))
+				}
+			}
+			Format::Cbor => {
+				let val = surrealdb_core::rpc::format::cbor::decode(&val)
+					.map_err(|_| RpcError::ParseError)?;
+				if let Value::Object(obj) = val {
+					Ok(Request::from_object(obj)?)
+				} else {
+					Err(DbResultError::from(RpcError::ParseError))
+				}
+			}
+			Format::Flatbuffers => {
+				let val = surrealdb_core::rpc::format::flatbuffers::decode(&val)
+					.map_err(|_| RpcError::ParseError)?;
+				if let Value::Object(obj) = val {
+					Ok(Request::from_object(obj)?)
+				} else {
+					Err(DbResultError::from(RpcError::ParseError))
+				}
+			}
+			Format::Unsupported => Err(DbResultError::from(RpcError::InvalidRequest)),
+		}
 	}
+
 	/// Process a WebSocket RPC response
-	fn res_ws(&self, res: Response) -> Result<(usize, Message), Failure> {
-		let res = self.res(res).map_err(Failure::from)?;
-		if matches!(self, Format::Json) {
-			// If this has significant performance overhead it could be
-			// replaced with unsafe { String::from_utf8_unchecked(res) }
-			// This would still be completel safe as in the case of JSON
-			// ressult come from a call to Into::<Vec<u8>> for String.
-			Ok((res.len(), Message::Text(String::from_utf8(res).unwrap())))
-		} else {
-			Ok((res.len(), Message::Binary(res)))
+	fn res_ws(&self, res: DbResponse) -> Result<(usize, Message), DbResultError> {
+		match self {
+			Format::Json => {
+				let val = surrealdb_core::rpc::format::json::encode_str(res.into_value())
+					.map_err(|_| RpcError::ParseError)?;
+				Ok((val.len(), Message::Text(val.into())))
+			}
+			Format::Cbor => {
+				let val = surrealdb_core::rpc::format::cbor::encode(res.into_value())
+					.map_err(|_| RpcError::ParseError)?;
+				Ok((val.len(), Message::Binary(val.into())))
+			}
+			Format::Flatbuffers => {
+				let res_value = res.into_value();
+				let val = surrealdb_core::rpc::format::flatbuffers::encode(&res_value)
+					.map_err(|_| RpcError::ParseError)?;
+				Ok((val.len(), Message::Binary(val.into())))
+			}
+			Format::Unsupported => Err(DbResultError::from(RpcError::InvalidRequest)),
 		}
 	}
 }
@@ -78,29 +115,63 @@ pub trait HttpFormat {
 	/// Process a HTTP RPC request
 	fn req_http(&self, body: Bytes) -> Result<Request, RpcError>;
 	/// Process a HTTP RPC response
-	fn res_http(&self, res: Response) -> Result<AxumResponse, RpcError>;
+	fn res_http(&self, res: DbResponse) -> Result<AxumResponse, RpcError>;
 }
 
 impl HttpFormat for Format {
 	/// Process a HTTP RPC request
 	fn req_http(&self, body: Bytes) -> Result<Request, RpcError> {
-		self.req(body)
-	}
-	/// Process a HTTP RPC response
-	fn res_http(&self, res: Response) -> Result<AxumResponse, RpcError> {
-		let res = self.res(res)?;
-		if matches!(self, Format::Json) {
-			// If this has significant performance overhead it could be
-			// replaced with unsafe { String::from_utf8_unchecked(res) }
-			// This would still be completel safe as in the case of JSON
-			// ressult come from a call to Into::<Vec<u8>> for String.
-			Ok((
-				[(CONTENT_TYPE, HeaderValue::from(ContentType::ApplicationJson))],
-				String::from_utf8(res).unwrap(),
-			)
-				.into_response())
-		} else {
-			Ok(([(CONTENT_TYPE, HeaderValue::from(ContentType::from(self)))], res).into_response())
+		match self {
+			Format::Json => {
+				let val = surrealdb_core::rpc::format::json::decode(&body)
+					.map_err(|_| RpcError::ParseError)?;
+				if let Value::Object(obj) = val {
+					Ok(Request::from_object(obj)?)
+				} else {
+					Err(RpcError::ParseError)
+				}
+			}
+			Format::Cbor => {
+				let val = surrealdb_core::rpc::format::cbor::decode(&body)
+					.map_err(|_| RpcError::ParseError)?;
+				if let Value::Object(obj) = val {
+					Ok(Request::from_object(obj)?)
+				} else {
+					Err(RpcError::ParseError)
+				}
+			}
+			Format::Flatbuffers => {
+				let val = surrealdb_core::rpc::format::flatbuffers::decode(&body)
+					.map_err(|_| RpcError::ParseError)?;
+				if let Value::Object(obj) = val {
+					Ok(Request::from_object(obj)?)
+				} else {
+					Err(RpcError::ParseError)
+				}
+			}
+			Format::Unsupported => Err(RpcError::InvalidRequest),
 		}
+	}
+
+	/// Process a HTTP RPC response
+	fn res_http(&self, res: DbResponse) -> Result<AxumResponse, RpcError> {
+		let val = match self {
+			Format::Json => surrealdb_core::rpc::format::json::encode_str(res.into_value())
+				.map_err(|_| RpcError::ParseError)?
+				.into_bytes(),
+			Format::Cbor => surrealdb_core::rpc::format::cbor::encode(res.into_value())
+				.map_err(|_| RpcError::ParseError)?,
+			Format::Flatbuffers => {
+				let res_value = res.into_value();
+				surrealdb_core::rpc::format::flatbuffers::encode(&res_value)
+					.map_err(|_| RpcError::ParseError)?
+			}
+			Format::Unsupported => return Err(RpcError::InvalidRequest),
+		};
+
+		Ok(AxumResponse::builder()
+			.header(CONTENT_TYPE, ContentType::from(self))
+			.body(val.into())
+			.unwrap())
 	}
 }

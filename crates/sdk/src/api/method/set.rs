@@ -1,12 +1,13 @@
-use crate::api::conn::Command;
-use crate::api::method::BoxFuture;
-use crate::api::Connection;
-use crate::api::Result;
-use crate::method::OnceLockExt;
-use crate::Surreal;
 use std::borrow::Cow;
 use std::future::IntoFuture;
-use surrealdb_core::sql::Value as CoreValue;
+
+use surrealdb_types::Value;
+
+use crate::Surreal;
+use crate::api::conn::Command;
+use crate::api::method::BoxFuture;
+use crate::api::{Connection, Result};
+use crate::method::OnceLockExt;
 
 /// A set future
 #[derive(Debug)]
@@ -14,14 +15,15 @@ use surrealdb_core::sql::Value as CoreValue;
 pub struct Set<'r, C: Connection> {
 	pub(super) client: Cow<'r, Surreal<C>>,
 	pub(super) key: String,
-	pub(super) value: Result<CoreValue>,
+	pub(super) value: Value,
 }
 
 impl<C> Set<'_, C>
 where
 	C: Connection,
 {
-	/// Converts to an owned type which can easily be moved to a different thread
+	/// Converts to an owned type which can easily be moved to a different
+	/// thread
 	pub fn into_owned(self) -> Set<'static, C> {
 		Set {
 			client: Cow::Owned(self.client.into_owned()),
@@ -43,7 +45,7 @@ where
 			router
 				.execute_unit(Command::Set {
 					key: self.key,
-					value: self.value?,
+					value: self.value,
 				})
 				.await
 		})

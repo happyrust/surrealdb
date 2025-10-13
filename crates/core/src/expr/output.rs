@@ -1,0 +1,46 @@
+use std::fmt::{self, Display};
+
+use crate::expr::Expr;
+use crate::expr::expression::VisitExpression;
+use crate::expr::field::Fields;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum Output {
+	None,
+	Null,
+	Diff,
+	After,
+	Before,
+	Fields(Fields),
+}
+
+impl VisitExpression for Output {
+	fn visit<F>(&self, visitor: &mut F)
+	where
+		F: FnMut(&Expr),
+	{
+		if let Self::Fields(f) = self {
+			f.visit(visitor);
+		}
+	}
+}
+
+impl Default for Output {
+	fn default() -> Self {
+		Self::None
+	}
+}
+
+impl Display for Output {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.write_str("RETURN ")?;
+		match self {
+			Self::None => f.write_str("NONE"),
+			Self::Null => f.write_str("NULL"),
+			Self::Diff => f.write_str("DIFF"),
+			Self::After => f.write_str("AFTER"),
+			Self::Before => f.write_str("BEFORE"),
+			Self::Fields(v) => Display::fmt(v, f),
+		}
+	}
+}

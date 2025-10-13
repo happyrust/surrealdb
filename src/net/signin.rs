@@ -1,24 +1,27 @@
-use super::headers::Accept;
-use super::AppState;
-use crate::cnf::HTTP_MAX_SIGNUP_BODY_SIZE;
-use crate::err::Error;
-use crate::net::input::bytes_to_utf8;
-use crate::net::output;
+use anyhow::Context as _;
 use axum::extract::DefaultBodyLimit;
-use axum::response::IntoResponse;
 use axum::routing::options;
-use axum::Extension;
-use axum::Router;
+use axum::{Extension, Router};
 use axum_extra::TypedHeader;
 use bytes::Bytes;
 use serde::Serialize;
-use surrealdb::dbs::capabilities::RouteTarget;
-use surrealdb::dbs::Session;
-use surrealdb::iam::signin::signin;
-use surrealdb::sql::Value;
+use surrealdb::types::Value;
+use surrealdb_core::dbs::Session;
+use surrealdb_core::dbs::capabilities::RouteTarget;
+use surrealdb_core::iam::signin::signin;
+use surrealdb_core::syn;
+use surrealdb_types::SurrealValue;
 use tower_http::limit::RequestBodyLimitLayer;
 
-#[derive(Serialize)]
+use super::AppState;
+use super::error::ResponseError;
+use super::headers::Accept;
+use super::output::Output;
+use crate::cnf::HTTP_MAX_SIGNUP_BODY_SIZE;
+use crate::net::error::Error as NetError;
+use crate::net::input::bytes_to_utf8;
+
+#[derive(Serialize, SurrealValue)]
 struct Success {
 	code: u16,
 	details: String,
@@ -52,45 +55,49 @@ async fn handler(
 	Extension(mut session): Extension<Session>,
 	accept: Option<TypedHeader<Accept>>,
 	body: Bytes,
-) -> Result<impl IntoResponse, impl IntoResponse> {
+) -> Result<Output, ResponseError> {
 	// Get a database reference
 	let kvs = &state.datastore;
 	// Check if capabilities allow querying the requested HTTP route
 	if !kvs.allows_http_route(&RouteTarget::Signin) {
 		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Signin);
-		return Err(Error::ForbiddenRoute(RouteTarget::Signin.to_string()));
+		return Err(NetError::ForbiddenRoute(RouteTarget::Signin.to_string()).into());
 	}
 	// Convert the HTTP body into text
-	let data = bytes_to_utf8(&body)?;
+	let data = bytes_to_utf8(&body).context("Non UTF-8 request body").map_err(ResponseError)?;
 	// Parse the provided data as JSON
-	match surrealdb::sql::json(data) {
+	match syn::json(data) {
 		// The provided value was an object
 		Ok(Value::Object(vars)) => {
-			match signin(kvs, &mut session, vars).await.map_err(Error::from) {
+			match signin(kvs, &mut session, vars.into()).await {
 				// Authentication was successful
 				Ok(v) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => {
-						Ok(output::json(&Success::new(v.token, v.refresh)))
+						Ok(Output::json_other(&Success::new(v.token, v.refresh)))
 					}
 					Some(Accept::ApplicationCbor) => {
-						Ok(output::cbor(&Success::new(v.token, v.refresh)))
+						let success = Success::new(v.token, v.refresh).into_value();
+						Ok(Output::cbor(&success))
 					}
 					// Text serialization
 					// NOTE: Only the token is returned in a plain text response.
-					Some(Accept::TextPlain) => Ok(output::text(v.token)),
+					Some(Accept::TextPlain) => Ok(Output::Text(v.token)),
 					// Internal serialization
-					Some(Accept::Surrealdb) => Ok(output::full(&Success::new(v.token, v.refresh))),
+					Some(Accept::ApplicationFlatbuffers) => {
+						let success = Success::new(v.token, v.refresh).into_value();
+						Ok(Output::flatbuffers(&success))
+					}
 					// Return nothing
-					None => Ok(output::none()),
+					None => Ok(Output::None),
 					// An incorrect content-type was requested
-					_ => Err(Error::InvalidType),
+					_ => Err(NetError::InvalidType.into()),
 				},
 				// There was an error with authentication
-				Err(err) => Err(err),
+				Err(err) => Err(ResponseError(err)),
 			}
 		}
 		// The provided value was not an object
-		_ => Err(Error::Request),
+		_ => Err(NetError::Request.into()),
 	}
 }

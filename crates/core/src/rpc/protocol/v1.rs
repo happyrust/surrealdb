@@ -1,26 +1,43 @@
-#[cfg(not(target_family = "wasm"))]
-use async_graphql::BatchRequest;
-use std::collections::BTreeMap;
+use std::mem;
 use std::sync::Arc;
 
+use anyhow::{Result, ensure};
+
+use crate::catalog::providers::{CatalogProvider, NamespaceProvider};
 #[cfg(not(target_family = "wasm"))]
 use crate::dbs::capabilities::ExperimentalTarget;
+use crate::dbs::capabilities::MethodTarget;
+use crate::dbs::{QueryResult, QueryType};
 use crate::err::Error;
-use crate::rpc::Data;
-use crate::rpc::Method;
-use crate::rpc::RpcContext;
-use crate::rpc::RpcError;
-use crate::{
-	dbs::{capabilities::MethodTarget, QueryType, Response},
-	rpc::args::Take,
-	sql::{
-		statements::{
-			CreateStatement, DeleteStatement, InsertStatement, KillStatement, LiveStatement,
-			RelateStatement, SelectStatement, UpdateStatement, UpsertStatement,
-		},
-		Array, Fields, Function, Model, Output, Query, Strand, Value,
-	},
+use crate::kvs::{LockType, TransactionType};
+use crate::rpc::args::extract_args;
+use crate::rpc::{DbResult, Method, RpcContext, RpcError};
+use crate::sql::{
+	Ast, CreateStatement, Data as SqlData, DeleteStatement, Expr, Fields, Function, FunctionCall,
+	InsertStatement, KillStatement, LiveStatement, Model, Output, Param, RelateStatement,
+	SelectStatement, TopLevelExpr, UpdateStatement, UpsertStatement,
 };
+use crate::types::{PublicArray, PublicRecordIdKey, PublicValue, PublicVariables};
+
+/// utility function converting a `Value::String` into a `Expr::Table`
+fn value_to_table(value: PublicValue) -> Expr {
+	match value {
+		PublicValue::String(s) => Expr::Table(s),
+		x => Expr::from_public_value(x),
+	}
+}
+
+/// returns if the expression returns a singular value when selected.
+///
+/// As this rpc is some what convuluted the singular conditions is not the same
+/// for all cases.
+fn singular(value: &PublicValue) -> bool {
+	match value {
+		PublicValue::Object(_) => true,
+		PublicValue::RecordId(t) => !matches!(t.key, PublicRecordIdKey::Range(_)),
+		_ => false,
+	}
+}
 
 #[expect(async_fn_in_trait)]
 pub trait RpcProtocolV1: RpcContext {
@@ -29,7 +46,7 @@ pub trait RpcProtocolV1: RpcContext {
 	// ------------------------------
 
 	/// Executes a method on this RPC implementation
-	async fn execute(&self, method: Method, params: Array) -> Result<Data, RpcError> {
+	async fn execute(&self, method: Method, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if capabilities allow executing the requested RPC method
 		if !self.kvs().allows_rpc_method(&MethodTarget {
 			method,
@@ -39,7 +56,7 @@ pub trait RpcProtocolV1: RpcContext {
 		}
 		// Execute the desired method
 		match method {
-			Method::Ping => Ok(Value::None.into()),
+			Method::Ping => Ok(DbResult::Other(PublicValue::None)),
 			Method::Info => self.info().await,
 			Method::Use => self.yuse(params).await,
 			Method::Signup => self.signup(params).await,
@@ -73,15 +90,17 @@ pub trait RpcProtocolV1: RpcContext {
 	// Methods for authentication
 	// ------------------------------
 
-	async fn yuse(&self, params: Array) -> Result<Data, RpcError> {
+	async fn yuse(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// For both ns+db, string = change, null = unset, none = do nothing
 		// We need to be able to adjust either ns or db without affecting the other
-		// To be able to select a namespace, and then list resources in that namespace, as an example
-		let (ns, db) = params.needs_two()?;
+		// To be able to select a namespace, and then list resources in that namespace,
+		// as an example
+		let (ns, db) = extract_args::<(PublicValue, PublicValue)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (ns, db)".to_string()))?;
 		// Get the context lock
 		let mutex = self.lock().clone();
 		// Lock the context for update
@@ -90,20 +109,38 @@ pub trait RpcProtocolV1: RpcContext {
 		let mut session = self.session().as_ref().clone();
 		// Update the selected namespace
 		match ns {
-			Value::None => (),
-			Value::Null => session.ns = None,
-			Value::Strand(ns) => session.ns = Some(ns.0),
-			_ => {
-				return Err(RpcError::InvalidParams);
+			PublicValue::None => (),
+			PublicValue::Null => session.ns = None,
+			PublicValue::String(ns) => {
+				let tx =
+					self.kvs().transaction(TransactionType::Write, LockType::Optimistic).await?;
+				tx.get_or_add_ns(&ns, self.kvs().is_strict_mode()).await?;
+				tx.commit().await?;
+
+				session.ns = Some(ns)
+			}
+			unexpected => {
+				return Err(RpcError::InvalidParams(format!(
+					"Expected ns to be string, got {unexpected:?}"
+				)));
 			}
 		}
 		// Update the selected database
 		match db {
-			Value::None => (),
-			Value::Null => session.db = None,
-			Value::Strand(db) => session.db = Some(db.0),
-			_ => {
-				return Err(RpcError::InvalidParams);
+			PublicValue::None => (),
+			PublicValue::Null => session.db = None,
+			PublicValue::String(db) => {
+				let ns = session.ns.clone().unwrap();
+				let tx =
+					self.kvs().transaction(TransactionType::Write, LockType::Optimistic).await?;
+				tx.ensure_ns_db(&ns, &db, self.kvs().is_strict_mode()).await?;
+				tx.commit().await?;
+				session.db = Some(db)
+			}
+			unexpected => {
+				return Err(RpcError::InvalidParams(format!(
+					"Expected db to be string, got {unexpected:?}"
+				)));
 			}
 		}
 		// Clear any residual database
@@ -113,17 +150,18 @@ pub trait RpcProtocolV1: RpcContext {
 		// Store the updated session
 		self.set_session(Arc::new(session));
 		// Drop the mutex guard
-		std::mem::drop(guard);
+		mem::drop(guard);
 		// Return nothing
-		Ok(Value::None.into())
+		Ok(DbResult::Other(PublicValue::None))
 	}
 
-	// TODO(gguillemas): Update this method in 3.0.0 to return an object instead of a string.
-	// This will allow returning refresh tokens as well as any additional credential resulting from signing up.
-	async fn signup(&self, params: Array) -> Result<Data, RpcError> {
+	// TODO(gguillemas): Update this method in 3.0.0 to return an object instead of
+	// a string. This will allow returning refresh tokens as well as any additional
+	// credential resulting from signing up.
+	async fn signup(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Process the method arguments
-		let Ok(Value::Object(v)) = params.needs_one() else {
-			return Err(RpcError::InvalidParams);
+		let Some(PublicValue::Object(params)) = extract_args(params.into_vec()) else {
+			return Err(RpcError::InvalidParams("Expected (params:object)".to_string()));
 		};
 		// Get the context lock
 		let mutex = self.lock().clone();
@@ -132,22 +170,26 @@ pub trait RpcProtocolV1: RpcContext {
 		// Clone the current session
 		let mut session = self.session().clone().as_ref().clone();
 		// Attempt signup, mutating the session
-		let out: Result<Value, Error> =
-			crate::iam::signup::signup(self.kvs(), &mut session, v).await.map(|v| v.token.into());
+		let out: Result<PublicValue> =
+			crate::iam::signup::signup(self.kvs(), &mut session, params.into())
+				.await
+				.map(|v| v.token.clone().map(PublicValue::String).unwrap_or(PublicValue::None));
+
 		// Store the updated session
 		self.set_session(Arc::new(session));
 		// Drop the mutex guard
-		std::mem::drop(guard);
+		mem::drop(guard);
 		// Return the signup result
-		out.map(Into::into).map_err(Into::into)
+		out.map(DbResult::Other).map_err(Into::into)
 	}
 
-	// TODO(gguillemas): Update this method in 3.0.0 to return an object instead of a string.
-	// This will allow returning refresh tokens as well as any additional credential resulting from signing in.
-	async fn signin(&self, params: Array) -> Result<Data, RpcError> {
+	// TODO(gguillemas): Update this method in 3.0.0 to return an object instead of
+	// a string. This will allow returning refresh tokens as well as any additional
+	// credential resulting from signing in.
+	async fn signin(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Process the method arguments
-		let Ok(Value::Object(v)) = params.needs_one() else {
-			return Err(RpcError::InvalidParams);
+		let Some(PublicValue::Object(params)) = extract_args(params.into_vec()) else {
+			return Err(RpcError::InvalidParams("Expected (params:object)".to_string()));
 		};
 		// Get the context lock
 		let mutex = self.lock().clone();
@@ -156,22 +198,23 @@ pub trait RpcProtocolV1: RpcContext {
 		// Clone the current session
 		let mut session = self.session().clone().as_ref().clone();
 		// Attempt signin, mutating the session
-		let out: Result<Value, Error> = crate::iam::signin::signin(self.kvs(), &mut session, v)
-			.await
-			// The default `signin` method just returns the token
-			.map(|v| v.token.into());
+		let out: Result<PublicValue> =
+			crate::iam::signin::signin(self.kvs(), &mut session, params.into())
+				.await
+				.map(|v| PublicValue::String(v.token.clone()));
 		// Store the updated session
 		self.set_session(Arc::new(session));
 		// Drop the mutex guard
-		std::mem::drop(guard);
+		mem::drop(guard);
 		// Return the signin result
-		out.map(Into::into).map_err(Into::into)
+		out.map(DbResult::Other).map_err(From::from)
 	}
 
-	async fn authenticate(&self, params: Array) -> Result<Data, RpcError> {
+	async fn authenticate(&self, params: PublicArray) -> Result<DbResult, RpcError> {
+		tracing::debug!("authenticate");
 		// Process the method arguments
-		let Ok(Value::Strand(token)) = params.needs_one() else {
-			return Err(RpcError::InvalidParams);
+		let Some(PublicValue::String(token)) = extract_args(params.into_vec()) else {
+			return Err(RpcError::InvalidParams("Expected (token:string)".to_string()));
 		};
 		// Get the context lock
 		let mutex = self.lock().clone();
@@ -180,19 +223,21 @@ pub trait RpcProtocolV1: RpcContext {
 		// Clone the current session
 		let mut session = self.session().as_ref().clone();
 		// Attempt authentication, mutating the session
-		let out: Result<Value, Error> =
-			crate::iam::verify::token(self.kvs(), &mut session, &token.0)
+		let out: Result<PublicValue> =
+			crate::iam::verify::token(self.kvs(), &mut session, token.as_str())
 				.await
-				.map(|_| Value::None);
+				.map(|_| PublicValue::None);
+
+		tracing::debug!("authenticate out: {out:?}");
 		// Store the updated session
 		self.set_session(Arc::new(session));
 		// Drop the mutex guard
-		std::mem::drop(guard);
+		mem::drop(guard);
 		// Return nothing on success
-		out.map_err(Into::into).map(Into::into)
+		out.map(DbResult::Other).map_err(From::from)
 	}
 
-	async fn invalidate(&self) -> Result<Data, RpcError> {
+	async fn invalidate(&self) -> Result<DbResult, RpcError> {
 		// Get the context lock
 		let mutex = self.lock().clone();
 		// Lock the context for update
@@ -204,12 +249,12 @@ pub trait RpcProtocolV1: RpcContext {
 		// Store the updated session
 		self.set_session(Arc::new(session));
 		// Drop the mutex guard
-		std::mem::drop(guard);
+		mem::drop(guard);
 		// Return nothing on success
-		Ok(Value::None.into())
+		Ok(DbResult::Other(PublicValue::None))
 	}
 
-	async fn reset(&self) -> Result<Data, RpcError> {
+	async fn reset(&self) -> Result<DbResult, RpcError> {
 		// Get the context lock
 		let mutex = self.lock().clone();
 		// Lock the context for update
@@ -217,558 +262,664 @@ pub trait RpcProtocolV1: RpcContext {
 		// Clone the current session
 		let mut session = self.session().as_ref().clone();
 		// Reset the current session
-		crate::iam::reset::reset(&mut session)?;
+		crate::iam::reset::reset(&mut session);
 		// Store the updated session
 		self.set_session(Arc::new(session));
 		// Drop the mutex guard
-		std::mem::drop(guard);
+		mem::drop(guard);
 		// Cleanup live queries
 		self.cleanup_lqs().await;
 		// Return nothing on success
-		Ok(Value::None.into())
+		Ok(DbResult::Other(PublicValue::None))
 	}
 
 	// ------------------------------
 	// Methods for identification
 	// ------------------------------
 
-	async fn info(&self) -> Result<Data, RpcError> {
+	async fn info(&self) -> Result<DbResult, RpcError> {
+		let what = vec![Expr::Param(Param::new("auth".to_owned()))];
+
+		// TODO: Check if this can be replaced by just evaluating the param or a
+		// `$auth.*` expression
 		// Specify the SQL query string
 		let sql = SelectStatement {
 			expr: Fields::all(),
-			what: vec![Value::Param("auth".into())].into(),
-			..Default::default()
-		}
-		.into();
+			what,
+			with: None,
+			cond: None,
+			omit: vec![],
+			only: false,
+			split: None,
+			group: None,
+			order: None,
+			limit: None,
+			start: None,
+			fetch: None,
+			version: None,
+			timeout: None,
+			parallel: false,
+			explain: None,
+			tempfiles: false,
+		};
+		let ast = Ast::single_expr(Expr::Select(Box::new(sql)));
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), None).await?;
+		let mut res = self.kvs().process(ast, &self.session(), None).await?;
 		// Extract the first value from the result
-		Ok(res.remove(0).result?.first().into())
+		// TODO: Move first here into the actual expression.
+		Ok(DbResult::Other(res.remove(0).result?.first().unwrap()))
 	}
 
 	// ------------------------------
 	// Methods for setting variables
 	// ------------------------------
 
-	async fn set(&self, params: Array) -> Result<Data, RpcError> {
+	async fn set(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((Value::Strand(key), val)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+		let Some((PublicValue::String(key), val)) =
+			extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+		else {
+			return Err(RpcError::InvalidParams("Expected (key:string, value:Value)".to_string()));
 		};
-		// Specify the query parameters
-		let var = Some(map! {
-			key.0.clone() => Value::None,
-		});
-		// Compute the specified parameter
-		match self.kvs().compute(val, &self.session(), var).await? {
-			// Remove the variable if undefined
-			Value::None => {
-				// Get the context lock
-				let mutex = self.lock().clone();
-				// Lock the context for update
-				let guard = mutex.acquire().await;
-				// Clone the parameters
-				let mut session = self.session().as_ref().clone();
-				// Remove the set parameter
-				session.parameters.remove(&key.0);
-				// Store the updated session
-				self.set_session(Arc::new(session));
-				// Drop the mutex guard
-				std::mem::drop(guard);
+		// TODO(3.0.0): The value inversion PR has removed the ability to set a value
+		// from an expression.
+		// Maybe reintroduce somehow.
+
+		let mutex = self.lock();
+		let guard = mutex.acquire().await.unwrap();
+		let mut session = self.session().as_ref().clone();
+
+		if session.expired() {
+			return Err(anyhow::Error::new(Error::ExpiredSession).into());
+		}
+
+		match val {
+			None | Some(PublicValue::None) => session.variables.remove(key.as_str()),
+			Some(val) => {
+				crate::rpc::check_protected_param(&key)?;
+				session.variables.insert(key, val)
 			}
-			// Store the variable if defined
-			v => {
-				// Get the context lock
-				let mutex = self.lock().clone();
-				// Lock the context for update
-				let guard = mutex.acquire().await;
-				// Clone the parameters
-				let mut session = self.session().as_ref().clone();
-				// Remove the set parameter
-				session.parameters.insert(key.0, v);
-				// Store the updated session
-				self.set_session(Arc::new(session));
-				// Drop the mutex guard
-				std::mem::drop(guard);
-			}
-		};
+		}
+		self.set_session(Arc::new(session));
+
+		mem::drop(guard);
+
 		// Return nothing
-		Ok(Value::Null.into())
+		Ok(DbResult::Other(PublicValue::Null))
 	}
 
-	async fn unset(&self, params: Array) -> Result<Data, RpcError> {
+	async fn unset(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok(Value::Strand(key)) = params.needs_one() else {
-			return Err(RpcError::InvalidParams);
+		let Some(PublicValue::String(key)) = extract_args(params.into_vec()) else {
+			return Err(RpcError::InvalidParams("Expected (key)".to_string()));
 		};
+
 		// Get the context lock
 		let mutex = self.lock().clone();
-		// Lock the context for update
 		let guard = mutex.acquire().await;
-		// Clone the parameters
 		let mut session = self.session().as_ref().clone();
-		// Remove the set parameter
-		session.parameters.remove(&key.0);
-		// Store the updated session
+		session.variables.remove(key.as_str());
 		self.set_session(Arc::new(session));
-		// Drop the mutex guard
-		std::mem::drop(guard);
-		// Return nothing
-		Ok(Value::Null.into())
+		mem::drop(guard);
+
+		Ok(DbResult::Other(PublicValue::Null))
 	}
 
 	// ------------------------------
 	// Methods for live queries
 	// ------------------------------
 
-	async fn kill(&self, params: Array) -> Result<Data, RpcError> {
+	async fn kill(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let id = params.needs_one()?;
+		let (id,) = extract_args::<(PublicValue,)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (id)".to_string()))?;
+
 		// Specify the SQL query string
-		let sql = KillStatement {
-			id,
-		}
-		.into();
+		let ast = Ast {
+			expressions: vec![TopLevelExpr::Kill(KillStatement {
+				id: Expr::from_public_value(id),
+			})],
+		};
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let vars = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.query_inner(Value::Query(sql), var).await?;
+		let mut res = run_query(self, QueryForm::Parsed(ast), vars).await?;
 		// Extract the first query result
-		Ok(res.remove(0).result?.into())
+		Ok(DbResult::Other(res.remove(0).result?))
 	}
 
-	async fn live(&self, params: Array) -> Result<Data, RpcError> {
+	async fn live(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let (what, diff) = params.needs_one_or_two()?;
+		let (what, diff) = extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what, diff)".to_string()))?;
+
+		// If value is a strand, handle it as if it was a table.
+		let what = match what {
+			PublicValue::String(x) => Expr::Table(x),
+			x => Expr::from_public_value(x),
+		};
+
 		// Specify the SQL query string
-		let sql = LiveStatement::new_from_what_expr(
-			match diff.is_true() {
-				true => Fields::default(),
-				false => Fields::all(),
+		let sql = LiveStatement {
+			fields: if diff.unwrap_or(PublicValue::None).is_true() {
+				Fields::none()
+			} else {
+				Fields::all()
 			},
-			what.could_be_table(),
-		)
-		.into();
+			what,
+			cond: None,
+			fetch: None,
+		};
+		let ast = Ast {
+			expressions: vec![TopLevelExpr::Live(Box::new(sql))],
+		};
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
-		// Execute the query on the database
-		let mut res = self.query_inner(Value::Query(sql), var).await?;
+		let vars = Some(self.session().variables.clone());
+
+		let res = run_query(self, QueryForm::Parsed(ast), vars).await?;
+
 		// Extract the first query result
-		Ok(res.remove(0).result?.into())
+		Ok(DbResult::Other(res.into_iter().next().unwrap().result?))
 	}
 
 	// ------------------------------
 	// Methods for selecting
 	// ------------------------------
 
-	async fn select(&self, params: Array) -> Result<Data, RpcError> {
+	async fn select(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok(what) = params.needs_one() else {
-			return Err(RpcError::InvalidParams);
+		let (what,) = extract_args::<(PublicValue,)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what:Value)".to_string()))?;
+
+		// If the what is a single record with a non range value, make it return only a
+		// single result.
+		let only = match what {
+			PublicValue::RecordId(ref x) => !x.key.is_range(),
+			_ => false,
 		};
+
+		// If value is a string, handle it as if it was a table.
+		let what = match what {
+			PublicValue::String(x) => Expr::Table(x),
+			x => Expr::from_public_value(x),
+		};
+
 		// Specify the SQL query string
 		let sql = SelectStatement {
-			only: what.is_thing_single(),
+			only,
 			expr: Fields::all(),
-			what: vec![what.could_be_table()].into(),
-			..Default::default()
-		}
-		.into();
+			what: vec![what],
+			with: None,
+			cond: None,
+			omit: vec![],
+			split: None,
+			group: None,
+			order: None,
+			limit: None,
+			start: None,
+			fetch: None,
+			version: None,
+			timeout: None,
+			parallel: false,
+			explain: None,
+			tempfiles: false,
+		};
+		let ast = Ast::single_expr(Expr::Select(Box::new(sql)));
+
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let vars = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), vars).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for inserting
 	// ------------------------------
 
-	async fn insert(&self, params: Array) -> Result<Data, RpcError> {
+	async fn insert(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data)) = params.needs_two() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data) = extract_args::<(PublicValue, PublicValue)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what:Value, data:Value)".to_string()))?;
+
+		let into = match what {
+			PublicValue::String(x) => Some(Expr::Table(x)),
+			x => {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(Expr::from_public_value(x))
+				}
+			}
 		};
+
 		// Specify the SQL query string
 		let sql = InsertStatement {
-			into: match what.is_none_or_null() {
-				false => Some(what.could_be_table()),
-				true => None,
-			},
-			data: crate::sql::Data::SingleExpression(data),
+			into,
+			data: SqlData::SingleExpression(Expr::from_public_value(data)),
 			output: Some(Output::After),
 			..Default::default()
-		}
-		.into();
+		};
+		let ast = Ast::single_expr(Expr::Insert(Box::new(sql)));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
-	async fn insert_relation(&self, params: Array) -> Result<Data, RpcError> {
+	async fn insert_relation(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data)) = params.needs_two() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data) = extract_args::<(PublicValue, PublicValue)>(params.to_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what, data)".to_string()))?;
+
+		let what = match what {
+			PublicValue::Null | PublicValue::None => None,
+			PublicValue::String(x) => Some(Expr::Table(x)),
+			x => Some(Expr::from_public_value(x)),
 		};
+
+		let data = SqlData::SingleExpression(Expr::from_public_value(data));
+
 		// Specify the SQL query string
 		let sql = InsertStatement {
 			relation: true,
-			into: match what.is_none_or_null() {
-				false => Some(what.could_be_table()),
-				true => None,
-			},
-			data: crate::sql::Data::SingleExpression(data),
+			into: what,
+			data,
 			output: Some(Output::After),
-			..Default::default()
-		}
-		.into();
+			ignore: false,
+			update: None,
+			timeout: None,
+			parallel: false,
+			version: None,
+		};
+		let ast = Ast::single_expr(Expr::Insert(Box::new(sql)));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for creating
 	// ------------------------------
 
-	async fn create(&self, params: Array) -> Result<Data, RpcError> {
+	async fn create(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data) = extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what:Value, data:Value)".to_string()))?;
+
+		let only = match what {
+			PublicValue::String(_) => true,
+			PublicValue::RecordId(ref x) => !matches!(x.key, PublicRecordIdKey::Range(_)),
+			_ => false,
 		};
-		let what = what.could_be_table();
+
+		let data = data
+			.and_then(|x| {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(x)
+				}
+			})
+			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
+
 		// Specify the SQL query string
 		let sql = CreateStatement {
-			only: what.is_thing_single() || what.is_table(),
-			what: vec![what.could_be_table()].into(),
-			data: match data.is_none_or_null() {
-				false => Some(crate::sql::Data::ContentExpression(data)),
-				true => None,
-			},
+			only,
+			what: vec![value_to_table(what)],
+			data,
 			output: Some(Output::After),
-			..Default::default()
-		}
-		.into();
+			timeout: None,
+			parallel: false,
+			version: None,
+		};
+		let ast = Ast::single_expr(Expr::Create(Box::new(sql)));
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), None).await?;
+		let mut res = self.kvs().process(ast, &self.session(), None).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for upserting
 	// ------------------------------
 
-	async fn upsert(&self, params: Array) -> Result<Data, RpcError> {
+	async fn upsert(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data) = extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what:Value, data:Value)".to_string()))?;
+
+		let only = match what {
+			PublicValue::RecordId(ref x) => !matches!(x.key, PublicRecordIdKey::Range(_)),
+			_ => false,
 		};
+
+		let data = data
+			.and_then(|x| {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(x)
+				}
+			})
+			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
+
 		// Specify the SQL query string
 		let sql = UpsertStatement {
-			only: what.is_thing_single(),
-			what: vec![what.could_be_table()].into(),
-			data: match data.is_none_or_null() {
-				false => Some(crate::sql::Data::ContentExpression(data)),
-				true => None,
-			},
+			only,
+			what: vec![value_to_table(what)],
+			data,
 			output: Some(Output::After),
-			..Default::default()
-		}
-		.into();
+			with: None,
+			cond: None,
+			timeout: None,
+			parallel: false,
+			explain: None,
+		};
+		let ast = Ast::single_expr(Expr::Upsert(Box::new(sql)));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for updating
 	// ------------------------------
 
-	async fn update(&self, params: Array) -> Result<Data, RpcError> {
+	async fn update(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data) = extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what, data)".to_string()))?;
+
+		let only = match what {
+			PublicValue::RecordId(ref x) => !matches!(x.key, PublicRecordIdKey::Range(_)),
+			_ => false,
 		};
+
+		let data = data
+			.and_then(|x| {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(x)
+				}
+			})
+			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
 		// Specify the SQL query string
 		let sql = UpdateStatement {
-			only: what.is_thing_single(),
-			what: vec![what.could_be_table()].into(),
-			data: match data.is_none_or_null() {
-				false => Some(crate::sql::Data::ContentExpression(data)),
-				true => None,
-			},
+			only,
+			what: vec![value_to_table(what)],
+			data,
 			output: Some(Output::After),
-			..Default::default()
-		}
-		.into();
+			with: None,
+			cond: None,
+			timeout: None,
+			parallel: false,
+			explain: None,
+		};
+		let ast = Ast::single_expr(Expr::Update(Box::new(sql)));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for merging
 	// ------------------------------
 
-	async fn merge(&self, params: Array) -> Result<Data, RpcError> {
+	async fn merge(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data) = extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what:Value, data:Value)".to_string()))?;
+
+		let only = match what {
+			PublicValue::RecordId(ref x) => !matches!(x.key, PublicRecordIdKey::Range(_)),
+			_ => false,
 		};
+
+		let data = data
+			.and_then(|x| {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(x)
+				}
+			})
+			.map(|x| SqlData::MergeExpression(Expr::from_public_value(x)));
 		// Specify the SQL query string
 		let sql = UpdateStatement {
-			only: what.is_thing_single(),
-			what: vec![what.could_be_table()].into(),
-			data: match data.is_none_or_null() {
-				false => Some(crate::sql::Data::MergeExpression(data)),
-				true => None,
-			},
+			only,
+			what: vec![value_to_table(what)],
+			data,
 			output: Some(Output::After),
 			..Default::default()
-		}
-		.into();
+		};
+		let ast = Ast::single_expr(Expr::Update(Box::new(sql)));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for patching
 	// ------------------------------
 
-	async fn patch(&self, params: Array) -> Result<Data, RpcError> {
+	async fn patch(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((what, data, diff)) = params.needs_one_two_or_three() else {
-			return Err(RpcError::InvalidParams);
+		let (what, data, diff) =
+			extract_args::<(PublicValue, Option<PublicValue>, Option<PublicValue>)>(
+				params.into_vec(),
+			)
+			.ok_or(RpcError::InvalidParams(
+				"Expected (what:Value, data:Value, diff:Value)".to_string(),
+			))?;
+
+		// Process the method arguments
+		let only = match what {
+			PublicValue::RecordId(ref x) => !matches!(x.key, PublicRecordIdKey::Range(_)),
+			_ => false,
 		};
+
+		let data = data
+			.and_then(|x| {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(x)
+				}
+			})
+			.map(|x| SqlData::PatchExpression(Expr::from_public_value(x)));
+
+		let diff = matches!(diff, Some(PublicValue::Bool(true)));
+
 		// Specify the SQL query string
-		let sql = UpdateStatement {
-			only: what.is_thing_single(),
-			what: vec![what.could_be_table()].into(),
-			data: Some(crate::sql::Data::PatchExpression(data)),
-			output: match diff.is_true() {
-				true => Some(Output::Diff),
-				false => Some(Output::After),
+		let expr = Expr::Update(Box::new(UpdateStatement {
+			only,
+			what: vec![value_to_table(what)],
+			data,
+			output: if diff {
+				Some(Output::Diff)
+			} else {
+				Some(Output::After)
 			},
-			..Default::default()
-		}
-		.into();
+			with: None,
+			cond: None,
+			timeout: None,
+			parallel: false,
+			explain: None,
+		}));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(Ast::single_expr(expr), &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for relating
 	// ------------------------------
 
-	async fn relate(&self, params: Array) -> Result<Data, RpcError> {
+	async fn relate(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((from, kind, with, data)) = params.needs_three_or_four() else {
-			return Err(RpcError::InvalidParams);
-		};
+		let (from, kind, with, data) =
+			extract_args::<(PublicValue, PublicValue, PublicValue, Option<PublicValue>)>(
+				params.to_vec(),
+			)
+			.ok_or(RpcError::InvalidParams(
+				"Expected (from:Value, kind:Value, with:Value, data:Value)".to_string(),
+			))?;
+
+		// Returns if selecting on this value returns a single result.
+		let only = singular(&from) && singular(&with);
+
+		let data = data
+			.and_then(|x| {
+				if x.is_nullish() {
+					None
+				} else {
+					Some(x)
+				}
+			})
+			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
+
 		// Specify the SQL query string
-		let sql = RelateStatement {
-			only: from.is_singular_selector() && with.is_singular_selector(),
-			from,
-			kind: kind.could_be_table(),
-			with,
-			data: match data.is_none_or_null() {
-				false => Some(crate::sql::Data::ContentExpression(data)),
-				true => None,
-			},
+		let expr = Expr::Relate(Box::new(RelateStatement {
+			only,
+			from: Expr::from_public_value(from),
+			through: value_to_table(kind),
+			to: Expr::from_public_value(with),
+			data,
 			output: Some(Output::After),
-			..Default::default()
-		}
-		.into();
+			uniq: false,
+			timeout: None,
+			parallel: false,
+		}));
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(Ast::single_expr(expr), &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for deleting
 	// ------------------------------
 
-	async fn delete(&self, params: Array) -> Result<Data, RpcError> {
+	async fn delete(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok(what) = params.needs_one() else {
-			return Err(RpcError::InvalidParams);
-		};
+		let (what,) = extract_args::<(PublicValue,)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams("Expected (what:Value)".to_string()))?;
 		// Specify the SQL query string
-		let sql = DeleteStatement {
-			only: what.is_thing_single(),
-			what: vec![what.could_be_table()].into(),
+		let sql = Expr::Delete(Box::new(DeleteStatement {
+			only: singular(&what),
+			what: vec![value_to_table(what)],
 			output: Some(Output::Before),
-			..Default::default()
-		}
-		.into();
+			with: None,
+			cond: None,
+			timeout: None,
+			parallel: false,
+			explain: None,
+		}));
+		let ast = Ast::single_expr(sql);
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the query on the database
-		let mut res = self.kvs().process(sql, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res
-			.remove(0)
-			.result
-			.or_else(|e| match e {
-				Error::SingleOnlyOutput => Ok(Value::None),
-				e => Err(e),
-			})?
-			.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
 	// Methods for getting info
 	// ------------------------------
 
-	async fn version(&self, params: Array) -> Result<Data, RpcError> {
+	async fn version(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		match params.len() {
 			0 => Ok(self.version_data()),
-			_ => Err(RpcError::InvalidParams),
+			_ => Err(RpcError::InvalidParams("Expected 0 arguments".to_string())),
 		}
 	}
 
@@ -776,76 +927,118 @@ pub trait RpcProtocolV1: RpcContext {
 	// Methods for querying
 	// ------------------------------
 
-	async fn query(&self, params: Array) -> Result<Data, RpcError> {
+	async fn query(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((query, vars)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+		let (query, vars) = extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+			.ok_or(RpcError::InvalidParams(
+			"Expected (query:string, vars:object)".to_string(),
+		))?;
+
+		let PublicValue::String(query) = query else {
+			return Err(RpcError::InvalidParams("Expected query to be string".to_string()));
 		};
-		// Check the query input type
-		if !(query.is_query() || query.is_strand()) {
-			return Err(RpcError::InvalidParams);
-		}
+
 		// Specify the query variables
 		let vars = match vars {
-			Value::Object(mut v) => Some(mrg! {v.0, self.session().parameters}),
-			Value::None | Value::Null => Some(self.session().parameters.clone()),
-			_ => return Err(RpcError::InvalidParams),
+			Some(PublicValue::Object(v)) => {
+				let mut merged = self.session().variables.clone();
+				merged.extend(v.into());
+				Some(merged)
+			}
+			None | Some(PublicValue::None | PublicValue::Null) => {
+				Some(self.session().variables.clone())
+			}
+			unexpected => {
+				return Err(RpcError::InvalidParams(format!(
+					"Expected vars to be object, got {unexpected:?}"
+				)));
+			}
 		};
-		// Execute the specified query
-		self.query_inner(query, vars).await.map(Into::into)
+
+		let res = run_query(self, QueryForm::Text(&query), vars).await?;
+		Ok(DbResult::Query(res))
 	}
 
 	// ------------------------------
 	// Methods for running functions
 	// ------------------------------
 
-	async fn run(&self, params: Array) -> Result<Data, RpcError> {
+	async fn run(&self, params: PublicArray) -> Result<DbResult, RpcError> {
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
 		}
 		// Process the method arguments
-		let Ok((name, version, args)) = params.needs_one_two_or_three() else {
-			return Err(RpcError::InvalidParams);
-		};
+		let (name, version, args) =
+			extract_args::<(PublicValue, Option<PublicValue>, Option<PublicValue>)>(
+				params.into_vec(),
+			)
+			.ok_or(RpcError::InvalidParams(
+				"Expected (name:string, version:string, args:array)".to_string(),
+			))?;
 		// Parse the function name argument
 		let name = match name {
-			Value::Strand(Strand(v)) => v,
-			_ => return Err(RpcError::InvalidParams),
+			PublicValue::String(v) => v,
+			unexpected => {
+				return Err(RpcError::InvalidParams(format!(
+					"Expected name to be string, got {unexpected:?}"
+				)));
+			}
 		};
 		// Parse any function version argument
 		let version = match version {
-			Value::Strand(Strand(v)) => Some(v),
-			Value::None | Value::Null => None,
-			_ => return Err(RpcError::InvalidParams),
+			Some(PublicValue::String(v)) => Some(v),
+			None | Some(PublicValue::None | PublicValue::Null) => None,
+			unexpected => {
+				return Err(RpcError::InvalidParams(format!(
+					"Expected version to be string, got {unexpected:?}"
+				)));
+			}
 		};
 		// Parse the function arguments if specified
 		let args = match args {
-			Value::Array(Array(arr)) => arr,
-			Value::None | Value::Null => vec![],
-			_ => return Err(RpcError::InvalidParams),
-		};
-		// Specify the function to run
-		let func: Query = match &name[0..4] {
-			"fn::" => Function::Custom(name.chars().skip(4).collect(), args).into(),
-			"ml::" => Model {
-				name: name.chars().skip(4).collect(),
-				version: version.ok_or(RpcError::InvalidParams)?,
-				args,
+			Some(PublicValue::Array(args)) => {
+				args.into_iter().map(Expr::from_public_value).collect::<Vec<Expr>>()
 			}
-			.into(),
-			_ => Function::Normal(name, args).into(),
+			None | Some(PublicValue::None | PublicValue::Null) => vec![],
+			unexpected => {
+				return Err(RpcError::InvalidParams(format!(
+					"Expected args to be array, got {unexpected:?}"
+				)));
+			}
 		};
+
+		let name = if let Some(rest) = name.strip_prefix("fn::") {
+			Function::Custom(rest.to_owned())
+		} else if let Some(rest) = name.strip_prefix("ml::") {
+			let name = rest.to_owned();
+			Function::Model(Model {
+				name,
+				version: version.ok_or(RpcError::InvalidParams(
+					"Expected version to be set for model function".to_string(),
+				))?,
+			})
+		} else {
+			Function::Normal(name)
+		};
+
+		let expr = Expr::FunctionCall(Box::new(FunctionCall {
+			receiver: name,
+			arguments: args,
+		}));
+		let ast = Ast::single_expr(expr);
+
 		// Specify the query parameters
-		let var = Some(self.session().parameters.clone());
+		let var = Some(self.session().variables.clone());
 		// Execute the function on the database
-		let mut res = self.kvs().process(func, &self.session(), var).await?;
+		let mut res = self.kvs().process(ast, &self.session(), var).await?;
 		// Extract the first query result
-		Ok(res.remove(0).result?.into())
+		let res = res.remove(0).result?;
+		Ok(DbResult::Other(res))
 	}
 
 	// ------------------------------
@@ -853,12 +1046,14 @@ pub trait RpcProtocolV1: RpcContext {
 	// ------------------------------
 
 	#[cfg(target_family = "wasm")]
-	async fn graphql(&self, _: Array) -> Result<Data, RpcError> {
+	async fn graphql(&self, _: PublicArray) -> Result<DbResult, RpcError> {
 		Err(RpcError::MethodNotFound)
 	}
 
 	#[cfg(not(target_family = "wasm"))]
-	async fn graphql(&self, params: Array) -> Result<Data, RpcError> {
+	async fn graphql(&self, _params: PublicArray) -> Result<DbResult, RpcError> {
+		//use crate::gql;
+
 		// Check if the user is allowed to query
 		if !self.kvs().allows_query_by_subject(self.session().au.as_ref()) {
 			return Err(RpcError::MethodNotAllowed);
@@ -867,16 +1062,16 @@ pub trait RpcProtocolV1: RpcContext {
 			return Err(RpcError::BadGQLConfig);
 		}
 
-		use serde::Serialize;
+		// TODO(3.0.0): Reimplement GraphQL.
+		Err(RpcError::from(anyhow::Error::new(Error::Unimplemented("graphql".to_owned()))))
 
-		use crate::gql;
-
+		/*
 		if !Self::GQL_SUPPORT {
 			return Err(RpcError::BadGQLConfig);
 		}
 
 		let Ok((query, options)) = params.needs_one_or_two() else {
-			return Err(RpcError::InvalidParams);
+			return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec())));
 		};
 
 		enum GraphQLFormat {
@@ -890,27 +1085,27 @@ pub trait RpcProtocolV1: RpcContext {
 		// Process any secondary config options
 		match options {
 			// A config object was passed
-			Value::Object(o) => {
+			SqlValue::Object(o) => {
 				for (k, v) in o {
 					match (k.as_str(), v) {
-						("pretty", Value::Bool(b)) => pretty = b,
-						("format", Value::Strand(s)) => match s.as_str() {
+						("pretty", SqlValue::Bool(b)) => pretty = b,
+						("format", SqlValue::String(s)) => match s.as_str() {
 							"json" => format = GraphQLFormat::Json,
-							_ => return Err(RpcError::InvalidParams),
+							_ => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 						},
-						_ => return Err(RpcError::InvalidParams),
+						_ => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 					}
 				}
 			}
 			// The config argument was not supplied
-			Value::None => (),
+			SqlValue::None => (),
 			// An invalid config argument was received
-			_ => return Err(RpcError::InvalidParams),
+			_ => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 		}
 		// Process the graphql query argument
 		let req = match query {
 			// It is a string, so parse the query
-			Value::Strand(s) => match format {
+			SqlValue::String(s) => match format {
 				GraphQLFormat::Json => {
 					let tmp: BatchRequest =
 						serde_json::from_str(s.as_str()).map_err(|_| RpcError::ParseError)?;
@@ -918,34 +1113,34 @@ pub trait RpcProtocolV1: RpcContext {
 				}
 			},
 			// It is an object, so build the query
-			Value::Object(mut o) => {
+			SqlValue::Object(mut o) => {
 				// We expect a `query` key with the graphql query
 				let mut tmp = match o.remove("query") {
-					Some(Value::Strand(s)) => async_graphql::Request::new(s),
-					_ => return Err(RpcError::InvalidParams),
+					Some(SqlValue::String(s)) => async_graphql::Request::new(s),
+					_ => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 				};
 				// We can accept a `variables` key with graphql variables
 				match o.remove("variables").or(o.remove("vars")) {
-					Some(obj @ Value::Object(_)) => {
-						let gql_vars = gql::schema::sql_value_to_gql_value(obj)
+					Some(obj @ SqlValue::Object(_)) => {
+						let gql_vars = gql::schema::sql_value_to_gql_value(obj.into())
 							.map_err(|_| RpcError::InvalidRequest)?;
 
 						tmp = tmp.variables(async_graphql::Variables::from_value(gql_vars));
 					}
-					Some(_) => return Err(RpcError::InvalidParams),
+					Some(_) => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 					None => {}
 				}
 				// We can accept an `operation` key with a graphql operation name
 				match o.remove("operationName").or(o.remove("operation")) {
-					Some(Value::Strand(s)) => tmp = tmp.operation_name(s),
-					Some(_) => return Err(RpcError::InvalidParams),
+					Some(SqlValue::String(s)) => tmp = tmp.operation_name(s),
+					Some(_) => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 					None => {}
 				}
 				// Return the graphql query object
 				tmp
 			}
 			// We received an invalid graphql query
-			_ => return Err(RpcError::InvalidParams),
+			_ => return Err(RpcError::InvalidParams(format!("Expected (query, options) got {:?}", params.into_vec()))),
 		};
 		// Process and cache the graphql schema
 		let schema = self
@@ -956,62 +1151,59 @@ pub trait RpcProtocolV1: RpcContext {
 		// Execute the request against the schema
 		let res = schema.execute(req).await;
 		// Serialize the graphql response
-		let out = match pretty {
-			true => {
-				let mut buf = Vec::new();
-				let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
-				let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-				res.serialize(&mut ser).ok().and_then(|_| String::from_utf8(buf).ok())
-			}
-			false => serde_json::to_string(&res).ok(),
+		let out = if pretty {
+			let mut buf = Vec::new();
+			let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+			let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+			res.serialize(&mut ser).ok().and_then(|_| String::from_utf8(buf).ok())
+		} else {
+			serde_json::to_string(&res).ok()
 		}
 		.ok_or(RpcError::Thrown("Serialization Error".to_string()))?;
 		// Output the graphql response
-		Ok(Value::Strand(out.into()).into())
+		Ok(PublicValue::String(out.into()).into())
+			*/
 	}
+}
 
-	// ------------------------------
-	// Private methods
-	// ------------------------------
+enum QueryForm<'a> {
+	Text(&'a str),
+	Parsed(Ast),
+}
 
-	async fn query_inner(
-		&self,
-		query: Value,
-		vars: Option<BTreeMap<String, Value>>,
-	) -> Result<Vec<Response>, RpcError> {
-		// If no live query handler force realtime off
-		if !Self::LQ_SUPPORT && self.session().rt {
-			return Err(RpcError::BadLQConfig);
-		}
-		// Execute the query on the database
-		let res = match query {
-			Value::Query(sql) => self.kvs().process(sql, &self.session(), vars).await?,
-			Value::Strand(sql) => self.kvs().execute(&sql, &self.session(), vars).await?,
-			_ => return Err(fail!("Unexpected query type: {query:?}").into()),
-		};
+async fn run_query<T>(
+	this: &T,
+	query: QueryForm<'_>,
+	vars: Option<PublicVariables>,
+) -> Result<Vec<QueryResult>>
+where
+	T: RpcContext + ?Sized,
+{
+	let session = this.session();
+	ensure!(T::LQ_SUPPORT || !session.rt, RpcError::BadLQConfig);
 
-		// Post-process hooks for web layer
-		for response in &res {
-			// This error should be unreachable because we shouldn't proceed if there's no handler
-			self.handle_live_query_results(response).await;
-		}
-		// Return the result to the client
-		Ok(res)
-	}
-
-	async fn handle_live_query_results(&self, res: &Response) {
-		match &res.query_type {
+	let res = match query {
+		QueryForm::Text(query) => this.kvs().execute(query, &session, vars).await?,
+		QueryForm::Parsed(ast) => this.kvs().process(ast, &session, vars).await?,
+	};
+	// Post-process hooks for web layer
+	for response in &res {
+		// This error should be unreachable because we shouldn't proceed if there's no
+		// handler
+		match &response.query_type {
 			QueryType::Live => {
-				if let Ok(Value::Uuid(lqid)) = &res.result {
-					self.handle_live(&lqid.0).await;
+				if let Ok(PublicValue::Uuid(lqid)) = &response.result {
+					this.handle_live(&lqid.0).await;
 				}
 			}
 			QueryType::Kill => {
-				if let Ok(Value::Uuid(lqid)) = &res.result {
-					self.handle_kill(&lqid.0).await;
+				if let Ok(PublicValue::Uuid(lqid)) = &response.result {
+					this.handle_kill(&lqid.0).await;
 				}
 			}
 			_ => {}
 		}
 	}
+	// Return the result to the client
+	Ok(res)
 }

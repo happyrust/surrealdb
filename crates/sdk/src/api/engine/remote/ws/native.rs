@@ -1,53 +1,40 @@
-use super::{HandleResult, PendingRequest, ReplayMethod, RequestEffect, PATH};
-use crate::api::conn::Route;
-use crate::api::conn::Router;
-use crate::api::conn::{Command, DbResponse};
-use crate::api::conn::{Connection, RequestData};
-use crate::api::engine::remote::ws::Client;
-use crate::api::engine::remote::ws::PING_INTERVAL;
-use crate::api::engine::remote::Response;
-use crate::api::engine::remote::{deserialize, serialize};
+use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::sync::atomic::AtomicI64;
+
+use async_channel::Receiver;
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
+use surrealdb_core::dbs::QueryResultBuilder;
+use surrealdb_core::rpc::{DbResponse, DbResult};
+use surrealdb_types::SurrealValue;
+use tokio::net::TcpStream;
+use tokio::sync::watch;
+use tokio::time;
+use tokio::time::MissedTickBehavior;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::Error as WsError;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
+use trice::Instant;
+
+use super::{HandleResult, PATH, PendingRequest, ReplayMethod, RequestEffect};
+use crate::api::conn::{self, Command, RequestData, Route, Router};
+use crate::api::engine::remote::ws::{Client, PING_INTERVAL};
 use crate::api::err::Error;
 use crate::api::method::BoxFuture;
 use crate::api::opt::Endpoint;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 use crate::api::opt::Tls;
-use crate::api::ExtraFeatures;
-use crate::api::Result;
-use crate::api::Surreal;
-use crate::engine::remote::Data;
+use crate::api::{ExtraFeatures, Result, Surreal};
 use crate::engine::IntervalStream;
 use crate::opt::WaitFor;
-use crate::{Action, Notification};
-use async_channel::Receiver;
-use futures::stream::{SplitSink, SplitStream};
-use futures::SinkExt;
-use futures::StreamExt;
-use revision::revisioned;
-use serde::Deserialize;
-use std::collections::hash_map::Entry;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicI64;
-use surrealdb_core::sql::Value as CoreValue;
-use tokio::net::TcpStream;
-use tokio::sync::watch;
-use tokio::time;
-use tokio::time::MissedTickBehavior;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::Error as WsError;
-use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::Connector;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
-use trice::Instant;
+use crate::types::{Value, Variables};
 
-pub(crate) const MAX_MESSAGE_SIZE: usize = 64 << 20; // 64 MiB
-pub(crate) const MAX_FRAME_SIZE: usize = 16 << 20; // 16 MiB
-pub(crate) const WRITE_BUFFER_SIZE: usize = 128000; // tungstenite default
-pub(crate) const MAX_WRITE_BUFFER_SIZE: usize = WRITE_BUFFER_SIZE + MAX_MESSAGE_SIZE; // Recommended max according to tungstenite docs
 pub(crate) const NAGLE_ALG: bool = false;
 
 type MessageSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -72,11 +59,10 @@ pub(crate) async fn connect(
 	#[cfg_attr(not(any(feature = "native-tls", feature = "rustls")), expect(unused_variables))]
 	maybe_connector: Option<Connector>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-	let mut request = (&endpoint.url).into_client_request()?;
+	let mut request =
+		(&endpoint.url).into_client_request().map_err(|err| Error::InvalidUrl(err.to_string()))?;
 
-	request
-		.headers_mut()
-		.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(super::REVISION_HEADER));
+	request.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("flatbuffers"));
 
 	#[cfg(any(feature = "native-tls", feature = "rustls"))]
 	let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -85,17 +71,19 @@ pub(crate) async fn connect(
 		NAGLE_ALG,
 		maybe_connector,
 	)
-	.await?;
+	.await
+	.map_err(|err| Error::Ws(err.to_string()))?;
 
 	#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-	let (socket, _) = tokio_tungstenite::connect_async_with_config(request, config, NAGLE_ALG).await?;
+	let (socket, _) = tokio_tungstenite::connect_async_with_config(request, config, NAGLE_ALG)
+		.await
+		.map_err(|err| Error::Ws(err.to_string()))?;
 
 	Ok(socket)
 }
 
 impl crate::api::Connection for Client {}
-
-impl Connection for Client {
+impl conn::Sealed for Client {
 	fn connect(
 		mut address: Endpoint,
 		capacity: usize,
@@ -107,12 +95,12 @@ impl Connection for Client {
 			#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
 			let maybe_connector = None;
 
-			let ws_config = WebSocketConfig {
-				max_message_size: Some(MAX_MESSAGE_SIZE),
-				max_frame_size: Some(MAX_FRAME_SIZE),
-				max_write_buffer_size: MAX_WRITE_BUFFER_SIZE,
-				..Default::default()
-			};
+			let ws_config = WebSocketConfig::default()
+				.read_buffer_size(address.config.websocket.read_buffer_size)
+				.max_message_size(address.config.websocket.max_message_size)
+				.max_frame_size(address.config.websocket.max_message_size)
+				.max_write_buffer_size(address.config.websocket.max_write_buffer_size)
+				.write_buffer_size(address.config.websocket.write_buffer_size);
 
 			let socket = connect(&address, Some(ws_config), maybe_connector.clone()).await?;
 
@@ -152,8 +140,8 @@ async fn router_handle_route(
 		request,
 		response,
 	}: Route,
+	max_message_size: Option<usize>,
 	state: &mut RouterState,
-	endpoint: &Endpoint,
 ) -> HandleResult {
 	let RequestData {
 		id,
@@ -168,6 +156,25 @@ async fn router_handle_route(
 			trace!("Receiver dropped");
 		}
 		return HandleResult::Ok;
+	};
+
+	// Merge stored vars with query vars for RawQuery
+	let command = match command {
+		Command::RawQuery {
+			txn,
+			query,
+			variables,
+		} => {
+			let mut merged_vars =
+				state.vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Variables>();
+			merged_vars.extend(variables);
+			Command::RawQuery {
+				txn,
+				query,
+				variables: merged_vars,
+			}
+		}
+		other => other,
 	};
 
 	let mut effect = RequestEffect::None;
@@ -189,17 +196,12 @@ async fn router_handle_route(
 				key: key.clone(),
 			};
 		}
-		Command::Insert {
-			..
-		} => {
-			effect = RequestEffect::Insert;
-		}
 		Command::SubscribeLive {
 			ref uuid,
 			ref notification_sender,
 		} => {
 			state.live_queries.insert(*uuid, notification_sender.clone());
-			if response.clone().send(Ok(DbResponse::Other(CoreValue::None))).await.is_err() {
+			if response.clone().send(Ok(vec![QueryResultBuilder::instant_none()])).await.is_err() {
 				trace!("Receiver dropped");
 			}
 			// There is nothing to send to the server here
@@ -242,13 +244,24 @@ async fn router_handle_route(
 			return HandleResult::Ok;
 		};
 		trace!("Request {:?}", request);
-		let payload = if endpoint.config.ast_payload {
-			serialize(&request, true).unwrap()
-		} else {
-			serialize(&request.stringify_queries(), true).unwrap()
-		};
-		Message::Binary(payload)
+
+		let request_value = request.into_value();
+
+		// Unwrap because a router request cannot fail to serialize.
+		let payload = surrealdb_core::rpc::format::flatbuffers::encode(&request_value).unwrap();
+
+		Message::Binary(payload.into())
 	};
+
+	if let Some(max_message_size) = max_message_size {
+		let size = message.len();
+		if size > max_message_size {
+			if response.send(Err(Error::MessageTooLong(size).into())).await.is_err() {
+				trace!("Receiver dropped");
+			}
+			return HandleResult::Ok;
+		}
+	}
 
 	match state.sink.send(message).await {
 		Ok(_) => {
@@ -259,8 +272,8 @@ async fn router_handle_route(
 			});
 		}
 		Err(error) => {
-			let error = Error::Ws(error.to_string());
-			if response.send(Err(error.into())).await.is_err() {
+			let err = Error::Ws(error.to_string());
+			if response.send(Err(err.into())).await.is_err() {
 				trace!("Receiver dropped");
 			}
 			return HandleResult::Disconnected;
@@ -269,134 +282,187 @@ async fn router_handle_route(
 	HandleResult::Ok
 }
 
-async fn router_handle_response(response: Message, state: &mut RouterState) -> HandleResult {
-	match Response::try_from(&response) {
-		Ok(option) => {
-			// We are only interested in responses that are not empty
-			if let Some(response) = option {
-				trace!("{response:?}");
-				match response.id {
-					// If `id` is set this is a normal response
-					Some(id) => {
-						if let Ok(id) = id.coerce_to() {
-							if let Some(pending) = state.pending_requests.remove(&id) {
-								let resp = match DbResponse::from_server_result(response.result) {
-									Ok(x) => x,
-									Err(e) => {
-										let _ = pending.response_channel.send(Err(e)).await;
-										return HandleResult::Ok;
-									}
-								};
+async fn router_handle_response(message: Message, state: &mut RouterState) -> HandleResult {
+	match db_response_from_message(&message) {
+		Ok(response) => {
+			trace!("{response:?}");
+			let Some(response) = response else {
+				return HandleResult::Ok;
+			};
+
+			match response.id {
+				// If `id` is set this is a normal response
+				Some(id) => {
+					// Try to extract i64 from Value
+					if let Value::Number(surrealdb_types::Number::Int(id_num)) = id {
+						match state.pending_requests.remove(&id_num) {
+							Some(pending) => {
 								// We can only route responses with IDs
-								match pending.effect {
-									RequestEffect::None => {}
-									RequestEffect::Insert => {
-										// For insert, we need to flatten single responses in an array
-										if let DbResponse::Other(CoreValue::Array(array)) = resp {
-											if array.len() == 1 {
-												let _ = pending
-													.response_channel
-													.send(Ok(DbResponse::Other(
-														array.into_iter().next().unwrap(),
-													)))
-													.await;
-											} else {
-												let _ = pending
-													.response_channel
-													.send(Ok(DbResponse::Other(CoreValue::Array(
-														array,
-													))))
-													.await;
+								match response.result {
+									Ok(DbResult::Query(results)) => {
+										// Apply effect only on success
+										match pending.effect {
+											RequestEffect::None => {}
+											RequestEffect::Set {
+												key,
+												value,
+											} => {
+												state.vars.insert(key, value);
 											}
-											return HandleResult::Ok;
+											RequestEffect::Clear {
+												key,
+											} => {
+												state.vars.shift_remove(&key);
+											}
+										}
+										if let Err(err) =
+											pending.response_channel.send(Ok(results)).await
+										{
+											tracing::error!(
+												"Failed to send query results to channel: {err:?}"
+											);
 										}
 									}
-									RequestEffect::Set {
-										key,
-										value,
-									} => {
-										state.vars.insert(key, value);
+									Ok(DbResult::Live(_notification)) => {
+										tracing::error!("Unexpected live query result in response");
 									}
-									RequestEffect::Clear {
-										key,
-									} => {
-										state.vars.shift_remove(&key);
+									Ok(DbResult::Other(value)) => {
+										// Apply effect only on success
+										match pending.effect {
+											RequestEffect::None => {}
+											RequestEffect::Set {
+												key,
+												value,
+											} => {
+												state.vars.insert(key, value);
+											}
+											RequestEffect::Clear {
+												key,
+											} => {
+												state.vars.shift_remove(&key);
+											}
+										}
+										let result = QueryResultBuilder::started_now()
+											.finish_with_result(Ok(value));
+										if let Err(err) =
+											pending.response_channel.send(Ok(vec![result])).await
+										{
+											tracing::error!(
+												"Failed to send query results to channel: {err:?}"
+											);
+										}
+									}
+									Err(error) => {
+										// Don't apply effect on error
+										let _res = pending.response_channel.send(Err(error)).await;
 									}
 								}
-								let _res = pending.response_channel.send(Ok(resp)).await;
-							} else {
-								warn!("got response for request with id '{id}', which was not in pending requests")
+							}
+							_ => {
+								warn!(
+									"got response for request with id '{id_num}', which was not in pending requests"
+								)
 							}
 						}
 					}
-					// If `id` is not set, this may be a live query notification
-					None => {
-						match response.result {
-							Ok(Data::Live(notification)) => {
-								let live_query_id = notification.id;
-								// Check if this live query is registered
-								if let Some(sender) = state.live_queries.get(&live_query_id) {
-									// Send the notification back to the caller or kill live query if the receiver is already dropped
-
-									let notification = Notification {
-										query_id: *notification.id,
-										action: Action::from_core(notification.action),
-										data: notification.result,
-									};
-									if sender.send(notification).await.is_err() {
-										state.live_queries.remove(&live_query_id);
-										let kill = {
-											let request = Command::Kill {
-												uuid: live_query_id.0,
-											}
-											.into_router_request(None)
-											.unwrap();
-											let value = serialize(&request, true).unwrap();
-											Message::Binary(value)
-										};
-										if let Err(error) = state.sink.send(kill).await {
-											trace!("failed to send kill query to the server; {error:?}");
-											return HandleResult::Disconnected;
-										}
+				}
+				// If `id` is not set, this may be a live query notification
+				None => {
+					if let Ok(DbResult::Live(notification)) = response.result {
+						let live_query_id = notification.id.0;
+						// Check if this live query is registered
+						if let Some(sender) = state.live_queries.get(&live_query_id) {
+							// Send the notification back to the caller or kill live query
+							// if the receiver is already dropped
+							if sender.send(Ok(notification)).await.is_err() {
+								state.live_queries.remove(&live_query_id);
+								let kill = {
+									let request = Command::Kill {
+										uuid: live_query_id,
 									}
+									.into_router_request(None)
+									.unwrap();
+
+									let request_value = request.into_value();
+
+									let value = surrealdb_core::rpc::format::flatbuffers::encode(
+										&request_value,
+									)
+									.unwrap();
+									Message::Binary(value.into())
+								};
+								if let Err(error) = state.sink.send(kill).await {
+									trace!("failed to send kill query to the server; {error:?}");
+									return HandleResult::Disconnected;
 								}
 							}
-							Ok(..) => { /* Ignored responses like pings */ }
-							Err(error) => error!("{error:?}"),
 						}
 					}
 				}
 			}
 		}
 		Err(error) => {
-			#[revisioned(revision = 1)]
-			#[derive(Deserialize)]
+			#[derive(Deserialize, SurrealValue)]
 			struct ErrorResponse {
-				id: Option<CoreValue>,
+				id: Option<Value>,
 			}
 
 			// Let's try to find out the ID of the response that failed to deserialise
-			if let Message::Binary(binary) = response {
-				if let Ok(ErrorResponse {
-					id,
-				}) = deserialize(&binary, true)
-				{
-					// Return an error if an ID was returned
-					if let Some(Ok(id)) = id.map(CoreValue::coerce_to) {
-						if let Some(pending) = state.pending_requests.remove(&id) {
-							let _res = pending.response_channel.send(Err(error)).await;
-						} else {
-							warn!("got response for request with id '{id}', which was not in pending requests")
+			if let Message::Binary(binary) = message {
+				match surrealdb_core::rpc::format::flatbuffers::decode(&binary) {
+					Ok(ErrorResponse {
+						id,
+					}) => {
+						// Return an error if an ID was returned
+						if let Some(Value::Number(surrealdb_types::Number::Int(id_num))) = id {
+							match state.pending_requests.remove(&id_num) {
+								Some(pending) => {
+									let _res =
+										pending.response_channel.send(Err(error.into())).await;
+								}
+								_ => {
+									warn!(
+										"got response for request with id '{id_num}', which was not in pending requests"
+									)
+								}
+							}
 						}
 					}
-				} else {
-					// Unfortunately, we don't know which response failed to deserialize
-					warn!("Failed to deserialise message; {error:?}");
+					_ => {
+						// Unfortunately, we don't know which response failed to deserialize
+						warn!("Failed to deserialise message; {error:?}");
+					}
 				}
 			}
 		}
 	}
 	HandleResult::Ok
+}
+
+fn db_response_from_message(message: &Message) -> Result<Option<DbResponse>> {
+	match message {
+		Message::Text(text) => {
+			trace!("Received an unexpected text message; {text}");
+			Ok(None)
+		}
+		Message::Binary(binary) => Ok(Some(DbResponse::from_bytes(binary)?)),
+		Message::Ping(..) => {
+			trace!("Received a ping from the server");
+			Ok(None)
+		}
+		Message::Pong(..) => {
+			trace!("Received a pong from the server");
+			Ok(None)
+		}
+		Message::Frame(..) => {
+			trace!("Received an unexpected raw frame");
+			Ok(None)
+		}
+		Message::Close(..) => {
+			trace!("Received an unexpected close message");
+			Ok(None)
+		}
+	}
 }
 
 async fn router_reconnect(
@@ -418,9 +484,12 @@ async fn router_reconnect(
 						.into_router_request(None)
 						.expect("replay commands should always convert to route requests");
 
-					let message = serialize(&request, true).unwrap();
+					let request_value = request.into_value();
 
-					if let Err(error) = state.sink.send(Message::Binary(message)).await {
+					let message =
+						surrealdb_core::rpc::format::flatbuffers::encode(&request_value).unwrap();
+
+					if let Err(error) = state.sink.send(Message::Binary(message.into())).await {
 						trace!("{error}");
 						time::sleep(time::Duration::from_secs(1)).await;
 						continue;
@@ -434,8 +503,11 @@ async fn router_reconnect(
 					.into_router_request(None)
 					.unwrap();
 					trace!("Request {:?}", request);
-					let payload = serialize(&request, true).unwrap();
-					if let Err(error) = state.sink.send(Message::Binary(payload)).await {
+					let request_value = request.into_value();
+					let payload =
+						surrealdb_core::rpc::format::flatbuffers::encode(&request_value).unwrap();
+
+					if let Err(error) = state.sink.send(Message::Binary(payload.into())).await {
 						trace!("{error}");
 						time::sleep(time::Duration::from_secs(1)).await;
 						continue;
@@ -462,8 +534,9 @@ pub(crate) async fn run_router(
 ) {
 	let ping = {
 		let request = Command::Health.into_router_request(None).unwrap();
-		let value = serialize(&request, true).unwrap();
-		Message::Binary(value)
+		let request_value = request.into_value();
+		let value = surrealdb_core::rpc::format::flatbuffers::encode(&request_value).unwrap();
+		Message::Binary(value.into())
 	};
 
 	let (socket_sink, socket_stream) = socket.split();
@@ -476,12 +549,11 @@ pub(crate) async fn run_router(
 
 		let mut pinger = IntervalStream::new(interval);
 		// Turn into a stream instead of calling recv_async
-		// The stream seems to be able to keep some state which would otherwise need to be
-		// recreated with each next.
+		// The stream seems to be able to keep some state which would otherwise need to
+		// be recreated with each next.
 
 		state.last_activity = Instant::now();
-		state.live_queries.clear();
-		state.pending_requests.clear();
+		state.reset().await;
 
 		loop {
 			tokio::select! {
@@ -500,7 +572,7 @@ pub(crate) async fn run_router(
 						break 'router;
 					};
 
-					match router_handle_route(response, &mut state, &endpoint).await {
+					match router_handle_route(response, config.max_message_size, &mut state).await {
 						HandleResult::Ok => {},
 						HandleResult::Disconnected => {
 							router_reconnect(
@@ -547,6 +619,7 @@ pub(crate) async fn run_router(
 							}
 						}
 						Err(error) => {
+							state.reset().await;
 							match error {
 								WsError::ConnectionClosed => {
 									trace!("Connection successfully closed on the server");
@@ -589,51 +662,18 @@ pub(crate) async fn run_router(
 	}
 }
 
-impl Response {
-	fn try_from(message: &Message) -> Result<Option<Self>> {
-		match message {
-			Message::Text(text) => {
-				trace!("Received an unexpected text message; {text}");
-				Ok(None)
-			}
-			Message::Binary(binary) => deserialize(binary, true).map(Some).map_err(|error| {
-				Error::ResponseFromBinary {
-					binary: binary.clone(),
-					error: bincode::ErrorKind::Custom(error.to_string()).into(),
-				}
-				.into()
-			}),
-			Message::Ping(..) => {
-				trace!("Received a ping from the server");
-				Ok(None)
-			}
-			Message::Pong(..) => {
-				trace!("Received a pong from the server");
-				Ok(None)
-			}
-			Message::Frame(..) => {
-				trace!("Received an unexpected raw frame");
-				Ok(None)
-			}
-			Message::Close(..) => {
-				trace!("Received an unexpected close message");
-				Ok(None)
-			}
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
-	use super::serialize;
-	use bincode::Options;
-	use flate2::write::GzEncoder;
-	use flate2::Compression;
-	use rand::{thread_rng, Rng};
 	use std::io::Write;
 	use std::time::SystemTime;
-	use surrealdb_core::rpc::format::cbor::Cbor;
-	use surrealdb_core::sql::{Array, Value};
+
+	use bincode::Options;
+	use flate2::Compression;
+	use flate2::write::GzEncoder;
+	use rand::{Rng, thread_rng};
+	use surrealdb_core::rpc;
+
+	use crate::types::{Array, Value};
 
 	#[test_log::test]
 	fn large_vector_serialisation_bench() {
@@ -658,7 +698,7 @@ mod tests {
 		let mut vector: Vec<i32> = Vec::new();
 		let mut rng = thread_rng();
 		for _ in 0..vector_size {
-			vector.push(rng.gen());
+			vector.push(rng.r#gen());
 		}
 		//	Store the results
 		let mut results = vec![];
@@ -714,14 +754,15 @@ mod tests {
 				payload.len() as f32 / ref_compressed,
 			));
 		}
-		const UNVERSIONED: &str = "Unversioned Vec<Value>";
-		const COMPRESSED_UNVERSIONED: &str = "Compressed Unversioned Vec<Value>";
+		const FLATBUFFERS: &str = "Flatbuffers Vec<Value>";
+		const FLATBUFFERS_COMPRESSED: &str = "Flatbuffers Compressed Vec<Value>";
 		{
 			// Unversioned
-			let (duration, payload) = timed(&|| serialize(&vector, false).unwrap());
+			let (duration, payload) =
+				timed(&|| surrealdb_core::rpc::format::flatbuffers::encode(&vector).unwrap());
 			results.push((
 				payload.len(),
-				UNVERSIONED,
+				FLATBUFFERS,
 				duration,
 				payload.len() as f32 / ref_payload,
 			));
@@ -731,25 +772,7 @@ mod tests {
 			let duration = duration + compression_duration;
 			results.push((
 				payload.len(),
-				COMPRESSED_UNVERSIONED,
-				duration,
-				payload.len() as f32 / ref_compressed,
-			));
-		}
-		//
-		const VERSIONED: &str = "Versioned Vec<Value>";
-		const COMPRESSED_VERSIONED: &str = "Compressed Versioned Vec<Value>";
-		{
-			// Versioned
-			let (duration, payload) = timed(&|| serialize(&vector, true).unwrap());
-			results.push((payload.len(), VERSIONED, duration, payload.len() as f32 / ref_payload));
-
-			// Compressed Versioned
-			let (compression_duration, payload) = timed(&|| compress(&payload));
-			let duration = duration + compression_duration;
-			results.push((
-				payload.len(),
-				COMPRESSED_VERSIONED,
+				FLATBUFFERS_COMPRESSED,
 				duration,
 				payload.len() as f32 / ref_compressed,
 			));
@@ -760,9 +783,9 @@ mod tests {
 		{
 			// CBor
 			let (duration, payload) = timed(&|| {
-				let cbor: Cbor = vector.clone().try_into().unwrap();
+				let cbor = rpc::format::cbor::encode(vector.clone()).unwrap();
 				let mut res = Vec::new();
-				ciborium::into_writer(&cbor.0, &mut res).unwrap();
+				ciborium::into_writer(&cbor, &mut res).unwrap();
 				res
 			});
 			results.push((payload.len(), CBOR, duration, payload.len() as f32 / ref_payload));
@@ -782,6 +805,25 @@ mod tests {
 		for (size, name, duration, factor) in &results {
 			info!("{name} - Size: {size} - Duration: {duration:?} - Factor: {factor}");
 		}
+
+		// TODO: Figure out what this test was supposed to track.
+		//
+		//	Note this test changed with the value inversion PR, below is the previous
+		// check.
+		//
+		//	vec![
+		//		BINCODE_REF,
+		//		COMPRESSED_BINCODE_REF,
+		//		COMPRESSED_CBOR,
+		//		COMPRESSED_BINCODE,
+		//		COMPRESSED_UNVERSIONED,
+		//		CBOR,
+		//		COMPRESSED_VERSIONED,
+		//		BINCODE,
+		//		UNVERSIONED,
+		//		VERSIONED,
+		//	]
+
 		// Check the expected sorted results
 		let results: Vec<&str> = results.into_iter().map(|(_, name, _, _)| name).collect();
 		assert_eq!(
@@ -789,14 +831,12 @@ mod tests {
 			vec![
 				BINCODE_REF,
 				COMPRESSED_BINCODE_REF,
-				COMPRESSED_CBOR,
 				COMPRESSED_BINCODE,
-				COMPRESSED_UNVERSIONED,
-				CBOR,
-				COMPRESSED_VERSIONED,
+				COMPRESSED_CBOR,
 				BINCODE,
-				UNVERSIONED,
-				VERSIONED,
+				CBOR,
+				FLATBUFFERS_COMPRESSED,
+				FLATBUFFERS,
 			]
 		)
 	}

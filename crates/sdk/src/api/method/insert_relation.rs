@@ -1,19 +1,16 @@
-use crate::api::conn::Command;
-use crate::api::Connection;
-use crate::api::Result;
-use crate::method::OnceLockExt;
-use crate::Surreal;
-use crate::Value;
-use serde::de::DeserializeOwned;
 use std::borrow::Cow;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
 
+use surrealdb_types::{SurrealValue, Value};
+
 use super::BoxFuture;
+use crate::Surreal;
+use crate::api::conn::Command;
+use crate::api::{Connection, Result};
+use crate::method::OnceLockExt;
 
 /// An Insert Relation future
-///
-///
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct InsertRelation<'r, C: Connection, R> {
@@ -37,7 +34,8 @@ where
 		}
 	}
 
-	/// Converts to an owned type which can easily be moved to a different thread
+	/// Converts to an owned type which can easily be moved to a different
+	/// thread
 	pub fn into_owned(self) -> InsertRelation<'static, C, R> {
 		InsertRelation {
 			client: Cow::Owned(self.client.into_owned()),
@@ -75,7 +73,7 @@ where
 impl<'r, Client, R> IntoFuture for InsertRelation<'r, Client, Option<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Option<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
@@ -86,7 +84,7 @@ where
 impl<'r, Client, R> IntoFuture for InsertRelation<'r, Client, Vec<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Vec<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;

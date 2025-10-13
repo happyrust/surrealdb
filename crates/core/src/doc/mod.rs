@@ -4,9 +4,9 @@
 //! - `current`: value after the transaction
 //! - `initial`: value before the transaction
 //! - `id`: traditionally an integer but can be an object or collection such as an array
-use crate::err;
 
 pub(crate) use self::document::*;
+pub(crate) use self::lives::DefaultBroker;
 
 mod document; // The entry point for a document to be processed
 
@@ -23,6 +23,7 @@ mod upsert; // Processes a UPSERT statement for this document
 mod alter; // Modifies and updates the fields in this document
 mod changefeeds; // Processes any change feeds relevant for this document
 mod check; // Data and condition checking for this document
+mod compute; // Compute computed fields for this document
 mod edges; // Attempts to store the edge data for this document
 mod event; // Processes any table events relevant for this document
 mod field; // Processes any schema-defined fields for this document
@@ -33,14 +34,16 @@ mod purge; // Deletes this document, and any edges or indexes
 mod store; // Writes the document content to the storage engine
 mod table; // Processes any foreign tables relevant for this document'
 
-/// Error result used when a function can result in the value being processed being ignored.
+/// Error result used when a function can result in the value being processed
+/// being ignored.
+#[derive(Debug)]
 pub enum IgnoreError {
 	Ignore,
-	Error(Box<err::Error>),
+	Error(anyhow::Error),
 }
 
-impl From<err::Error> for IgnoreError {
-	fn from(value: err::Error) -> Self {
-		IgnoreError::Error(Box::new(value))
+impl From<anyhow::Error> for IgnoreError {
+	fn from(value: anyhow::Error) -> Self {
+		IgnoreError::Error(value)
 	}
 }

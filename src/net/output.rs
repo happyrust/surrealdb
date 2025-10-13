@@ -1,63 +1,61 @@
-use super::headers::Accept;
-use crate::err::Error;
 use axum::response::{IntoResponse, Response};
-use http::header::{HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
+use http::header::{CONTENT_TYPE, HeaderValue};
 use serde::Serialize;
-use serde_json::Value as Json;
-use surrealdb::sql;
+use surrealdb::types::Value;
+
+use super::headers::Accept;
 
 pub enum Output {
 	None,
 	Fail,
 	Text(String),
-	Json(Vec<u8>), // JSON
-	Cbor(Vec<u8>), // CBOR
-	Full(Vec<u8>), // Full type serialization
+	Json(Vec<u8>),
+	Cbor(Vec<u8>),
+	Flatbuffers(Vec<u8>),
 }
-
-pub fn none() -> Output {
-	Output::None
-}
-
-pub fn text(val: String) -> Output {
-	Output::Text(val)
-}
-
-pub fn json<T>(val: &T) -> Output
-where
-	T: Serialize,
-{
-	match serde_json::to_vec(val) {
-		Ok(v) => Output::Json(v),
-		Err(_) => Output::Fail,
+impl Output {
+	// All these methods should not be used.
+	//
+	// They handle serialization differently then how serialization is handled in
+	// core. We need to force a single way to serialize values or end up with
+	// subtle bugs and format differences.
+	#[deprecated]
+	pub fn json_value(val: &Value) -> Output {
+		match surrealdb_core::rpc::format::json::encode(val.clone()) {
+			Ok(v) => Output::Json(v),
+			Err(_) => Output::Fail,
+		}
 	}
-}
 
-pub fn cbor<T>(val: &T) -> Output
-where
-	T: Serialize,
-{
-	let mut out = Vec::new();
-	match ciborium::into_writer(&val, &mut out) {
-		Ok(_) => Output::Cbor(out),
-		Err(_) => Output::Fail,
+	#[deprecated]
+	pub fn json_other<T>(val: &T) -> Output
+	where
+		T: Serialize,
+	{
+		match serde_json::to_vec(val) {
+			Ok(v) => Output::Json(v),
+			Err(_) => Output::Fail,
+		}
 	}
-}
 
-pub fn full<T>(val: &T) -> Output
-where
-	T: Serialize,
-{
-	match surrealdb::sql::serde::serialize(val) {
-		Ok(v) => Output::Full(v),
-		Err(_) => Output::Fail,
+	#[deprecated]
+	pub fn cbor(val: &Value) -> Output {
+		let mut out = Vec::new();
+		match ciborium::into_writer(&val, &mut out) {
+			Ok(_) => Output::Cbor(out),
+			Err(_) => Output::Fail,
+		}
 	}
-}
 
-/// Convert and simplify the value into JSON
-pub fn simplify<T: Serialize + 'static>(v: T) -> Result<Json, Error> {
-	Ok(sql::to_value(v)?.into())
+	#[deprecated]
+	pub fn flatbuffers(val: &Value) -> Output {
+		let val = surrealdb_core::rpc::format::flatbuffers::encode(val);
+		match val {
+			Ok(v) => Output::Flatbuffers(v),
+			Err(_) => Output::Fail,
+		}
+	}
 }
 
 impl IntoResponse for Output {
@@ -72,8 +70,9 @@ impl IntoResponse for Output {
 			Output::Cbor(v) => {
 				([(CONTENT_TYPE, HeaderValue::from(Accept::ApplicationCbor))], v).into_response()
 			}
-			Output::Full(v) => {
-				([(CONTENT_TYPE, HeaderValue::from(Accept::Surrealdb))], v).into_response()
+			Output::Flatbuffers(v) => {
+				([(CONTENT_TYPE, HeaderValue::from(Accept::ApplicationFlatbuffers))], v)
+					.into_response()
 			}
 			Output::None => StatusCode::OK.into_response(),
 			Output::Fail => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

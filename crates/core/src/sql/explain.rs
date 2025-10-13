@@ -1,11 +1,7 @@
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub struct Explain(pub bool);
 
 impl fmt::Display for Explain {
@@ -15,5 +11,16 @@ impl fmt::Display for Explain {
 			f.write_str(" FULL")?;
 		}
 		Ok(())
+	}
+}
+
+impl From<Explain> for crate::expr::Explain {
+	fn from(v: Explain) -> Self {
+		Self(v.0)
+	}
+}
+impl From<crate::expr::Explain> for Explain {
+	fn from(v: crate::expr::Explain) -> Self {
+		Self(v.0)
 	}
 }

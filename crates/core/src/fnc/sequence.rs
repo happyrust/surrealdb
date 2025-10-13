@@ -1,21 +1,19 @@
+use anyhow::Result;
+
 use crate::ctx::Context;
 use crate::dbs::Options;
 use crate::err::Error;
-use crate::sql::Value;
+use crate::val::Value;
 
 /// Return the next value for a given sequence.
-pub async fn nextval((ctx, opt): (&Context, &Options), (seq,): (Value,)) -> Result<Value, Error> {
-	if let Some(sqs) = ctx.get_sequences() {
-		if let Value::Strand(s) = seq {
-			let next = sqs.next_val(ctx, opt, &s).await?;
-			Ok(next.into())
-		} else {
-			Err(Error::InvalidArguments {
-				name: "sequence::nextval()".to_string(),
-				message: "Expect a sequence name".to_string(),
-			})
-		}
+pub async fn nextval((ctx, opt): (&Context, &Options), (seq,): (Value,)) -> Result<Value> {
+	if let Value::String(s) = seq {
+		let next = ctx.try_get_sequences()?.next_val_user(ctx, opt, &s).await?;
+		Ok(next.into())
 	} else {
-		Err(Error::Internal("Sequences are not supported in this context.".to_string()))?
+		Err(anyhow::Error::new(Error::InvalidArguments {
+			name: "sequence::nextval()".to_string(),
+			message: "Expect a sequence name".to_string(),
+		}))
 	}
 }

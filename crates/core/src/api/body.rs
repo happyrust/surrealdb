@@ -1,34 +1,23 @@
-#[cfg(not(target_family = "wasm"))]
 use std::fmt::Display;
 
-#[cfg(not(target_family = "wasm"))]
 use bytes::Bytes;
-#[cfg(not(target_family = "wasm"))]
-use futures::Stream;
-#[cfg(not(target_family = "wasm"))]
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use http::header::CONTENT_TYPE;
-
-use crate::err::Error;
-use crate::rpc::format::cbor;
-use crate::rpc::format::json;
-use crate::rpc::format::revision;
-use crate::sql;
-use crate::sql::Bytesize;
-use crate::sql::Value;
 
 use super::context::InvocationContext;
 use super::err::ApiError;
 use super::invocation::ApiInvocation;
+use crate::err::Error;
+use crate::expr::Bytesize;
+use crate::rpc::format::{cbor, flatbuffers, json};
+use crate::types::PublicValue;
 
 pub enum ApiBody {
-	#[cfg(not(target_family = "wasm"))]
 	Stream(Box<dyn Stream<Item = Result<Bytes, Box<dyn Display + Send + Sync>>> + Send + Unpin>),
-	Native(Value),
+	Native(PublicValue),
 }
 
 impl ApiBody {
-	#[cfg(not(target_family = "wasm"))]
 	pub fn from_stream<S, E>(stream: S) -> Self
 	where
 		S: Stream<Item = Result<Bytes, E>> + Unpin + Send + 'static,
@@ -39,7 +28,7 @@ impl ApiBody {
 		Self::Stream(Box::new(mapped_stream))
 	}
 
-	pub fn from_value(value: Value) -> Self {
+	pub fn from_value(value: PublicValue) -> Self {
 		Self::Native(value)
 	}
 
@@ -49,7 +38,7 @@ impl ApiBody {
 
 	// The `max` variable is unused in WASM only
 	#[cfg_attr(target_family = "wasm", expect(unused_variables))]
-	pub async fn stream(self, max: Option<Bytesize>) -> Result<Vec<u8>, Error> {
+	pub(crate) async fn stream(self, max: Option<Bytesize>) -> Result<Vec<u8>, Error> {
 		match self {
 			#[cfg(not(target_family = "wasm"))]
 			Self::Stream(mut stream) => {
@@ -76,15 +65,11 @@ impl ApiBody {
 		}
 	}
 
-	pub async fn process(
+	pub(crate) async fn process(
 		self,
 		ctx: &InvocationContext,
 		invocation: &ApiInvocation,
-	) -> Result<Value, Error> {
-		#[cfg_attr(
-			target_family = "wasm",
-			expect(irrefutable_let_patterns, reason = "For WASM this is the only pattern.")
-		)]
+	) -> Result<PublicValue, Error> {
 		if let ApiBody::Native(value) = self {
 			let max = ctx.request_body_max.unwrap_or(Bytesize::MAX);
 			let size = std::mem::size_of_val(&value);
@@ -94,7 +79,14 @@ impl ApiBody {
 			}
 
 			if ctx.request_body_raw {
-				Ok(value.coerce_to::<sql::Bytes>()?.into())
+				// Convert value to bytes if raw body is requested
+				match value {
+					PublicValue::Bytes(b) => Ok(PublicValue::Bytes(b)),
+					PublicValue::String(s) => {
+						Ok(PublicValue::Bytes(surrealdb_types::Bytes::new(s.into_bytes())))
+					}
+					_ => Err(Error::ApiError(ApiError::InvalidRequestBody)),
+				}
 			} else {
 				Ok(value)
 			}
@@ -102,16 +94,16 @@ impl ApiBody {
 			let bytes = self.stream(ctx.request_body_max).await?;
 
 			if ctx.request_body_raw {
-				Ok(Value::Bytes(crate::sql::Bytes(bytes)))
+				Ok(PublicValue::Bytes(surrealdb_types::Bytes::new(bytes)))
 			} else {
 				let content_type =
 					invocation.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
 
 				let parsed = match content_type {
-					Some("application/json") => json::parse_value(&bytes),
-					Some("application/cbor") => cbor::parse_value(bytes),
-					Some("application/surrealdb") => revision::parse_value(bytes),
-					_ => return Ok(Value::Bytes(crate::sql::Bytes(bytes))),
+					Some(super::format::JSON) => json::decode(&bytes),
+					Some(super::format::CBOR) => cbor::decode(&bytes),
+					Some(super::format::FLATBUFFERS) => flatbuffers::decode(&bytes),
+					_ => return Ok(PublicValue::Bytes(surrealdb_types::Bytes::new(bytes))),
 				};
 
 				parsed.map_err(|_| Error::ApiError(ApiError::BodyDecodeFailure))

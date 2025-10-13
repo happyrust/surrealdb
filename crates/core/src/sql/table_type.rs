@@ -1,15 +1,11 @@
-use crate::sql::statements::info::InfoStructure;
-use crate::sql::{Kind, Value};
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Display;
 
+use crate::sql::Kind;
+
 /// The type of records stored by a table
-#[revisioned(revision = 1)]
-#[derive(Debug, Default, Serialize, Deserialize, Hash, Clone, Eq, PartialEq, PartialOrd)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub enum TableType {
 	#[default]
 	Any,
@@ -43,34 +39,50 @@ impl Display for TableType {
 	}
 }
 
-impl InfoStructure for TableType {
-	fn structure(self) -> Value {
-		match self {
-			TableType::Any => Value::from(map! {
-				"kind".to_string() => "ANY".into(),
-			}),
-			TableType::Normal => Value::from(map! {
-				"kind".to_string() => "NORMAL".into(),
-			}),
-			TableType::Relation(rel) => Value::from(map! {
-				"kind".to_string() => "RELATION".into(),
-				"in".to_string(), if let Some(Kind::Record(tables)) = rel.from =>
-					tables.into_iter().map(|t| t.0).collect::<Vec<_>>().into(),
-				"out".to_string(), if let Some(Kind::Record(tables)) = rel.to =>
-					tables.into_iter().map(|t| t.0).collect::<Vec<_>>().into(),
-				"enforced".to_string() => rel.enforced.into()
-			}),
+impl From<TableType> for crate::catalog::TableType {
+	fn from(v: TableType) -> Self {
+		match v {
+			TableType::Any => Self::Any,
+			TableType::Normal => Self::Normal,
+			TableType::Relation(rel) => Self::Relation(rel.into()),
 		}
 	}
 }
 
-#[revisioned(revision = 2)]
-#[derive(Debug, Default, Serialize, Deserialize, Hash, Clone, Eq, PartialEq, PartialOrd)]
+impl From<crate::catalog::TableType> for TableType {
+	fn from(v: crate::catalog::TableType) -> Self {
+		match v {
+			crate::catalog::TableType::Any => Self::Any,
+			crate::catalog::TableType::Normal => Self::Normal,
+			crate::catalog::TableType::Relation(rel) => Self::Relation(rel.into()),
+		}
+	}
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub struct Relation {
 	pub from: Option<Kind>,
 	pub to: Option<Kind>,
-	#[revision(start = 2)]
 	pub enforced: bool,
+}
+
+impl From<Relation> for crate::catalog::Relation {
+	fn from(v: Relation) -> Self {
+		Self {
+			from: v.from.map(Into::into),
+			to: v.to.map(Into::into),
+			enforced: v.enforced,
+		}
+	}
+}
+
+impl From<crate::catalog::Relation> for Relation {
+	fn from(v: crate::catalog::Relation) -> Self {
+		Self {
+			from: v.from.map(Into::into),
+			to: v.to.map(Into::into),
+			enforced: v.enforced,
+		}
+	}
 }

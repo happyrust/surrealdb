@@ -1,10 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use futures::Future;
 use pprof::criterion::{Output, PProfProfiler};
-use surrealdb::{
-	dbs::{Capabilities, Session},
-	kvs::Datastore,
-};
+use surrealdb_core::dbs::{Capabilities, Session};
+use surrealdb_core::kvs::Datastore;
 
 macro_rules! query {
 	($c: expr, $name: ident, $query: expr) => {
@@ -42,8 +40,12 @@ fn bench_executor(c: &mut Criterion) {
 	c.throughput(Throughput::Elements(1));
 	query!(c, create_delete_simple, "CREATE person:one; DELETE person:one;");
 	query!(c, select_simple_one, "CREATE person:tobie;", "SELECT * FROM person;");
-	query!(c, select_simple_five, "CREATE person:one; CREATE person:two; CREATE person:three; CREATE person:four; CREATE person:five;", "SELECT * FROM person;");
-	query!(c, select_future, "SELECT * FROM <future>{5};");
+	query!(
+		c,
+		select_simple_five,
+		"CREATE person:one; CREATE person:two; CREATE person:three; CREATE person:four; CREATE person:five;",
+		"SELECT * FROM person;"
+	);
 	query!(
 		c,
 		update_simple,

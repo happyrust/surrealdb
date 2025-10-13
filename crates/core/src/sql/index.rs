@@ -1,132 +1,118 @@
-use crate::err::Error;
-use crate::fnc::util::math::vector::{
-	ChebyshevDistance, CosineDistance, EuclideanDistance, HammingDistance, JaccardSimilarity,
-	ManhattanDistance, MinkowskiDistance, PearsonSimilarity,
-};
-use crate::sql::ident::Ident;
-use crate::sql::scoring::Scoring;
-use crate::sql::statements::info::InfoStructure;
-use crate::sql::{Number, Value};
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
-#[revisioned(revision = 2)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+use crate::fmt::EscapeIdent;
+use crate::sql::Cond;
+use crate::sql::scoring::Scoring;
+use crate::types::PublicNumber;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub enum Index {
+pub(crate) enum Index {
 	/// (Basic) non unique
-	#[default]
 	Idx,
 	/// Unique index
 	Uniq,
-	/// Index with Full-Text search capabilities
-	Search(SearchParams),
-	/// M-Tree index for distance based metrics
+	/// M-Tree index for distance-based metrics
 	MTree(MTreeParams),
 	/// HNSW index for distance based metrics
-	#[revision(start = 2)]
 	Hnsw(HnswParams),
+	/// Index with Full-Text search capabilities - single writer
+	FullText(FullTextParams),
+	/// Count index
+	Count(Option<Cond>),
 }
 
-#[revisioned(revision = 2)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+impl From<Index> for crate::catalog::Index {
+	fn from(v: Index) -> Self {
+		match v {
+			Index::Idx => Self::Idx,
+			Index::Uniq => Self::Uniq,
+			Index::MTree(p) => Self::MTree(p.into()),
+			Index::Hnsw(p) => Self::Hnsw(p.into()),
+			Index::FullText(p) => Self::FullText(p.into()),
+			Index::Count(c) => Self::Count(c.map(Into::into)),
+		}
+	}
+}
+
+impl From<crate::catalog::Index> for Index {
+	fn from(v: crate::catalog::Index) -> Self {
+		match v {
+			crate::catalog::Index::Idx => Self::Idx,
+			crate::catalog::Index::Uniq => Self::Uniq,
+			crate::catalog::Index::MTree(p) => Self::MTree(p.into()),
+			crate::catalog::Index::Hnsw(p) => Self::Hnsw(p.into()),
+			crate::catalog::Index::FullText(p) => Self::FullText(p.into()),
+			crate::catalog::Index::Count(c) => Self::Count(c.map(Into::into)),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct SearchParams {
-	pub az: Ident,
+pub struct FullTextParams {
+	pub az: String,
 	pub hl: bool,
 	pub sc: Scoring,
-	pub doc_ids_order: u32,
-	pub doc_lengths_order: u32,
-	pub postings_order: u32,
-	pub terms_order: u32,
-	#[revision(start = 2)]
-	pub doc_ids_cache: u32,
-	#[revision(start = 2)]
-	pub doc_lengths_cache: u32,
-	#[revision(start = 2)]
-	pub postings_cache: u32,
-	#[revision(start = 2)]
-	pub terms_cache: u32,
 }
 
-#[revisioned(revision = 2)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+impl From<FullTextParams> for crate::catalog::FullTextParams {
+	fn from(v: FullTextParams) -> Self {
+		crate::catalog::FullTextParams {
+			analyzer: v.az.clone(),
+			highlight: v.hl,
+			scoring: v.sc.into(),
+		}
+	}
+}
+impl From<crate::catalog::FullTextParams> for FullTextParams {
+	fn from(v: crate::catalog::FullTextParams) -> Self {
+		Self {
+			az: v.analyzer,
+			hl: v.highlight,
+			sc: v.scoring.into(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct MTreeParams {
+pub(crate) struct MTreeParams {
 	pub dimension: u16,
-	#[revision(start = 1, end = 2, convert_fn = "convert_old_distance")]
-	pub _distance: Distance1, // TODO remove once 1.0 && 1.1 are EOL
-	#[revision(start = 2)]
 	pub distance: Distance,
 	pub vector_type: VectorType,
 	pub capacity: u16,
-	pub doc_ids_order: u32,
-	#[revision(start = 2)]
-	pub doc_ids_cache: u32,
-	#[revision(start = 2)]
 	pub mtree_cache: u32,
 }
 
-impl MTreeParams {
-	pub fn new(
-		dimension: u16,
-		distance: Distance,
-		vector_type: VectorType,
-		capacity: u16,
-		doc_ids_order: u32,
-		doc_ids_cache: u32,
-		mtree_cache: u32,
-	) -> Self {
-		Self {
-			dimension,
-			distance,
-			vector_type,
-			capacity,
-			doc_ids_order,
-			doc_ids_cache,
-			mtree_cache,
+impl From<MTreeParams> for crate::catalog::MTreeParams {
+	fn from(v: MTreeParams) -> Self {
+		crate::catalog::MTreeParams {
+			dimension: v.dimension,
+			distance: v.distance.into(),
+			vector_type: v.vector_type.into(),
+			capacity: v.capacity,
+			mtree_cache: v.mtree_cache,
 		}
 	}
+}
 
-	fn convert_old_distance(
-		&mut self,
-		_revision: u16,
-		d1: Distance1,
-	) -> Result<(), revision::Error> {
-		self.distance = match d1 {
-			Distance1::Euclidean => Distance::Euclidean,
-			Distance1::Manhattan => Distance::Manhattan,
-			Distance1::Cosine => Distance::Cosine,
-			Distance1::Hamming => Distance::Hamming,
-			Distance1::Minkowski(n) => Distance::Minkowski(n),
-		};
-		Ok(())
+impl From<crate::catalog::MTreeParams> for MTreeParams {
+	fn from(v: crate::catalog::MTreeParams) -> Self {
+		Self {
+			dimension: v.dimension,
+			distance: v.distance.into(),
+			vector_type: v.vector_type.into(),
+			capacity: v.capacity,
+			mtree_cache: v.mtree_cache,
+		}
 	}
 }
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Default, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub enum Distance1 {
-	#[default]
-	Euclidean,
-	Manhattan,
-	Cosine,
-	Hamming,
-	Minkowski(Number),
-}
-
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct HnswParams {
+pub(crate) struct HnswParams {
 	pub dimension: u16,
 	pub distance: Distance,
 	pub vector_type: VectorType,
@@ -135,41 +121,44 @@ pub struct HnswParams {
 	pub ef_construction: u16,
 	pub extend_candidates: bool,
 	pub keep_pruned_connections: bool,
-	pub ml: Number,
+	pub ml: PublicNumber,
 }
 
-impl HnswParams {
-	#[expect(clippy::too_many_arguments)]
-	pub fn new(
-		dimension: u16,
-		distance: Distance,
-		vector_type: VectorType,
-		m: u8,
-		m0: u8,
-		ml: Number,
-		ef_construction: u16,
-		extend_candidates: bool,
-		keep_pruned_connections: bool,
-	) -> Self {
-		Self {
-			dimension,
-			distance,
-			vector_type,
-			m,
-			m0,
-			ef_construction,
-			ml,
-			extend_candidates,
-			keep_pruned_connections,
+impl From<HnswParams> for crate::catalog::HnswParams {
+	fn from(v: HnswParams) -> Self {
+		crate::catalog::HnswParams {
+			dimension: v.dimension,
+			distance: v.distance.into(),
+			vector_type: v.vector_type.into(),
+			m: v.m,
+			m0: v.m0,
+			ef_construction: v.ef_construction,
+			ml: v.ml.into(),
+			extend_candidates: v.extend_candidates,
+			keep_pruned_connections: v.keep_pruned_connections,
 		}
 	}
 }
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Default, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+impl From<crate::catalog::HnswParams> for HnswParams {
+	fn from(v: crate::catalog::HnswParams) -> Self {
+		Self {
+			dimension: v.dimension,
+			distance: v.distance.into(),
+			vector_type: v.vector_type.into(),
+			m: v.m,
+			m0: v.m0,
+			ef_construction: v.ef_construction,
+			ml: v.ml.into(),
+			extend_candidates: v.extend_candidates,
+			keep_pruned_connections: v.keep_pruned_connections,
+		}
+	}
+}
+
+#[derive(Clone, Default, Debug, Eq, PartialEq, PartialOrd, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub enum Distance {
+pub(crate) enum Distance {
 	Chebyshev,
 	Cosine,
 	#[default]
@@ -177,23 +166,8 @@ pub enum Distance {
 	Hamming,
 	Jaccard,
 	Manhattan,
-	Minkowski(Number),
+	Minkowski(PublicNumber),
 	Pearson,
-}
-
-impl Distance {
-	pub(crate) fn compute(&self, v1: &Vec<Number>, v2: &Vec<Number>) -> Result<Number, Error> {
-		match self {
-			Self::Cosine => v1.cosine_distance(v2),
-			Self::Chebyshev => v1.chebyshev_distance(v2),
-			Self::Euclidean => v1.euclidean_distance(v2),
-			Self::Hamming => v1.hamming_distance(v2),
-			Self::Jaccard => v1.jaccard_similarity(v2),
-			Self::Manhattan => v1.manhattan_distance(v2),
-			Self::Minkowski(r) => v1.minkowski_distance(v2, r),
-			Self::Pearson => v1.pearson_similarity(v2),
-		}
-	}
 }
 
 impl Display for Distance {
@@ -211,10 +185,38 @@ impl Display for Distance {
 	}
 }
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Copy, Default, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+impl From<Distance> for crate::catalog::Distance {
+	fn from(v: Distance) -> Self {
+		match v {
+			Distance::Chebyshev => crate::catalog::Distance::Chebyshev,
+			Distance::Cosine => crate::catalog::Distance::Cosine,
+			Distance::Euclidean => crate::catalog::Distance::Euclidean,
+			Distance::Hamming => crate::catalog::Distance::Hamming,
+			Distance::Jaccard => crate::catalog::Distance::Jaccard,
+			Distance::Manhattan => crate::catalog::Distance::Manhattan,
+			Distance::Minkowski(n) => crate::catalog::Distance::Minkowski(n.into()),
+			Distance::Pearson => crate::catalog::Distance::Pearson,
+		}
+	}
+}
+
+impl From<crate::catalog::Distance> for Distance {
+	fn from(v: crate::catalog::Distance) -> Self {
+		match v {
+			crate::catalog::Distance::Chebyshev => Self::Chebyshev,
+			crate::catalog::Distance::Cosine => Self::Cosine,
+			crate::catalog::Distance::Euclidean => Self::Euclidean,
+			crate::catalog::Distance::Hamming => Self::Hamming,
+			crate::catalog::Distance::Jaccard => Self::Jaccard,
+			crate::catalog::Distance::Manhattan => Self::Manhattan,
+			crate::catalog::Distance::Minkowski(n) => Self::Minkowski(n.into()),
+			crate::catalog::Distance::Pearson => Self::Pearson,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq, PartialOrd, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub enum VectorType {
 	#[default]
 	F64,
@@ -241,21 +243,15 @@ impl Display for Index {
 		match self {
 			Self::Idx => Ok(()),
 			Self::Uniq => f.write_str("UNIQUE"),
-			Self::Search(p) => {
-				write!(
-					f,
-					"SEARCH ANALYZER {} {} DOC_IDS_ORDER {} DOC_LENGTHS_ORDER {} POSTINGS_ORDER {} TERMS_ORDER {} DOC_IDS_CACHE {} DOC_LENGTHS_CACHE {} POSTINGS_CACHE {} TERMS_CACHE {}",
-					p.az,
-					p.sc,
-					p.doc_ids_order,
-					p.doc_lengths_order,
-					p.postings_order,
-					p.terms_order,
-					p.doc_ids_cache,
-					p.doc_lengths_cache,
-					p.postings_cache,
-					p.terms_cache
-				)?;
+			Self::Count(c) => {
+				f.write_str("COUNT")?;
+				if let Some(v) = c {
+					write!(f, " {v}")?
+				}
+				Ok(())
+			}
+			Self::FullText(p) => {
+				write!(f, "FULLTEXT ANALYZER {} {}", EscapeIdent(&p.az), p.sc,)?;
 				if p.hl {
 					f.write_str(" HIGHLIGHTS")?
 				}
@@ -264,8 +260,8 @@ impl Display for Index {
 			Self::MTree(p) => {
 				write!(
 					f,
-					"MTREE DIMENSION {} DIST {} TYPE {} CAPACITY {} DOC_IDS_ORDER {} DOC_IDS_CACHE {} MTREE_CACHE {}",
-					p.dimension, p.distance, p.vector_type, p.capacity, p.doc_ids_order, p.doc_ids_cache, p.mtree_cache
+					"MTREE DIMENSION {} DIST {} TYPE {} CAPACITY {} MTREE_CACHE {}",
+					p.dimension, p.distance, p.vector_type, p.capacity, p.mtree_cache
 				)
 			}
 			Self::Hnsw(p) => {
@@ -286,8 +282,26 @@ impl Display for Index {
 	}
 }
 
-impl InfoStructure for Index {
-	fn structure(self) -> Value {
-		self.to_string().into()
+impl From<VectorType> for crate::catalog::VectorType {
+	fn from(v: VectorType) -> Self {
+		match v {
+			VectorType::F64 => Self::F64,
+			VectorType::F32 => Self::F32,
+			VectorType::I64 => Self::I64,
+			VectorType::I32 => Self::I32,
+			VectorType::I16 => Self::I16,
+		}
+	}
+}
+
+impl From<crate::catalog::VectorType> for VectorType {
+	fn from(v: crate::catalog::VectorType) -> Self {
+		match v {
+			crate::catalog::VectorType::F64 => Self::F64,
+			crate::catalog::VectorType::F32 => Self::F32,
+			crate::catalog::VectorType::I64 => Self::I64,
+			crate::catalog::VectorType::I32 => Self::I32,
+			crate::catalog::VectorType::I16 => Self::I16,
+		}
 	}
 }

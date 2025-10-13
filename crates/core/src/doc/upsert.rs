@@ -1,12 +1,13 @@
-use crate::ctx::Context;
-use crate::dbs::Options;
-use crate::dbs::Statement;
-use crate::doc::Document;
-use crate::err::Error;
-use crate::sql::value::Value;
+use anyhow::anyhow;
 use reblessive::tree::Stk;
 
 use super::IgnoreError;
+use crate::catalog::providers::TableProvider;
+use crate::ctx::Context;
+use crate::dbs::{Options, Statement};
+use crate::doc::Document;
+use crate::err::Error;
+use crate::val::Value;
 
 impl Document {
 	pub(super) async fn upsert(
@@ -16,38 +17,38 @@ impl Document {
 		opt: &Options,
 		stm: &Statement<'_>,
 	) -> Result<Value, IgnoreError> {
-		// Even though we haven't tried to create first this can still not be the 'initial iteration' if
-		// the initial doc is not set.
+		// Even though we haven't tried to create first this can still not be the
+		// 'initial iteration' if the initial doc is not set.
 		//
-		// If this is not the initial iteration we immediatly skip trying to create and go straight
-		// to updating.
+		// If this is not the initial iteration we immediatly skip trying to create and
+		// go straight to updating.
 		if !self.is_iteration_initial() {
 			return self.upsert_update(stk, ctx, opt, stm).await;
 		}
 
 		ctx.tx().lock().await.new_save_point();
 
-		// First try to create the value and if that is not possible due to an existing value fall
-		// back to update instead.
+		// First try to create the value and if that is not possible due to an existing
+		// value fall back to update instead.
 		//
-		// This is done this way to make the create path fast and take priority over the update
-		// path.
+		// This is done this way to make the create path fast and take priority over the
+		// update path.
 		let retry = match self.upsert_create(stk, ctx, opt, stm).await {
-			Err(IgnoreError::Error(e)) => match *e {
+			Err(IgnoreError::Error(e)) => match e.downcast() {
 				// We received an index exists error, so we
 				// ignore the error, and attempt to update the
 				// record using the ON DUPLICATE KEY UPDATE
 				// clause with the ID received in the error
-				Error::IndexExists {
+				Ok(Error::IndexExists {
 					thing,
 					..
-				} if !self.is_specific_record_id() => thing,
+				}) if !self.is_specific_record_id() => thing,
 				// We attempted to INSERT a document with an ID,
 				// and this ID already exists in the database,
 				// so we need to UPDATE the record instead.
-				Error::RecordExists {
+				Ok(Error::RecordExists {
 					thing,
-				} => thing,
+				}) => thing,
 
 				// If an error was received, but this statement
 				// is potentially retryable because it might
@@ -57,8 +58,14 @@ impl Document {
 				// need to presume that we might need to retry
 				// after fetching the initial record value
 				// from storage before processing schema again.
-				e if e.is_schema_related() && stm.is_repeatable() => self.inner_id()?,
-				_ => {
+				Ok(e) => {
+					if e.is_schema_related() && stm.is_repeatable() {
+						self.inner_id()?
+					} else {
+						return Err(IgnoreError::Error(anyhow!(e)));
+					}
+				}
+				Err(e) => {
 					ctx.tx().lock().await.rollback_to_save_point().await?;
 					return Err(IgnoreError::Error(e));
 				}
@@ -81,12 +88,15 @@ impl Document {
 			return Err(IgnoreError::Ignore);
 		}
 
-		let (ns, db) = opt.ns_db()?;
-		let val = ctx.tx().get_record(ns, db, &retry.tb, &retry.id, opt.version).await?;
+		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
+		let val = ctx.tx().get_record(ns, db, &retry.table, &retry.key, opt.version).await?;
 
 		self.modify_for_update_retry(retry, val);
 
-		self.generate_record_id(stk, ctx, opt, stm).await?;
+		// Skip generate_record_id in retry mode since the ID is already set correctly
+		if !self.retry {
+			self.generate_record_id()?;
+		}
 
 		self.upsert_update(stk, ctx, opt, stm).await
 	}
@@ -100,12 +110,13 @@ impl Document {
 		stm: &Statement<'_>,
 	) -> Result<Value, IgnoreError> {
 		self.check_permissions_quick(stk, ctx, opt, stm).await?;
+		self.process_record_data(stk, ctx, opt, stm).await?;
+		self.generate_record_id()?;
 		self.check_table_type(ctx, opt, stm).await?;
 		self.check_data_fields(stk, ctx, opt, stm).await?;
-		self.process_record_data(stk, ctx, opt, stm).await?;
+		self.default_record_data(ctx, opt, stm).await?;
 		self.process_table_fields(stk, ctx, opt, stm).await?;
 		self.cleanup_table_fields(ctx, opt, stm).await?;
-		self.default_record_data(ctx, opt, stm).await?;
 		self.check_permissions_table(stk, ctx, opt, stm).await?;
 		self.store_record_data(ctx, opt, stm).await?;
 		self.store_index_data(stk, ctx, opt, stm).await?;
@@ -130,9 +141,9 @@ impl Document {
 		self.check_where_condition(stk, ctx, opt, stm).await?;
 		self.check_permissions_table(stk, ctx, opt, stm).await?;
 		self.process_record_data(stk, ctx, opt, stm).await?;
+		self.default_record_data(ctx, opt, stm).await?;
 		self.process_table_fields(stk, ctx, opt, stm).await?;
 		self.cleanup_table_fields(ctx, opt, stm).await?;
-		self.default_record_data(ctx, opt, stm).await?;
 		self.check_permissions_table(stk, ctx, opt, stm).await?;
 		self.store_record_data(ctx, opt, stm).await?;
 		self.store_index_data(stk, ctx, opt, stm).await?;

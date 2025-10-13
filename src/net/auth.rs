@@ -1,36 +1,33 @@
-use axum::RequestPartsExt;
-use axum::{body::Body, Extension};
-use axum_extra::headers::{
-	authorization::{Basic, Bearer},
-	Authorization, Origin,
-};
+use anyhow::{Result, bail};
+use axum::body::Body;
+use axum::{Extension, RequestPartsExt};
 use axum_extra::TypedHeader;
+use axum_extra::headers::authorization::{Basic, Bearer};
+use axum_extra::headers::{Authorization, Origin};
 use futures_util::future::BoxFuture;
-use http::{request::Parts, StatusCode};
+use http::StatusCode;
+use http::request::Parts;
 use hyper::{Request, Response};
-use surrealdb::{
-	dbs::Session,
-	iam::verify::{basic, token},
-};
+use surrealdb_core::dbs::Session;
+use surrealdb_core::iam::verify::{basic, token};
 use tower_http::auth::AsyncAuthorizeRequest;
 use uuid::Uuid;
 
-use crate::err::Error;
-
-use super::{
-	client_ip::ExtractClientIP,
-	headers::{
-		parse_typed_header, SurrealAuthDatabase, SurrealAuthNamespace, SurrealDatabase, SurrealId,
-		SurrealNamespace,
-	},
-	AppState,
+use super::AppState;
+use super::client_ip::ExtractClientIP;
+use super::headers::{
+	SurrealAuthDatabase, SurrealAuthNamespace, SurrealDatabase, SurrealId, SurrealNamespace,
+	parse_typed_header,
 };
+use crate::net::error::Error as NetError;
 
 ///
-/// SurrealAuth is a tower layer that implements the AsyncAuthorizeRequest trait.
-/// It is used to authorize requests to SurrealDB using Basic or Token authentication.
+/// SurrealAuth is a tower layer that implements the AsyncAuthorizeRequest
+/// trait. It is used to authorize requests to SurrealDB using Basic or Token
+/// authentication.
 ///
-/// It has to be used in conjunction with the tower_http::auth::RequireAuthorizationLayer layer:
+/// It has to be used in conjunction with the
+/// tower_http::auth::RequireAuthorizationLayer layer:
 ///
 /// ```rust
 /// use tower_http::auth::RequireAuthorizationLayer;
@@ -71,15 +68,16 @@ impl AsyncAuthorizeRequest<Body> for SurrealAuth {
 	}
 }
 
-async fn check_auth(parts: &mut Parts) -> Result<Session, Error> {
-	let or = if let Ok(or) = parts.extract::<TypedHeader<Origin>>().await {
-		if !or.is_null() {
-			Some(or.to_string())
-		} else {
-			None
+async fn check_auth(parts: &mut Parts) -> Result<Session> {
+	let or = match parts.extract::<TypedHeader<Origin>>().await {
+		Ok(or) => {
+			if !or.is_null() {
+				Some(or.to_string())
+			} else {
+				None
+			}
 		}
-	} else {
-		None
+		_ => None,
 	};
 
 	// Extract the session id from the headers or generate a new one.
@@ -91,7 +89,7 @@ async fn check_auth(parts: &mut Parts) -> Result<Session, Error> {
 				// The specified request id was a valid UUID.
 				Ok(id) => Some(id.to_string()),
 				// The specified request id was not a valid UUID.
-				Err(_) => return Err(Error::Request),
+				Err(_) => bail!(NetError::Request),
 			}
 		}
 		// No request id was specified, create a new id.
@@ -118,7 +116,7 @@ async fn check_auth(parts: &mut Parts) -> Result<Session, Error> {
 
 	let Extension(state) = parts.extract::<Extension<AppState>>().await.map_err(|err| {
 		tracing::error!("Error extracting the app state: {:?}", err);
-		Error::InvalidAuth
+		NetError::InvalidAuth
 	})?;
 
 	let kvs = &state.datastore;
@@ -127,12 +125,14 @@ async fn check_auth(parts: &mut Parts) -> Result<Session, Error> {
 		parts.extract_with_state(&state).await.unwrap_or(ExtractClientIP(None));
 
 	// Create session
-	let mut session = Session::default();
-	session.ip = ip;
-	session.or = or;
-	session.id = id;
-	session.ns = ns;
-	session.db = db;
+	let mut session = Session {
+		ip,
+		or,
+		id,
+		ns,
+		db,
+		..Session::default()
+	};
 
 	// If Basic authentication data was supplied
 	if let Ok(au) = parts.extract::<TypedHeader<Authorization<Basic>>>().await {

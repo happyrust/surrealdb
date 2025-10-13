@@ -4,27 +4,27 @@ mod lru;
 mod mapper;
 pub(crate) mod tree;
 
+use std::fmt::{Debug, Display, Formatter};
+use std::sync::Arc;
+
+use anyhow::Result;
+
+use crate::catalog::providers::{DatabaseProvider, TableProvider};
+use crate::catalog::{DatabaseId, HnswParams, Index, IndexDefinition, NamespaceId};
 use crate::ctx::Context;
-use crate::dbs::Options;
 use crate::err::Error;
+use crate::idx::IndexKeyBase;
 use crate::idx::trees::store::cache::TreeCache;
 use crate::idx::trees::store::hnsw::{HnswIndexes, SharedHnswIndex};
 use crate::idx::trees::store::mapper::Mappers;
 use crate::idx::trees::store::tree::{TreeRead, TreeWrite};
-use crate::idx::IndexKeyBase;
 #[cfg(not(target_family = "wasm"))]
 use crate::kvs::IndexBuilder;
-use crate::kvs::{Key, Transaction, TransactionType, Val};
-use crate::sql::index::HnswParams;
-use crate::sql::statements::DefineIndexStatement;
-use crate::sql::Index;
-use std::fmt::{Debug, Display, Formatter};
-use std::sync::Arc;
+use crate::kvs::{KVKey, Key, Transaction, TransactionType, Val};
 
 pub type NodeId = u64;
 pub type StoreGeneration = u64;
 
-#[non_exhaustive]
 #[expect(clippy::large_enum_variant)]
 pub enum TreeStore<N>
 where
@@ -51,21 +51,22 @@ where
 		&mut self,
 		tx: &Transaction,
 		node_id: NodeId,
-	) -> Result<StoredNode<N>, Error> {
+	) -> Result<StoredNode<N>> {
 		match self {
 			Self::Write(w) => w.get_node_mut(tx, node_id).await,
-			_ => Err(fail!("TreeStore::get_node_mut")),
+			_ => fail!("TreeStore::get_node_mut"),
 		}
 	}
 
+	#[cfg(test)]
 	pub(in crate::idx) async fn get_node(
 		&self,
 		tx: &Transaction,
 		node_id: NodeId,
-	) -> Result<Arc<StoredNode<N>>, Error> {
+	) -> Result<Arc<StoredNode<N>>> {
 		match self {
 			Self::Read(r) => r.get_node(tx, node_id).await,
-			_ => Err(fail!("TreeStore::get_node")),
+			_ => fail!("TreeStore::get_node"),
 		}
 	}
 
@@ -73,13 +74,13 @@ where
 		&self,
 		ctx: &Context,
 		node_id: NodeId,
-	) -> Result<Arc<StoredNode<N>>, Error> {
+	) -> Result<Arc<StoredNode<N>>> {
 		match self {
 			Self::Read(r) => {
 				let tx = ctx.tx();
 				r.get_node(&tx, node_id).await
 			}
-			_ => Err(fail!("TreeStore::get_node_txn")),
+			_ => fail!("TreeStore::get_node_txn"),
 		}
 	}
 
@@ -87,17 +88,17 @@ where
 		&mut self,
 		node: StoredNode<N>,
 		updated: bool,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		match self {
 			Self::Write(w) => w.set_node(node, updated),
-			_ => Err(fail!("TreeStore::set_node")),
+			_ => fail!("TreeStore::set_node"),
 		}
 	}
 
-	pub(in crate::idx) fn new_node(&mut self, id: NodeId, node: N) -> Result<StoredNode<N>, Error> {
+	pub(in crate::idx) fn new_node(&mut self, id: NodeId, node: N) -> Result<StoredNode<N>> {
 		match self {
 			Self::Write(w) => Ok(w.new_node(id, node)?),
-			_ => Err(fail!("TreeStore::new_node")),
+			_ => fail!("TreeStore::new_node"),
 		}
 	}
 
@@ -105,14 +106,14 @@ where
 		&mut self,
 		node_id: NodeId,
 		node_key: Key,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		match self {
 			Self::Write(w) => w.remove_node(node_id, node_key),
-			_ => Err(fail!("TreeStore::remove_node")),
+			_ => fail!("TreeStore::remove_node"),
 		}
 	}
 
-	pub async fn finish(&mut self, tx: &Transaction) -> Result<Option<TreeCache<N>>, Error> {
+	pub async fn finish(&mut self, tx: &Transaction) -> Result<Option<TreeCache<N>>> {
 		match self {
 			Self::Write(w) => w.finish(tx).await,
 			_ => Ok(None),
@@ -121,54 +122,44 @@ where
 }
 
 #[derive(Clone)]
-#[non_exhaustive]
 pub enum TreeNodeProvider {
-	DocIds(IndexKeyBase),
-	DocLengths(IndexKeyBase),
-	Postings(IndexKeyBase),
-	Terms(IndexKeyBase),
 	Vector(IndexKeyBase),
 	Debug,
 }
 
 impl TreeNodeProvider {
-	pub fn get_key(&self, node_id: NodeId) -> Result<Key, Error> {
+	pub fn get_key(&self, node_id: NodeId) -> Result<Key> {
 		match self {
-			TreeNodeProvider::DocIds(ikb) => ikb.new_bd_key(Some(node_id)),
-			TreeNodeProvider::DocLengths(ikb) => ikb.new_bl_key(Some(node_id)),
-			TreeNodeProvider::Postings(ikb) => ikb.new_bp_key(Some(node_id)),
-			TreeNodeProvider::Terms(ikb) => ikb.new_bt_key(Some(node_id)),
-			TreeNodeProvider::Vector(ikb) => ikb.new_vm_key(Some(node_id)),
+			TreeNodeProvider::Vector(ikb) => ikb.new_vm_key(node_id).encode_key(),
 			TreeNodeProvider::Debug => Ok(node_id.to_be_bytes().to_vec()),
 		}
 	}
 
-	async fn load<N>(&self, tx: &Transaction, id: NodeId) -> Result<StoredNode<N>, Error>
+	async fn load<N>(&self, tx: &Transaction, id: NodeId) -> Result<StoredNode<N>>
 	where
 		N: TreeNode + Clone,
 	{
 		let key = self.get_key(id)?;
-		if let Some(val) = tx.get(key.clone(), None).await? {
+		if let Some(val) = tx.get(&key, None).await? {
 			let size = val.len() as u32;
 			let node = N::try_from_val(val)?;
 			Ok(StoredNode::new(node, id, key, size))
 		} else {
-			Err(Error::CorruptedIndex("TreeStore::load"))
+			Err(anyhow::Error::new(Error::CorruptedIndex("TreeStore::load")))
 		}
 	}
 
-	async fn save<N>(&self, tx: &Transaction, node: &mut StoredNode<N>) -> Result<(), Error>
+	async fn save<N>(&self, tx: &Transaction, node: &mut StoredNode<N>) -> Result<()>
 	where
 		N: TreeNode + Clone + Display,
 	{
 		let val = node.n.try_into_val()?;
 		node.size = val.len() as u32;
-		tx.set(node.key.clone(), val, None).await?;
+		tx.set(&node.key, &val, None).await?;
 		Ok(())
 	}
 }
 
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct StoredNode<N>
 where
@@ -205,14 +196,13 @@ where
 
 pub trait TreeNode: Debug + Clone + Display {
 	fn prepare_save(&mut self) {}
-	fn try_from_val(val: Val) -> Result<Self, Error>
+	fn try_from_val(val: Val) -> Result<Self>
 	where
 		Self: Sized;
-	fn try_into_val(&self) -> Result<Val, Error>;
+	fn try_into_val(&self) -> Result<Val>;
 }
 
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct IndexStores(Arc<Inner>);
 
 struct Inner {
@@ -232,43 +222,43 @@ impl Default for IndexStores {
 impl IndexStores {
 	pub(crate) async fn get_index_hnsw(
 		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
 		ctx: &Context,
-		opt: &Options,
-		ix: &DefineIndexStatement,
+		ix: &IndexDefinition,
 		p: &HnswParams,
-	) -> Result<SharedHnswIndex, Error> {
-		let (ns, db) = opt.ns_db()?;
-		let ikb = IndexKeyBase::new(ns, db, ix)?;
-		self.0.hnsw_indexes.get(ctx, &ix.what, &ikb, p).await
+	) -> Result<SharedHnswIndex> {
+		let ikb = IndexKeyBase::new(ns, db, &ix.table_name, ix.index_id);
+		self.0.hnsw_indexes.get(ctx, &ix.table_name, &ikb, p).await
 	}
 
 	pub(crate) async fn index_removed(
 		&self,
 		#[cfg(not(target_family = "wasm"))] ib: Option<&IndexBuilder>,
 		tx: &Transaction,
-		ns: &str,
-		db: &str,
+		ns: NamespaceId,
+		db: DatabaseId,
 		tb: &str,
 		ix: &str,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		#[cfg(not(target_family = "wasm"))]
 		if let Some(ib) = ib {
-			ib.remove_index(ns, db, tb, ix)?;
+			ib.remove_index(ns, db, tb, ix).await?;
 		}
-		self.remove_index(ns, db, tx.get_tb_index(ns, db, tb, ix).await?.as_ref()).await
+		self.remove_index(ns, db, tx.expect_tb_index(ns, db, tb, ix).await?.as_ref()).await
 	}
 
 	pub(crate) async fn namespace_removed(
 		&self,
 		#[cfg(not(target_family = "wasm"))] ib: Option<&IndexBuilder>,
 		tx: &Transaction,
-		ns: &str,
-	) -> Result<(), Error> {
+		ns: NamespaceId,
+	) -> Result<()> {
 		for db in tx.all_db(ns).await?.iter() {
 			#[cfg(not(target_family = "wasm"))]
-			self.database_removed(ib, tx, ns, &db.name).await?;
+			self.database_removed(ib, tx, ns, db.database_id).await?;
 			#[cfg(target_family = "wasm")]
-			self.database_removed(tx, ns, &db.name).await?;
+			self.database_removed(tx, ns, db.database_id).await?;
 		}
 		Ok(())
 	}
@@ -277,9 +267,9 @@ impl IndexStores {
 		&self,
 		#[cfg(not(target_family = "wasm"))] ib: Option<&IndexBuilder>,
 		tx: &Transaction,
-		ns: &str,
-		db: &str,
-	) -> Result<(), Error> {
+		ns: NamespaceId,
+		db: DatabaseId,
+	) -> Result<()> {
 		for tb in tx.all_tb(ns, db, None).await?.iter() {
 			#[cfg(not(target_family = "wasm"))]
 			self.table_removed(ib, tx, ns, db, &tb.name).await?;
@@ -293,14 +283,14 @@ impl IndexStores {
 		&self,
 		#[cfg(not(target_family = "wasm"))] ib: Option<&IndexBuilder>,
 		tx: &Transaction,
-		ns: &str,
-		db: &str,
+		ns: NamespaceId,
+		db: DatabaseId,
 		tb: &str,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		for ix in tx.all_tb_indexes(ns, db, tb).await?.iter() {
 			#[cfg(not(target_family = "wasm"))]
 			if let Some(ib) = ib {
-				ib.remove_index(ns, db, tb, &ix.name)?;
+				ib.remove_index(ns, db, tb, &ix.name).await?;
 			}
 			self.remove_index(ns, db, ix).await?;
 		}
@@ -309,18 +299,18 @@ impl IndexStores {
 
 	async fn remove_index(
 		&self,
-		ns: &str,
-		db: &str,
-		ix: &DefineIndexStatement,
-	) -> Result<(), Error> {
+		ns: NamespaceId,
+		db: DatabaseId,
+		ix: &IndexDefinition,
+	) -> Result<()> {
 		if matches!(ix.index, Index::Hnsw(_)) {
-			let ikb = IndexKeyBase::new(ns, db, ix)?;
+			let ikb = IndexKeyBase::new(ns, db, &ix.table_name, ix.index_id);
 			self.remove_hnsw_index(ikb).await?;
 		}
 		Ok(())
 	}
 
-	async fn remove_hnsw_index(&self, ikb: IndexKeyBase) -> Result<(), Error> {
+	async fn remove_hnsw_index(&self, ikb: IndexKeyBase) -> Result<()> {
 		self.0.hnsw_indexes.remove(&ikb).await?;
 		Ok(())
 	}

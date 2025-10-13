@@ -5,38 +5,35 @@ pub(crate) mod native;
 #[cfg(target_family = "wasm")]
 pub(crate) mod wasm;
 
-use crate::api::conn::Command;
-use crate::api::conn::DbResponse;
-use crate::api::Connect;
-use crate::api::Result;
-use crate::api::Surreal;
-use crate::opt::IntoEndpoint;
-use crate::value::Notification;
-use async_channel::Sender;
-use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::io;
 use std::marker::PhantomData;
 use std::time::Duration;
-use surrealdb_core::sql::Value as CoreValue;
+
+use async_channel::Sender;
+use indexmap::IndexMap;
+use surrealdb_core::dbs::QueryResult;
+use surrealdb_types::{Notification, Value};
 use trice::Instant;
 use uuid::Uuid;
 
+use crate::api::conn::Command;
+use crate::api::{Connect, Result, Surreal};
+use crate::opt::IntoEndpoint;
+
 pub(crate) const PATH: &str = "rpc";
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-const REVISION_HEADER: &str = "revision";
 
 enum RequestEffect {
 	/// Completing this request sets a variable to a give value.
 	Set {
 		key: String,
-		value: CoreValue,
+		value: Value,
 	},
 	/// Completing this request sets a variable to a give value.
 	Clear {
 		key: String,
 	},
-	/// Insert requests repsonses need to be flattened in an array.
-	Insert,
 	/// No effect
 	None,
 }
@@ -54,16 +51,17 @@ struct PendingRequest {
 	// Does resolving this request has some effects.
 	effect: RequestEffect,
 	// The channel to send the result of the request into.
-	response_channel: Sender<Result<DbResponse>>,
+	response_channel:
+		Sender<std::result::Result<Vec<QueryResult>, surrealdb_core::rpc::DbResultError>>,
 }
 
 struct RouterState<Sink, Stream> {
 	/// Vars currently set by the set method,
-	vars: IndexMap<String, CoreValue>,
+	vars: IndexMap<String, Value>,
 	/// Messages which aught to be replayed on a reconnect.
 	replay: IndexMap<ReplayMethod, Command>,
 	/// Pending live queries
-	live_queries: HashMap<Uuid, async_channel::Sender<Notification<CoreValue>>>,
+	live_queries: HashMap<Uuid, Sender<Result<Notification>>>,
 	/// Send requests which are still awaiting an awnser.
 	pending_requests: HashMap<i64, PendingRequest>,
 	/// The last time a message was recieved from the server.
@@ -85,6 +83,29 @@ impl<Sink, Stream> RouterState<Sink, Stream> {
 			sink,
 			stream,
 		}
+	}
+
+	async fn clear_pending_requests(&mut self) {
+		for (_id, request) in self.pending_requests.drain() {
+			let error = io::Error::from(io::ErrorKind::ConnectionReset);
+			let sender = request.response_channel;
+			let err: crate::api::err::Error = error.into();
+			sender.send(Err(err.into())).await.ok();
+			sender.close();
+		}
+	}
+
+	async fn clear_live_queries(&mut self) {
+		for (_id, sender) in self.live_queries.drain() {
+			let error = io::Error::from(io::ErrorKind::ConnectionReset);
+			sender.send(Err(error.into())).await.ok();
+			sender.close();
+		}
+	}
+
+	async fn reset(&mut self) {
+		self.clear_pending_requests().await;
+		self.clear_live_queries().await;
 	}
 }
 
@@ -108,7 +129,8 @@ pub struct Wss;
 pub struct Client(());
 
 impl Surreal<Client> {
-	/// Connects to a specific database endpoint, saving the connection on the static client
+	/// Connects to a specific database endpoint, saving the connection on the
+	/// static client
 	///
 	/// # Examples
 	///
@@ -132,7 +154,6 @@ impl Surreal<Client> {
 	) -> Connect<Client, ()> {
 		Connect {
 			surreal: self.inner.clone().into(),
-			#[expect(deprecated)]
 			address: address.into_endpoint(),
 			capacity: 0,
 			response_type: PhantomData,

@@ -1,25 +1,28 @@
-use crate::err::Error;
-use crate::fnc::util::math::ToFloat;
-use crate::idx::VersionedStore;
-use crate::sql::index::{Distance, VectorType};
-use crate::sql::{Number, Value};
-use ahash::AHasher;
-use ahash::HashSet;
-use linfa_linalg::norm::Norm;
-use ndarray::{Array1, LinalgScalar, Zip};
-use ndarray_stats::DeviationExt;
-use num_traits::Zero;
-use revision::revisioned;
-use rust_decimal::prelude::FromPrimitive;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::PartialEq;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Deref, Div, Sub};
 use std::sync::Arc;
 
-/// In the context of a Symmetric MTree index, the term object refers to a vector, representing the indexed item.
+use ahash::{AHasher, HashSet};
+use anyhow::{Result, ensure};
+use linfa_linalg::norm::Norm;
+use ndarray::{Array1, LinalgScalar, Zip};
+use ndarray_stats::DeviationExt;
+use num_traits::Zero;
+use revision::{DeserializeRevisioned, SerializeRevisioned, revisioned};
+use rust_decimal::prelude::FromPrimitive;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use storekey::{BorrowDecode, Encode};
+
+use crate::catalog::{Distance, VectorType};
+use crate::err::Error;
+use crate::fnc::util::math::ToFloat;
+use crate::kvs::KVValue;
+use crate::val::{Number, Value};
+
+/// In the context of a Symmetric MTree index, the term object refers to a
+/// vector, representing the indexed item.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum Vector {
 	F64(Array1<f64>),
 	F32(Array1<f32>),
@@ -29,8 +32,7 @@ pub enum Vector {
 }
 
 #[revisioned(revision = 1)]
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, BorrowDecode)]
 pub enum SerializedVector {
 	F64(Vec<f64>),
 	F32(Vec<f32>),
@@ -39,7 +41,19 @@ pub enum SerializedVector {
 	I16(Vec<i16>),
 }
 
-impl VersionedStore for SerializedVector {}
+impl KVValue for SerializedVector {
+	#[inline]
+	fn kv_encode_value(&self) -> anyhow::Result<Vec<u8>> {
+		let mut val = Vec::new();
+		SerializeRevisioned::serialize_revisioned(self, &mut val)?;
+		Ok(val)
+	}
+
+	#[inline]
+	fn kv_decode_value(val: Vec<u8>) -> Result<Self> {
+		Ok(DeserializeRevisioned::deserialize_revisioned(&mut val.as_slice())?)
+	}
+}
 
 impl From<&Vector> for SerializedVector {
 	fn from(value: &Vector) -> Self {
@@ -313,11 +327,13 @@ impl Vector {
 	}
 }
 
-/// For vectors, as we want to support very large vectors, we want to avoid copy or clone.
-/// So the requirement is multiple ownership but not thread safety.
-/// However, because we are running in an async context, and because we are using cache structures that use the Arc as a key,
-/// the cached objects has to be Sent, which then requires the use of Arc (rather than just Rc).
-/// As computing the hash for a large vector is costly, this structures also caches the hashcode to avoid recomputing it.
+/// For vectors, as we want to support very large vectors, we want to avoid copy
+/// or clone. So the requirement is multiple ownership but not thread safety.
+/// However, because we are running in an async context, and because we are
+/// using cache structures that use the Arc as a key, the cached objects has to
+/// be Sent, which then requires the use of Arc (rather than just Rc).
+/// As computing the hash for a large vector is costly, this structures also
+/// caches the hashcode to avoid recomputing it.
 #[derive(Debug, Clone)]
 pub struct SharedVector(Arc<Vector>, u64);
 impl From<Vector> for SharedVector {
@@ -408,19 +424,19 @@ impl SharedVector {
 #[cfg(test)]
 impl From<&Vector> for Value {
 	fn from(v: &Vector) -> Self {
-		let vec: Vec<Number> = match v {
-			Vector::F64(a) => a.iter().map(|i| Number::Float(*i)).collect(),
-			Vector::F32(a) => a.iter().map(|i| Number::Float(*i as f64)).collect(),
-			Vector::I64(a) => a.iter().map(|i| Number::Int(*i)).collect(),
-			Vector::I32(a) => a.iter().map(|i| Number::Int(*i as i64)).collect(),
-			Vector::I16(a) => a.iter().map(|i| Number::Int(*i as i64)).collect(),
+		let vec: Vec<_> = match v {
+			Vector::F64(a) => a.iter().map(|i| Number::Float(*i)).map(Value::from).collect(),
+			Vector::F32(a) => a.iter().map(|i| Number::Float(*i as f64)).map(Value::from).collect(),
+			Vector::I64(a) => a.iter().map(|i| Number::Int(*i)).map(Value::from).collect(),
+			Vector::I32(a) => a.iter().map(|i| Number::Int(*i as i64)).map(Value::from).collect(),
+			Vector::I16(a) => a.iter().map(|i| Number::Int(*i as i64)).map(Value::from).collect(),
 		};
 		Value::from(vec)
 	}
 }
 
 impl Vector {
-	pub(super) fn try_from_value(t: VectorType, d: usize, v: &Value) -> Result<Self, Error> {
+	pub(super) fn try_from_value(t: VectorType, d: usize, v: &Value) -> Result<Self> {
 		let res = match t {
 			VectorType::F64 => {
 				let mut vec = Vec::with_capacity(d);
@@ -451,7 +467,7 @@ impl Vector {
 		Ok(res)
 	}
 
-	fn check_vector_value<T>(value: &Value, vec: &mut Vec<T>) -> Result<(), Error>
+	fn check_vector_value<T>(value: &Value, vec: &mut Vec<T>) -> Result<()>
 	where
 		T: TryFrom<Number, Error = Error>,
 	{
@@ -466,11 +482,11 @@ impl Vector {
 				vec.push((*n).try_into()?);
 				Ok(())
 			}
-			_ => Err(Error::InvalidVectorValue(value.clone().to_raw_string())),
+			_ => Err(anyhow::Error::new(Error::InvalidVectorValue(value.clone().to_raw_string()))),
 		}
 	}
 
-	pub fn try_from_vector(t: VectorType, v: &[Number]) -> Result<Self, Error> {
+	pub(super) fn try_from_vector(t: VectorType, v: &[Number]) -> Result<Self> {
 		let res = match t {
 			VectorType::F64 => {
 				let mut vec = Vec::with_capacity(v.len());
@@ -501,7 +517,7 @@ impl Vector {
 		Ok(res)
 	}
 
-	fn check_vector_number<T>(v: &[Number], vec: &mut Vec<T>) -> Result<(), Error>
+	fn check_vector_number<T>(v: &[Number], vec: &mut Vec<T>) -> Result<()>
 	where
 		T: TryFrom<Number, Error = Error>,
 	{
@@ -521,18 +537,18 @@ impl Vector {
 		}
 	}
 
-	pub(super) fn check_expected_dimension(current: usize, expected: usize) -> Result<(), Error> {
-		if current != expected {
-			Err(Error::InvalidVectorDimension {
+	pub(super) fn check_expected_dimension(current: usize, expected: usize) -> Result<()> {
+		ensure!(
+			current == expected,
+			Error::InvalidVectorDimension {
 				current,
 				expected,
-			})
-		} else {
-			Ok(())
-		}
+			}
+		);
+		Ok(())
 	}
 
-	pub(super) fn check_dimension(&self, expected_dim: usize) -> Result<(), Error> {
+	pub(super) fn check_dimension(&self, expected_dim: usize) -> Result<()> {
 		Self::check_expected_dimension(self.len(), expected_dim)
 	}
 }
@@ -554,9 +570,9 @@ impl Distance {
 
 #[cfg(test)]
 mod tests {
-	use crate::idx::trees::knn::tests::{get_seed_rnd, new_random_vec, RandomItemGenerator};
+	use crate::catalog::{Distance, VectorType};
+	use crate::idx::trees::knn::tests::{RandomItemGenerator, get_seed_rnd, new_random_vec};
 	use crate::idx::trees::vector::{SharedVector, Vector};
-	use crate::sql::index::{Distance, VectorType};
 
 	fn test_distance(dist: Distance, a1: &[f64], a2: &[f64], res: f64) {
 		// Convert the arrays to Vec<Number>
@@ -580,11 +596,11 @@ mod tests {
 		for vt in
 			[VectorType::F64, VectorType::F32, VectorType::I64, VectorType::I32, VectorType::I16]
 		{
-			let gen = RandomItemGenerator::new(&dist, dim);
+			let r#gen = RandomItemGenerator::new(&dist, dim);
 			let mut num_zero = 0;
 			for i in 0..size {
-				let v1 = new_random_vec(&mut rng, vt, dim, &gen);
-				let v2 = new_random_vec(&mut rng, vt, dim, &gen);
+				let v1 = new_random_vec(&mut rng, vt, dim, &r#gen);
+				let v2 = new_random_vec(&mut rng, vt, dim, &r#gen);
 				let d = dist.calculate(&v1, &v2);
 				assert!(
 					d.is_finite() && !d.is_nan(),

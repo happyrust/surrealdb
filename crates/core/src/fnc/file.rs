@@ -1,21 +1,20 @@
+use anyhow::Result;
 use reblessive::tree::Stk;
 
-use crate::{
-	buc::{store::ObjectKey, BucketController},
-	ctx::Context,
-	dbs::Options,
-	err::Error,
-	sql::{File, Object, Strand, Value},
-};
-
-use super::{args::Optional, CursorDoc};
+use super::CursorDoc;
+use super::args::Optional;
+use crate::buc::BucketController;
+use crate::buc::store::ObjectKey;
+use crate::ctx::Context;
+use crate::dbs::Options;
+use crate::val::{File, Object, Value};
 
 pub async fn put(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(file, value): (File, Value),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.put(&file.key.into(), value).await?;
+	controller.put(&ObjectKey::new(file.key), value).await?;
 
 	Ok(Value::None)
 }
@@ -23,9 +22,9 @@ pub async fn put(
 pub async fn put_if_not_exists(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(file, value): (File, Value),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.put_if_not_exists(&file.key.into(), value).await?;
+	controller.put_if_not_exists(&ObjectKey::new(file.key), value).await?;
 
 	Ok(Value::None)
 }
@@ -33,71 +32,71 @@ pub async fn put_if_not_exists(
 pub async fn get(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(file,): (File,),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	let res = controller.get(&file.key.into()).await?;
+	let res = controller.get(&ObjectKey::new(file.key)).await?;
 	Ok(res.map(Value::Bytes).unwrap_or_default())
 }
 
 pub async fn head(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(file,): (File,),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	let res = controller.head(&file.key.into()).await?;
+	let res = controller.head(&ObjectKey::new(file.key)).await?;
 	Ok(res.map(|v| v.into_value(file.bucket)).unwrap_or_default())
 }
 
 pub async fn delete(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(file,): (File,),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.delete(&file.key.into()).await?;
+	controller.delete(&ObjectKey::new(file.key)).await?;
 
 	Ok(Value::None)
 }
 
 pub async fn copy(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
-	(file, Strand(target)): (File, Strand),
-) -> Result<Value, Error> {
-	let target = ObjectKey::from(target);
+	(file, target): (File, String),
+) -> Result<Value> {
+	let target = ObjectKey::new(target);
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.copy(&file.key.into(), target).await?;
+	controller.copy(&ObjectKey::new(file.key), target).await?;
 
 	Ok(Value::None)
 }
 
 pub async fn copy_if_not_exists(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
-	(file, Strand(target)): (File, Strand),
-) -> Result<Value, Error> {
-	let target = ObjectKey::from(target);
+	(file, target): (File, String),
+) -> Result<Value> {
+	let target = ObjectKey::new(target);
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.copy_if_not_exists(&file.key.into(), target).await?;
+	controller.copy_if_not_exists(&ObjectKey::new(file.key), target).await?;
 
 	Ok(Value::None)
 }
 
 pub async fn rename(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
-	(file, Strand(target)): (File, Strand),
-) -> Result<Value, Error> {
-	let target = ObjectKey::from(target);
+	(file, target): (File, String),
+) -> Result<Value> {
+	let target = ObjectKey::new(target);
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.rename(&file.key.into(), target).await?;
+	controller.rename(&ObjectKey::new(file.key), target).await?;
 
 	Ok(Value::None)
 }
 
 pub async fn rename_if_not_exists(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
-	(file, Strand(target)): (File, Strand),
-) -> Result<Value, Error> {
-	let target = ObjectKey::from(target);
+	(file, target): (File, String),
+) -> Result<Value> {
+	let target = ObjectKey::new(target);
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	controller.rename_if_not_exists(&file.key.into(), target).await?;
+	controller.rename_if_not_exists(&ObjectKey::new(file.key), target).await?;
 
 	Ok(Value::None)
 }
@@ -105,9 +104,9 @@ pub async fn rename_if_not_exists(
 pub async fn exists(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(file,): (File,),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &file.bucket).await?;
-	let exists = controller.exists(&file.key.into()).await?;
+	let exists = controller.exists(&ObjectKey::new(file.key)).await?;
 
 	Ok(Value::Bool(exists))
 }
@@ -115,7 +114,7 @@ pub async fn exists(
 pub async fn list(
 	(stk, ctx, opt, doc): (&mut Stk, &Context, &Options, Option<&CursorDoc>),
 	(bucket, Optional(opts)): (String, Optional<Object>),
-) -> Result<Value, Error> {
+) -> Result<Value> {
 	let mut controller = BucketController::new(stk, ctx, opt, doc, &bucket).await?;
 	let opts = opts.map(|v| v.try_into()).transpose()?.unwrap_or_default();
 	let res = controller
@@ -129,10 +128,10 @@ pub async fn list(
 	Ok(res)
 }
 
-pub fn bucket((file,): (File,)) -> Result<Value, Error> {
+pub fn bucket((file,): (File,)) -> Result<Value> {
 	Ok(file.bucket.into())
 }
 
-pub fn key((file,): (File,)) -> Result<Value, Error> {
+pub fn key((file,): (File,)) -> Result<Value> {
 	Ok(file.key.into())
 }

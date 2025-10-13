@@ -1,23 +1,12 @@
+use std::sync::LazyLock;
 use std::time::Instant;
 
+use opentelemetry::metrics::{Counter, Histogram, Meter, MetricsError, UpDownCounter};
+use opentelemetry::{Context as TelemetryContext, KeyValue, global};
+
 use crate::cnf::TELEMETRY_NAMESPACE;
-use opentelemetry::metrics::Meter;
-use opentelemetry::{global, KeyValue};
-use opentelemetry::{
-	metrics::{Histogram, MetricsError, UpDownCounter},
-	Context as TelemetryContext,
-};
-use std::sync::LazyLock;
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("surrealdb.rpc"));
-
-pub static RPC_SERVER_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-	METER
-		.u64_histogram("rpc.server.duration")
-		.with_description("Measures duration of inbound RPC requests in milliseconds.")
-		.with_unit("ms")
-		.init()
-});
 
 pub static RPC_SERVER_ACTIVE_CONNECTIONS: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 	METER
@@ -26,10 +15,25 @@ pub static RPC_SERVER_ACTIVE_CONNECTIONS: LazyLock<UpDownCounter<i64>> = LazyLoc
 		.init()
 });
 
+pub static RPC_SERVER_CONNECTION_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+	METER
+		.u64_counter("rpc.server.connection.count")
+		.with_description("The total number of WebSocket connections processed.")
+		.init()
+});
+
+pub static RPC_SERVER_REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+	METER
+		.u64_histogram("rpc.server.request.duration")
+		.with_description("The duration of inbound WebSocket requests in milliseconds.")
+		.with_unit("ms")
+		.init()
+});
+
 pub static RPC_SERVER_REQUEST_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 	METER
 		.u64_histogram("rpc.server.request.size")
-		.with_description("Measures the size of HTTP request messages.")
+		.with_description("The size of inbound WebSocket request messages.")
 		.with_unit("mb")
 		.init()
 });
@@ -37,7 +41,7 @@ pub static RPC_SERVER_REQUEST_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| 
 pub static RPC_SERVER_RESPONSE_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 	METER
 		.u64_histogram("rpc.server.response.size")
-		.with_description("Measures the size of HTTP response messages.")
+		.with_description("The size of outbound WebSocket response messages.")
 		.with_unit("mb")
 		.init()
 });
@@ -55,13 +59,14 @@ pub fn on_connect() -> Result<(), MetricsError> {
 	observe_active_connection(1)
 }
 
-/// Registers the callback that increases the number of active RPC connections.
+/// Registers the callback that decreases the number of active RPC connections.
 pub fn on_disconnect() -> Result<(), MetricsError> {
 	observe_active_connection(-1)
 }
 
 pub(super) fn observe_active_connection(value: i64) -> Result<(), MetricsError> {
 	let attrs = otel_common_attrs();
+	RPC_SERVER_CONNECTION_COUNT.add(1, &attrs);
 	RPC_SERVER_ACTIVE_CONNECTIONS.add(value, &attrs);
 	Ok(())
 }
@@ -144,7 +149,8 @@ pub fn record_rpc(cx: &TelemetryContext, res_size: usize, is_error: bool) {
 			KeyValue::new("rpc.live_id", cx.live_id.clone()),
 		]);
 	} else {
-		// If a bug causes the RequestContent to be empty, we still want to record the metrics to avoid a silent failure.
+		// If a bug causes the RequestContent to be empty, we still want to record the
+		// metrics to avoid a silent failure.
 		warn!("record_rpc: no request context found, resulting metrics will be invalid");
 		attrs.extend_from_slice(&[
 			KeyValue::new("rpc.method", "unknown"),
@@ -152,7 +158,7 @@ pub fn record_rpc(cx: &TelemetryContext, res_size: usize, is_error: bool) {
 		]);
 	};
 
-	RPC_SERVER_DURATION.record(duration, &attrs);
+	RPC_SERVER_REQUEST_DURATION.record(duration, &attrs);
 	RPC_SERVER_REQUEST_SIZE.record(req_size, &attrs);
 	RPC_SERVER_RESPONSE_SIZE.record(res_size as u64, &attrs);
 }

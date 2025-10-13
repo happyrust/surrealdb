@@ -1,17 +1,18 @@
 //! Request class implementation
 
-use crate::fnc::script::fetch::{body::Body, RequestError};
 use bytes::Bytes;
-use js::{
-	class::Trace, function::Opt, prelude::Coerced, Class, Ctx, Exception, FromJs, JsLifetime,
-	Object, Result, Value,
-};
-use reqwest::{header::HeaderName, Method, Url};
+use js::class::Trace;
+use js::function::Opt;
+use js::prelude::Coerced;
+use js::{Class, Ctx, Exception, FromJs, JsLifetime, Object, Result, Value};
+use reqwest::header::HeaderName;
+use reqwest::{Method, Url};
 
 use super::{Blob, Headers};
+use crate::fnc::script::fetch::RequestError;
+use crate::fnc::script::fetch::body::Body;
 
 #[derive(Clone, Copy, Eq, PartialEq, JsLifetime)]
-#[non_exhaustive]
 pub enum RequestMode {
 	Navigate,
 	SameOrigin,
@@ -38,7 +39,7 @@ impl<'js> FromJs<'js> for RequestMode {
 							or `cors`",
 							x
 						),
-					))
+					));
 				}
 			}
 		} else {
@@ -49,7 +50,6 @@ impl<'js> FromJs<'js> for RequestMode {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, JsLifetime)]
-#[non_exhaustive]
 pub enum RequestCredentials {
 	Omit,
 	SameOrigin,
@@ -73,7 +73,7 @@ impl<'js> FromJs<'js> for RequestCredentials {
 								, or `include`",
 							x
 						),
-					))
+					));
 				}
 			}
 		} else {
@@ -84,7 +84,6 @@ impl<'js> FromJs<'js> for RequestCredentials {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, JsLifetime)]
-#[non_exhaustive]
 pub enum RequestCache {
 	Default,
 	NoStore,
@@ -117,7 +116,7 @@ impl<'js> FromJs<'js> for RequestCache {
 								, or `only-if-cached`",
 							x
 						),
-					))
+					));
 				}
 			}
 		} else {
@@ -128,7 +127,6 @@ impl<'js> FromJs<'js> for RequestCache {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, JsLifetime)]
-#[non_exhaustive]
 pub enum RequestRedirect {
 	Follow,
 	Error,
@@ -152,7 +150,7 @@ impl<'js> FromJs<'js> for RequestRedirect {
 							or `manual`",
 							x
 						),
-					))
+					));
 				}
 			}
 		} else {
@@ -163,7 +161,6 @@ impl<'js> FromJs<'js> for RequestRedirect {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, JsLifetime)]
-#[non_exhaustive]
 pub enum ReferrerPolicy {
 	Empty,
 	NoReferrer,
@@ -204,7 +201,7 @@ impl<'js> FromJs<'js> for ReferrerPolicy {
 							, or `unsafe-url1`",
 							x
 						),
-					))
+					));
 				}
 			}
 		} else {
@@ -215,7 +212,6 @@ impl<'js> FromJs<'js> for ReferrerPolicy {
 }
 
 #[derive(JsLifetime)]
-#[non_exhaustive]
 pub struct RequestInit<'js> {
 	pub method: Method,
 	pub headers: Class<'js, Headers>,
@@ -286,7 +282,8 @@ fn normalize_method(ctx: &Ctx<'_>, m: String) -> Result<Method> {
 		return Err(Exception::throw_type(ctx, &format!("method {m} is forbidden")));
 	}
 
-	// The following methods must be uppercased to the default case insensitive equivalent.
+	// The following methods must be uppercased to the default case insensitive
+	// equivalent.
 	if m.as_bytes().eq_ignore_ascii_case(b"DELETE") {
 		return Ok(Method::DELETE);
 	}
@@ -378,7 +375,6 @@ impl<'js> FromJs<'js> for RequestInit<'js> {
 
 #[js::class]
 #[derive(Trace, JsLifetime)]
-#[non_exhaustive]
 pub struct Request<'js> {
 	#[qjs(skip_trace)]
 	pub(crate) url: Url,
@@ -543,8 +539,10 @@ impl<'js> Request<'js> {
 
 #[cfg(test)]
 mod test {
+	use js::CatchResultExt;
+	use js::promise::Promise;
+
 	use crate::fnc::script::fetch::test::create_test_context;
-	use js::{promise::Promise, CatchResultExt};
 
 	#[tokio::test]
 	async fn basic_request_use() {

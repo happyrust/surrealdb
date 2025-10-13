@@ -1,14 +1,13 @@
-use crate::sql::statements::{DefineAccessStatement, DefineUserStatement};
+use anyhow::Result;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 
-use super::{is_allowed, Action, Actor, Error, Level, Resource, Role};
+use super::{Action, Actor, Level, Resource, Role, is_allowed};
 
 /// Specifies the current authentication for the datastore execution context.
 #[revisioned(revision = 1)]
 #[derive(Clone, Default, Debug, Eq, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub struct Auth {
 	actor: Actor,
 }
@@ -59,38 +58,50 @@ impl Auth {
 		matches!(self.level(), Level::Namespace(n) if n.eq(ns))
 	}
 
-	/// Check if the current level is Database, and the namespace and database match
+	/// Check if the current level is Database, and the namespace and database
+	/// match
 	pub fn is_db_check(&self, ns: &str, db: &str) -> bool {
 		matches!(self.level(), Level::Database(n, d) if n.eq(ns) && d.eq(db))
 	}
 
 	/// System Auth helpers
 	///
-	/// These are not stored in the database and are used for internal operations
-	/// Do not use for authentication
+	/// These are not stored in the database and are used for internal
+	/// operations Do not use for authentication
 	pub fn for_root(role: Role) -> Self {
 		Self::new(Actor::new("system_auth".into(), vec![role], Level::Root))
 	}
 
 	pub fn for_ns(role: Role, ns: &str) -> Self {
-		Self::new(Actor::new("system_auth".into(), vec![role], (ns,).into()))
+		Self::new(Actor::new("system_auth".into(), vec![role], Level::Namespace(ns.to_owned())))
 	}
 
 	pub fn for_db(role: Role, ns: &str, db: &str) -> Self {
-		Self::new(Actor::new("system_auth".into(), vec![role], (ns, db).into()))
+		Self::new(Actor::new(
+			"system_auth".into(),
+			vec![role],
+			Level::Database(ns.to_owned(), db.to_owned()),
+		))
 	}
 
 	pub fn for_record(rid: String, ns: &str, db: &str, ac: &str) -> Self {
-		Self::new(Actor::new(rid.to_string(), vec![], (ns, db, ac).into()))
+		Self::new(Actor::new(
+			rid.to_string(),
+			vec![],
+			Level::Record(ns.to_owned(), db.to_owned(), ac.to_owned()),
+		))
 	}
 
 	//
 	// Permission checks
 	//
 
-	/// Checks if the current auth is allowed to perform an action on a given resource
-	pub fn is_allowed(&self, action: Action, res: &Resource) -> Result<(), Error> {
-		is_allowed(&self.actor, &action, res, None)
+	/// Checks if the current auth is allowed to perform an action on a given
+	/// resource
+	pub fn is_allowed(&self, action: Action, res: &Resource) -> Result<()> {
+		is_allowed(&self.actor, &action, res)
+			.map_err(crate::err::Error::from)
+			.map_err(anyhow::Error::new)
 	}
 
 	/// Checks if the current actor has a given role
@@ -111,18 +122,5 @@ impl Auth {
 	/// Checks if the current actor has a Viewer role
 	pub fn has_viewer_role(&self) -> bool {
 		self.actor.has_viewer_role()
-	}
-}
-
-impl std::convert::TryFrom<(&DefineUserStatement, Level)> for Auth {
-	type Error = Error;
-	fn try_from(val: (&DefineUserStatement, Level)) -> Result<Self, Self::Error> {
-		Ok(Self::new((val.0, val.1).try_into()?))
-	}
-}
-
-impl std::convert::From<(&DefineAccessStatement, Level)> for Auth {
-	fn from(val: (&DefineAccessStatement, Level)) -> Self {
-		Self::new((val.0, val.1).into())
 	}
 }

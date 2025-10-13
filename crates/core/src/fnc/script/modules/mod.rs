@@ -15,16 +15,16 @@ pub fn loader() -> ModuleLoader {
 
 macro_rules! impl_module_def {
 	// Delegate to a sub-module.
-	($ctx: expr, $path: literal, $name: literal, ($module: ident::$pkg: ident), $($wrapper: ident)?) => {
+	($ctx: expr_2021, $path: literal, $name: literal, ($module: ident::$pkg: ident), $($wrapper: ident)?) => {
 		{
 			crate::fnc::script::modules::surrealdb::pkg::<$module::$pkg>($ctx, $name)?
 		}
 	};
-	($ctx: expr, $path: literal, $name: literal, $call: ident, Async) => {
+	($ctx: expr_2021, $path: literal, $name: literal, $call: ident, Async) => {
 		{
 			// It is currently impossible to create closures which capture Ctx in a returned future.
 			// So instead we define a normal function for async.
-            async fn f(ctx: js::Ctx<'_>, v: js::function::Rest<crate::sql::value::Value>) -> js::Result<crate::sql::value::Value>{
+            async fn f(ctx: js::Ctx<'_>, v: js::function::Rest<crate::val::Value>) -> js::Result<crate::val::Value>{
                 $call(ctx,if $path == "" { $name } else { concat!($path, "::", $name) }, v.0).await
             }
 			let func = Async(f);
@@ -32,19 +32,19 @@ macro_rules! impl_module_def {
 		}
 	};
 	// Call a (possibly-async) function.
-	($ctx: expr, $path: literal, $name: literal, $call: ident, ) => {
+	($ctx: expr_2021, $path: literal, $name: literal, $call: ident, ) => {
 		{
-			let func = |ctx: js::Ctx<'_>, v: js::function::Rest<crate::sql::value::Value>| $call(ctx,if $path == "" { $name } else { concat!($path, "::", $name) }, v.0);
+			let func = |ctx: js::Ctx<'_>, v: js::function::Rest<crate::val::Value>| $call(ctx,if $path == "" { $name } else { concat!($path, "::", $name) }, v.0);
 			js::Function::new($ctx.clone(),func)?.with_name(stringify!($name))?
 		}
 	};
 	// Return the value of an expression that can be converted to JS.
-	($ctx: expr, $path: literal, $name: literal, ($e: expr), $($wrapper: ident)?) => {
+	($ctx: expr_2021, $path: literal, $name: literal, ($e: expr_2021), $($wrapper: ident)?) => {
 		{
 			$e
 		}
 	};
-	($pkg: ident, $path: literal, $($name: literal => $action: tt $($wrapper: ident)?),*) => {
+	($pkg: ident, $path: literal, $($name: literal => $action: tt $($wrapper: ident)?),* $(,)?) => {
 		impl js::module::ModuleDef for Package {
 			fn declare(decls: &js::module::Declarations) -> js::Result<()> {
 				decls.declare("default")?;

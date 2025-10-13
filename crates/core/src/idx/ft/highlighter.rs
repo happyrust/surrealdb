@@ -1,10 +1,14 @@
-use crate::err::Error;
-use crate::idx::ft::offsets::{Offset, Position};
-use crate::sql::{Array, Idiom, Object, Value};
 use std::collections::btree_map::Entry as BEntry;
 use std::collections::hash_map::Entry as HEntry;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use anyhow::{Result, ensure};
+
+use crate::err::Error;
+use crate::expr::Idiom;
+use crate::idx::ft::Position;
+use crate::idx::ft::offset::Offset;
+use crate::val::{Array, Object, Value};
 
 pub(crate) struct HighlightParams {
 	pub(crate) prefix: Value,
@@ -46,7 +50,7 @@ impl Highlighter {
 
 	fn extract(val: Value, vals: &mut Vec<String>) {
 		match val {
-			Value::Strand(s) => vals.push(s.0),
+			Value::String(s) => vals.push(s),
 			Value::Number(n) => vals.push(n.to_string()),
 			Value::Bool(b) => vals.push(b.to_string()),
 			Value::Array(a) => {
@@ -65,9 +69,9 @@ impl Highlighter {
 }
 
 impl TryFrom<Highlighter> for Value {
-	type Error = Error;
+	type Error = anyhow::Error;
 
-	fn try_from(hl: Highlighter) -> Result<Self, Error> {
+	fn try_from(hl: Highlighter) -> Result<Self> {
 		if hl.fields.is_empty() {
 			return Ok(Self::None);
 		}
@@ -83,13 +87,12 @@ impl TryFrom<Highlighter> for Value {
 				let mut d = 0;
 
 				// We use a closure to append the prefix and the suffix
-				let mut append = |s: u32, ix: &Vec<char>| -> Result<(), Error> {
+				let mut append = |s: u32, ix: &Vec<char>| -> Result<()> {
 					let p = (s as usize) + d;
-					if p > l {
-						return Err(Error::HighlightError(format!(
-							"position overflow: {s} - len: {l}"
-						)));
-					}
+					ensure!(
+						p <= l,
+						Error::HighlightError(format!("position overflow: {s} - len: {l}"))
+					);
 					v.splice(p..p, ix.clone());
 					let xl = ix.len();
 					d += xl;
@@ -157,12 +160,10 @@ impl Offseter {
 	}
 }
 
-impl TryFrom<Offseter> for Value {
-	type Error = Error;
-
-	fn try_from(or: Offseter) -> Result<Self, Error> {
+impl From<Offseter> for Value {
+	fn from(or: Offseter) -> Self {
 		if or.offsets.is_empty() {
-			return Ok(Self::None);
+			return Self::None;
 		}
 		let mut res = BTreeMap::default();
 		for (idx, offsets) in or.offsets {
@@ -173,9 +174,10 @@ impl TryFrom<Offseter> for Value {
 			}
 			res.insert(idx.to_string(), Value::Array(Array::from(r)));
 		}
-		Ok(match res.len() {
-			0 => Value::None,
-			_ => Value::from(Object::from(res)),
-		})
+		if res.is_empty() {
+			Value::None
+		} else {
+			Value::from(Object::from(res))
+		}
 	}
 }

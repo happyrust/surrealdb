@@ -1,69 +1,15 @@
-use crate::sql::{escape::EscapeIdent, Id, Thing};
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::ops::Bound;
 
-pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Mock";
+use crate::fmt::EscapeIdent;
+use crate::val::range::TypedRange;
 
-#[non_exhaustive]
-pub struct IntoIter {
-	model: Mock,
-	index: u64,
-}
-
-impl Iterator for IntoIter {
-	type Item = Thing;
-	fn next(&mut self) -> Option<Thing> {
-		match &self.model {
-			Mock::Count(tb, c) => {
-				if self.index < *c {
-					self.index += 1;
-					Some(Thing {
-						tb: tb.to_string(),
-						id: Id::rand(),
-					})
-				} else {
-					None
-				}
-			}
-			Mock::Range(tb, b, e) => {
-				if self.index == 0 {
-					self.index = *b - 1;
-				}
-				if self.index < *e {
-					self.index += 1;
-					Some(Thing {
-						tb: tb.to_string(),
-						id: Id::from(self.index),
-					})
-				} else {
-					None
-				}
-			}
-		}
-	}
-}
-
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
-#[serde(rename = "$surrealdb::private::sql::Mock")]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
 pub enum Mock {
-	Count(String, u64),
-	Range(String, u64, u64),
+	Count(String, i64),
+	Range(String, TypedRange<i64>),
 	// Add new variants here
-}
-
-impl IntoIterator for Mock {
-	type Item = Thing;
-	type IntoIter = IntoIter;
-	fn into_iter(self) -> Self::IntoIter {
-		IntoIter {
-			model: self,
-			index: 0,
-		}
-	}
 }
 
 impl fmt::Display for Mock {
@@ -72,9 +18,37 @@ impl fmt::Display for Mock {
 			Mock::Count(tb, c) => {
 				write!(f, "|{}:{}|", EscapeIdent(tb), c)
 			}
-			Mock::Range(tb, b, e) => {
-				write!(f, "|{}:{}..{}|", EscapeIdent(tb), b, e)
+			Mock::Range(tb, r) => {
+				write!(f, "|{}:", EscapeIdent(tb))?;
+				match r.start {
+					Bound::Included(x) => write!(f, "{x}..")?,
+					Bound::Excluded(x) => write!(f, "{x}>..")?,
+					Bound::Unbounded => write!(f, "..")?,
+				}
+				match r.end {
+					Bound::Included(x) => write!(f, "={x}|"),
+					Bound::Excluded(x) => write!(f, "{x}|"),
+					Bound::Unbounded => write!(f, "|"),
+				}
 			}
+		}
+	}
+}
+
+impl From<Mock> for crate::expr::Mock {
+	fn from(v: Mock) -> Self {
+		match v {
+			Mock::Count(tb, c) => crate::expr::Mock::Count(tb, c),
+			Mock::Range(tb, r) => crate::expr::Mock::Range(tb, r),
+		}
+	}
+}
+
+impl From<crate::expr::Mock> for Mock {
+	fn from(v: crate::expr::Mock) -> Self {
+		match v {
+			crate::expr::Mock::Count(tb, c) => Mock::Count(tb, c),
+			crate::expr::Mock::Range(tb, r) => Mock::Range(tb, r),
 		}
 	}
 }

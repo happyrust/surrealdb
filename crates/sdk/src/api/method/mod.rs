@@ -1,27 +1,16 @@
 //! Methods to use when interacting with a SurrealDB instance
-use self::query::ValidQuery;
-use crate::api::opt;
-use crate::api::opt::auth;
-use crate::api::opt::auth::Credentials;
-use crate::api::opt::auth::Jwt;
-use crate::api::opt::IntoEndpoint;
-use crate::api::Connect;
-use crate::api::Connection;
-use crate::api::OnceLockExt;
-use crate::api::Surreal;
-use crate::opt::IntoExportDestination;
-use crate::opt::WaitFor;
-use serde::Serialize;
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::Duration;
-use surrealdb_core::sql::to_value as to_core_value;
-use surrealdb_core::sql::Value as CoreValue;
-use surrealdb_core::syn;
+use std::sync::{Arc, OnceLock};
+
+use surrealdb_types::{self, SurrealValue, Value, Variables};
+
+use crate::api::opt::auth::{Credentials, Jwt};
+use crate::api::opt::{IntoEndpoint, auth};
+use crate::api::{Connect, Connection, OnceLockExt, Surreal};
+use crate::opt::{IntoExportDestination, WaitFor};
 
 pub(crate) mod live;
 pub(crate) mod query;
@@ -46,6 +35,7 @@ mod select;
 mod set;
 mod signin;
 mod signup;
+mod transaction;
 mod unset;
 mod update;
 mod upsert;
@@ -57,17 +47,8 @@ mod version;
 mod tests;
 
 pub use authenticate::Authenticate;
-/// Not supported yet
-#[doc(hidden)]
 pub use begin::Begin;
-/// Not supported yet
-#[doc(hidden)]
-pub use begin::Transaction;
-/// Not supported yet
-#[doc(hidden)]
 pub use cancel::Cancel;
-/// Not supported yet
-#[doc(hidden)]
 pub use commit::Commit;
 pub use content::Content;
 pub use create::Create;
@@ -78,19 +59,16 @@ pub use health::Health;
 pub use import::Import;
 pub use insert::Insert;
 pub use invalidate::Invalidate;
-pub use live::Stream;
 pub use merge::Merge;
 pub use patch::Patch;
-pub use query::Query;
-pub use query::QueryStream;
-pub use run::IntoFn;
-pub use run::Run;
+pub use query::{Query, QueryStream};
+pub use run::{IntoFn, Run};
 pub use select::Select;
-use serde_content::Serializer;
 pub use set::Set;
 pub use signin::Signin;
 pub use signup::Signup;
 use tokio::sync::watch;
+pub use transaction::Transaction;
 pub use unset::Unset;
 pub use update::Update;
 pub use upsert::Upsert;
@@ -98,19 +76,11 @@ pub use use_db::UseDb;
 pub use use_ns::UseNs;
 pub use version::Version;
 
-use super::opt::CreateResource;
-use super::opt::IntoResource;
+use super::opt::{CreateResource, IntoResource};
 
-/// A alias for an often used type of future returned by async methods in this library.
+/// A alias for an often used type of future returned by async methods in this
+/// library.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
-
-/// Query statistics
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub struct Stats {
-	/// The time taken to execute the query
-	pub execution_time: Option<Duration>,
-}
 
 /// Machine learning model marker type for import and export types
 pub struct Model;
@@ -120,6 +90,9 @@ pub struct ExportConfig;
 
 /// Live query marker type
 pub struct Live;
+
+/// Relation marker type
+pub struct Relation;
 
 /// Responses returned with statistics
 #[derive(Debug)]
@@ -131,10 +104,11 @@ where
 {
 	/// Initialises a new unconnected instance of the client
 	///
-	/// This makes it easy to create a static singleton of the client. The static singleton
-	/// pattern in the example below ensures that a single database instance is available
-	/// across very large or complicated applications. With the singleton, only one connection
-	/// to the database is instantiated, and the database connection does not have to be shared
+	/// This makes it easy to create a static singleton of the client. The
+	/// static singleton pattern in the example below ensures that a single
+	/// database instance is available across very large or complicated
+	/// applications. With the singleton, only one connection to the database
+	/// is instantiated, and the database connection does not have to be shared
 	/// across components or controllers.
 	///
 	/// # Examples
@@ -253,10 +227,15 @@ where
 	pub fn new<P>(address: impl IntoEndpoint<P, Client = C>) -> Connect<C, Self> {
 		Connect {
 			surreal: Surreal::init(),
-			#[expect(deprecated)]
 			address: address.into_endpoint(),
 			capacity: 0,
 			response_type: PhantomData,
+		}
+	}
+
+	pub fn transaction(&self) -> Begin<C> {
+		Begin {
+			client: self.clone(),
 		}
 	}
 
@@ -272,7 +251,7 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn use_ns(&self, ns: impl Into<String>) -> UseNs<C> {
+	pub fn use_ns(&'_ self, ns: impl Into<String>) -> UseNs<'_, C> {
 		UseNs {
 			client: Cow::Borrowed(self),
 			ns: ns.into(),
@@ -291,7 +270,7 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn use_db(&self, db: impl Into<String>) -> UseDb<C> {
+	pub fn use_db(&'_ self, db: impl Into<String>) -> UseDb<'_, C> {
 		UseDb {
 			client: Cow::Borrowed(self),
 			ns: None,
@@ -331,11 +310,11 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn set(&self, key: impl Into<String>, value: impl Serialize + 'static) -> Set<C> {
+	pub fn set(&self, key: impl Into<String>, value: impl SurrealValue) -> Set<'_, C> {
 		Set {
 			client: Cow::Borrowed(self),
 			key: key.into(),
-			value: to_core_value(value).map_err(Into::into),
+			value: value.into_value(),
 		}
 	}
 
@@ -371,7 +350,7 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn unset(&self, key: impl Into<String>) -> Unset<C> {
+	pub fn unset(&'_ self, key: impl Into<String>) -> Unset<'_, C> {
 		Unset {
 			client: Cow::Borrowed(self),
 			key: key.into(),
@@ -429,10 +408,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn signup<R>(&self, credentials: impl Credentials<auth::Signup, R>) -> Signup<C, R> {
+	pub fn signup<R>(&'_ self, credentials: impl Credentials<auth::Signup, R>) -> Signup<'_, C, R> {
 		Signup {
 			client: Cow::Borrowed(self),
-			credentials: Serializer::new().serialize(credentials),
+			credentials: credentials.into_value(),
 			response_type: PhantomData,
 		}
 	}
@@ -546,10 +525,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn signin<R>(&self, credentials: impl Credentials<auth::Signin, R>) -> Signin<C, R> {
+	pub fn signin<R>(&'_ self, credentials: impl Credentials<auth::Signin, R>) -> Signin<'_, C, R> {
 		Signin {
 			client: Cow::Borrowed(self),
-			credentials: Serializer::new().serialize(credentials),
+			credentials: credentials.into_value(),
 			response_type: PhantomData,
 		}
 	}
@@ -566,7 +545,7 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn invalidate(&self) -> Invalidate<C> {
+	pub fn invalidate(&'_ self) -> Invalidate<'_, C> {
 		Invalidate {
 			client: Cow::Borrowed(self),
 		}
@@ -585,7 +564,7 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn authenticate(&self, token: impl Into<Jwt>) -> Authenticate<C> {
+	pub fn authenticate(&'_ self, token: impl Into<Jwt>) -> Authenticate<'_, C> {
 		Authenticate {
 			client: Cow::Borrowed(self),
 			token: token.into(),
@@ -641,36 +620,13 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn query(&self, query: impl opt::IntoQuery) -> Query<C> {
-		let result = match query.as_str() {
-			Some(surql) => self.inner.router.extract().and_then(|router| {
-				let capabilities = &router.config.capabilities;
-				#[expect(deprecated)]
-				syn::parse_with_capabilities(surql, capabilities)
-					.map_err(Into::into)
-					.and_then(opt::IntoQuery::into_query)
-			}),
-			#[expect(deprecated)]
-			None => query.into_query(),
-		};
-		let inner = match result {
-			Ok(query) => Ok(ValidQuery::Normal {
-				query,
-				register_live_queries: true,
-				bindings: Default::default(),
-			}),
-			Err(crate::Error::Api(crate::api::err::Error::RawQuery(query))) => {
-				Ok(ValidQuery::Raw {
-					query,
-					bindings: Default::default(),
-				})
-			}
-			Err(error) => Err(error),
-		};
-
+	#[must_use = "queries do nothing unless you `.await` or poll them"]
+	pub fn query<'client>(&'client self, query: impl Into<Cow<'client, str>>) -> Query<'client, C> {
 		Query {
-			inner,
+			txn: None,
 			client: Cow::Borrowed(self),
+			query: query.into(),
+			variables: Ok(Variables::new()),
 		}
 	}
 
@@ -713,10 +669,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn select<O>(&self, resource: impl IntoResource<O>) -> Select<C, O> {
+	pub fn select<O>(&'_ self, resource: impl IntoResource<O>) -> Select<'_, C, O> {
 		Select {
+			txn: None,
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 			query_type: PhantomData,
@@ -769,10 +725,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn create<R>(&self, resource: impl CreateResource<R>) -> Create<C, R> {
+	pub fn create<R>(&'_ self, resource: impl CreateResource<R>) -> Create<'_, C, R> {
 		Create {
+			txn: None,
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 		}
@@ -915,10 +871,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn insert<O>(&self, resource: impl IntoResource<O>) -> Insert<C, O> {
+	pub fn insert<O>(&self, resource: impl IntoResource<O>) -> Insert<'_, C, O> {
 		Insert {
+			txn: None,
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 		}
@@ -1074,10 +1030,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn upsert<O>(&self, resource: impl IntoResource<O>) -> Upsert<C, O> {
+	pub fn upsert<O>(&'_ self, resource: impl IntoResource<O>) -> Upsert<'_, C, O> {
 		Upsert {
+			txn: None,
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 		}
@@ -1233,10 +1189,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn update<O>(&self, resource: impl IntoResource<O>) -> Update<C, O> {
+	pub fn update<O>(&'_ self, resource: impl IntoResource<O>) -> Update<'_, C, O> {
 		Update {
+			txn: None,
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 		}
@@ -1266,10 +1222,10 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn delete<O>(&self, resource: impl IntoResource<O>) -> Delete<C, O> {
+	pub fn delete<O>(&'_ self, resource: impl IntoResource<O>) -> Delete<'_, C, O> {
 		Delete {
+			txn: None,
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 		}
@@ -1287,40 +1243,9 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn version(&self) -> Version<C> {
+	pub fn version(&'_ self) -> Version<'_, C> {
 		Version {
 			client: Cow::Borrowed(self),
-		}
-	}
-
-	/// Runs a function
-	///
-	/// # Examples
-	///
-	/// ```no_run
-	/// # #[tokio::main]
-	/// # async fn main() -> surrealdb::Result<()> {
-	/// # let db = surrealdb::engine::any::connect("mem://").await?;
-	/// // Specify no args by not calling `.args()`
-	/// let foo = db.run("fn::foo").await?; // fn::foo()
-	/// // A single value will be turned into one argument
-	/// let bar = db.run("fn::bar").args(42).await?; // fn::bar(42)
-	/// // Arrays are treated as single arguments
-	/// let count = db.run("count").args(vec![1,2,3]).await?;
-	/// // Specify multiple args using a tuple
-	/// let two = db.run("math::log").args((100, 10)).await?; // math::log(100, 10)
-	///
-	/// # Ok(())
-	/// # }
-	/// ```
-	///
-	pub fn run<R>(&self, function: impl IntoFn) -> Run<C, R> {
-		Run {
-			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
-			function: function.into_fn(),
-			args: Ok(serde_content::Value::Tuple(vec![])),
-			response_type: PhantomData,
 		}
 	}
 
@@ -1336,14 +1261,14 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn health(&self) -> Health<C> {
+	pub fn health(&'_ self) -> Health<'_, C> {
 		Health {
 			client: Cow::Borrowed(self),
 		}
 	}
 
 	/// Wait for the selected event to happen before proceeding
-	pub async fn wait_for(&self, event: WaitFor) {
+	pub async fn wait_for(&'_ self, event: WaitFor) {
 		let mut rx = self.inner.waiter.0.subscribe();
 		rx.wait_for(|current| match current {
 			// The connection hasn't been initialised yet.
@@ -1361,7 +1286,8 @@ where
 	///
 	/// # Support
 	///
-	/// Currently only supported by HTTP and the local engines. *Not* supported on WebAssembly.
+	/// Currently only supported by HTTP and the local engines. *Not* supported
+	/// on WebAssembly.
 	///
 	/// # Examples
 	///
@@ -1391,10 +1317,9 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn export<R>(&self, target: impl IntoExportDestination<R>) -> Export<C, R> {
+	pub fn export<R>(&'_ self, target: impl IntoExportDestination<R>) -> Export<'_, C, R> {
 		Export {
 			client: Cow::Borrowed(self),
-			#[expect(deprecated)]
 			target: target.into_export_destination(),
 			ml_config: None,
 			db_config: None,
@@ -1407,7 +1332,8 @@ where
 	///
 	/// # Support
 	///
-	/// Currently only supported by HTTP and the local engines. *Not* supported on WebAssembly.
+	/// Currently only supported by HTTP and the local engines. *Not* supported
+	/// on WebAssembly.
 	///
 	/// # Examples
 	///
@@ -1422,7 +1348,7 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn import<P>(&self, file: P) -> Import<C>
+	pub fn import<P>(&'_ self, file: P) -> Import<'_, C>
 	where
 		P: AsRef<Path>,
 	{
@@ -1435,10 +1361,10 @@ where
 	}
 }
 
-fn validate_data(data: &CoreValue, error_message: &str) -> crate::Result<()> {
+fn validate_data(data: &Value, error_message: &str) -> crate::Result<()> {
 	match data {
-		CoreValue::Object(_) => Ok(()),
-		CoreValue::Array(v) if v.iter().all(CoreValue::is_object) => Ok(()),
-		_ => Err(crate::api::err::Error::InvalidParams(error_message.to_owned()).into()),
+		Value::Object(_) => Ok(()),
+		Value::Array(v) if v.iter().all(Value::is_object) => Ok(()),
+		_ => Err(crate::api::err::Error::InvalidParams(error_message.to_owned())),
 	}
 }

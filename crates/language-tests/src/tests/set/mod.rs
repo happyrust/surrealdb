@@ -1,23 +1,20 @@
-use anyhow::{anyhow, Context, Result};
-use std::{
-	borrow::Cow,
-	collections::{hash_map::Values, HashMap},
-	fmt::Write,
-	hash::Hash,
-	io::{self, IsTerminal as _},
-	mem,
-	ops::Index,
-	path::{self, Path},
-	sync::Arc,
-};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::collections::hash_map::Values;
+use std::fmt::Write;
+use std::hash::Hash;
+use std::io::{self, IsTerminal as _};
+use std::mem;
+use std::ops::Index;
+use std::path::{self, Path};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow};
 use tokio::fs;
 
-use crate::{
-	cli::ColorMode,
-	format::{ansi, IndentFormatter},
-};
-
 use super::{ResolvedImport, TestCase};
+use crate::cli::ColorMode;
+use crate::format::{IndentFormatter, ansi};
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub struct TestId(usize);
@@ -98,7 +95,7 @@ impl TestSet {
 		let map = self
 			.map
 			.iter()
-			.filter(|x| f(x.0.as_str(), &self.all[x.1 .0]))
+			.filter(|x| f(x.0.as_str(), &self.all[x.1.0]))
 			.map(|(a, b)| (a.clone(), *b))
 			.collect();
 
@@ -182,10 +179,10 @@ impl TestSet {
 					errors.push(TestLoadError {
 						path: all[test_index].path.clone(),
 						error: anyhow::anyhow!(
-								"Importing test `{}` for test `{}` which contains imports itself is not supported.",
-								import.path,
-								all[test_index].path
-							),
+							"Importing test `{}` for test `{}` which contains imports itself is not supported.",
+							import.path,
+							all[test_index].path
+						),
 					});
 				}
 			}
@@ -259,14 +256,14 @@ impl TestSet {
 		Ok(())
 	}
 
-	pub fn iter(&self) -> Iter {
+	pub fn iter(&self) -> Iter<'_> {
 		Iter {
 			map_iter: self.map.values(),
 			slice: self.all.as_slice(),
 		}
 	}
 
-	pub fn iter_ids(&self) -> IterIds {
+	pub fn iter_ids(&self) -> IterIds<'_> {
 		IterIds {
 			map_iter: self.map.values(),
 			slice: self.all.as_slice(),

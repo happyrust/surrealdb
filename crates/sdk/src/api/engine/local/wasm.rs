@@ -1,38 +1,31 @@
-use crate::api::conn::Connection;
-use crate::api::conn::Route;
-use crate::api::conn::Router;
-use crate::api::engine::local::Db;
-use crate::api::method::BoxFuture;
-use crate::api::opt::Endpoint;
-use crate::api::ExtraFeatures;
-use crate::api::Result;
-use crate::api::Surreal;
-use crate::dbs::Session;
-use crate::engine::tasks;
-use crate::iam::Level;
-use crate::kvs::Datastore;
-use crate::opt::auth::Root;
-use crate::opt::WaitFor;
-use crate::options::EngineOptions;
-use crate::{Action, Notification};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::task::Poll;
+
 use async_channel::{Receiver, Sender};
 use futures::stream::poll_fn;
-use futures::FutureExt;
-use futures::StreamExt;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicI64;
-use std::sync::Arc;
-use std::task::Poll;
-use tokio::sync::watch;
-use tokio::sync::RwLock;
+use futures::{FutureExt, StreamExt};
+use surrealdb_core::dbs::Session;
+use surrealdb_core::iam::Level;
+use surrealdb_core::kvs::Datastore;
+use surrealdb_core::options::EngineOptions;
+use surrealdb_types::Variables;
+use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use wasm_bindgen_futures::spawn_local;
 
-impl crate::api::Connection for Db {}
+use crate::api::conn::{Route, Router};
+use crate::api::engine::local::Db;
+use crate::api::method::BoxFuture;
+use crate::api::opt::Endpoint;
+use crate::api::{ExtraFeatures, Result, Surreal, conn};
+use crate::engine::tasks;
+use crate::opt::WaitFor;
+use crate::opt::auth::Root;
 
-impl Connection for Db {
+impl crate::api::Connection for Db {}
+impl conn::Sealed for Db {
 	fn connect(address: Endpoint, capacity: usize) -> BoxFuture<'static, Result<Surreal<Self>>> {
 		Box::pin(async move {
 			let (route_tx, route_rx) = match capacity {
@@ -70,8 +63,8 @@ pub(crate) async fn run_router(
 ) {
 	let configured_root = match address.config.auth {
 		Level::Root => Some(Root {
-			username: &address.config.username,
-			password: &address.config.password,
+			username: address.config.username.clone(),
+			password: address.config.password.clone(),
 		}),
 		_ => None,
 	};
@@ -83,8 +76,9 @@ pub(crate) async fn run_router(
 				return;
 			}
 			// If a root user is specified, setup the initial datastore credentials
-			if let Some(root) = configured_root {
-				if let Err(error) = kvs.initialise_credentials(root.username, root.password).await {
+			if let Some(ref root) = configured_root {
+				if let Err(error) = kvs.initialise_credentials(&root.username, &root.password).await
+				{
 					conn_tx.send(Err(error.into())).await.ok();
 					return;
 				}
@@ -110,7 +104,7 @@ pub(crate) async fn run_router(
 		.with_capabilities(address.config.capabilities);
 
 	let kvs = Arc::new(kvs);
-	let vars = Arc::new(RwLock::new(BTreeMap::new()));
+	let vars = Arc::new(RwLock::new(Variables::new()));
 	let live_queries = Arc::new(RwLock::new(HashMap::new()));
 	let session = Arc::new(RwLock::new(Session::default().with_rt(true)));
 
@@ -159,7 +153,7 @@ pub(crate) async fn run_router(
 						route.response.send(Ok(value)).await.ok();
 					}
 					Err(error) => {
-						route.response.send(Err(error)).await.ok();
+						route.response.send(Err(error.into())).await.ok();
 					}
 				}
 			}
@@ -172,14 +166,7 @@ pub(crate) async fn run_router(
 
 				let id = notification.id;
 				if let Some(sender) = live_queries.read().await.get(&id) {
-
-					let notification = Notification {
-						query_id: notification.id.0,
-						action: Action::from_core(notification.action),
-						data: notification.result,
-					};
-
-					if sender.send(notification).await.is_err() {
+					if sender.send(Ok(notification)).await.is_err() {
 						live_queries.write().await.remove(&id);
 						if let Err(error) =
 							super::kill_live_query(&kvs, *id, &*session.read().await, vars.read().await.clone()).await

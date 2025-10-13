@@ -1,22 +1,10 @@
-use crate::sql::statements::info::InfoStructure;
-use crate::sql::value::Value;
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::ops::Deref;
 
-#[revisioned(revision = 1)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
+use crate::sql::Expr;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[non_exhaustive]
-pub struct Cond(pub Value);
-
-impl Deref for Cond {
-	type Target = Value;
-	fn deref(&self) -> &Self::Target {
-		&self.0
-	}
-}
+pub(crate) struct Cond(pub(crate) Expr);
 
 impl fmt::Display for Cond {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -24,8 +12,14 @@ impl fmt::Display for Cond {
 	}
 }
 
-impl InfoStructure for Cond {
-	fn structure(self) -> Value {
-		self.0.structure()
+impl From<Cond> for crate::expr::Cond {
+	fn from(v: Cond) -> Self {
+		Self(v.0.into())
+	}
+}
+
+impl From<crate::expr::Cond> for Cond {
+	fn from(v: crate::expr::Cond) -> Self {
+		Self(v.0.into())
 	}
 }

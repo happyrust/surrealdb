@@ -1,10 +1,4 @@
-use crate::cli::abstraction::auth::{CredentialsBuilder, CredentialsLevel};
-use crate::cli::abstraction::{
-	AuthArguments, DatabaseConnectionArguments, LevelSelectionArguments,
-};
-use crate::cnf::PKG_VERSION;
-use crate::dbs::DbsCapabilities;
-use crate::err::Error;
+use anyhow::{Result, anyhow};
 use clap::Args;
 use futures::StreamExt;
 use rustyline::error::ReadlineError;
@@ -12,12 +6,20 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Completer, Editor, Helper, Highlighter, Hinter};
 use serde::Serialize;
 use serde_json::ser::PrettyFormatter;
-use surrealdb::dbs::Capabilities as CoreCapabilities;
-use surrealdb::engine::any::{connect, IntoEndpoint};
-use surrealdb::method::{Stats, WithStats};
+use surrealdb::engine::any::{self, connect};
+use surrealdb::method::WithStats;
 use surrealdb::opt::Config;
-use surrealdb::sql::{Param, Statement, Uuid as CoreUuid, Value as CoreValue};
-use surrealdb::{Notification, Response, Value};
+use surrealdb::types::{SurrealValue, ToSql, Value, object};
+use surrealdb::{IndexedResults, Notification};
+use surrealdb_core::dbs::Capabilities as CoreCapabilities;
+use surrealdb_core::rpc::DbResultStats;
+
+use crate::cli::abstraction::auth::{CredentialsBuilder, CredentialsLevel};
+use crate::cli::abstraction::{
+	AuthArguments, DatabaseConnectionArguments, LevelSelectionArguments,
+};
+use crate::cnf::PKG_VERSION;
+use crate::dbs::DbsCapabilities;
 
 #[derive(Args, Debug)]
 pub struct SqlCommandArguments {
@@ -66,22 +68,23 @@ pub async fn init(
 		capabilities,
 		..
 	}: SqlCommandArguments,
-) -> Result<(), Error> {
+) -> Result<()> {
 	// Capabilities configuration for local engines
 	let capabilities = capabilities.into_cli_capabilities();
 	let config = Config::new().capabilities(capabilities.clone().into());
-	// If username and password are specified, and we are connecting to a remote SurrealDB server, then we need to authenticate.
-	// If we are connecting directly to a datastore (i.e. surrealkv://local.skv or tikv://...), then we don't need to authenticate because we use an embedded (local) SurrealDB instance with auth disabled.
-	let client = if username.is_some()
-		&& password.is_some()
-		&& !endpoint.clone().into_endpoint()?.parse_kind()?.is_local()
-	{
+	let is_local = any::__into_endpoint(&endpoint)?.parse_kind()?.is_local();
+	// If username and password are specified, and we are connecting to a remote
+	// SurrealDB server, then we need to authenticate. If we are connecting
+	// directly to a datastore (i.e. surrealkv://local.skv or tikv://...), then we
+	// don't need to authenticate because we use an embedded (local) SurrealDB
+	// instance with auth disabled.
+	let client = if username.is_some() && password.is_some() && !is_local {
 		debug!("Connecting to the database engine with authentication");
 		let creds = CredentialsBuilder::default()
-			.with_username(username.as_deref())
-			.with_password(password.as_deref())
-			.with_namespace(namespace.as_deref())
-			.with_database(database.as_deref());
+			.with_username(username.clone())
+			.with_password(password.clone())
+			.with_namespace(namespace.clone())
+			.with_database(database.clone());
 
 		let client = connect(endpoint).await?;
 
@@ -93,7 +96,7 @@ pub async fn init(
 		};
 
 		client
-	} else if token.is_some() && !endpoint.clone().into_endpoint()?.parse_kind()?.is_local() {
+	} else if token.is_some() && !is_local {
 		let client = connect(endpoint).await?;
 		client.authenticate(token.unwrap()).await?;
 
@@ -134,8 +137,11 @@ pub async fn init(
 	if !hide_welcome {
 		let hints = [
 			(true, "Different statements within a query should be separated by a (;) semicolon."),
-			(!multi, "To create a multi-line query, end your lines with a (\\) backslash, and press enter."),
-			(true, "To exit, send a SIGTERM or press CTRL+C")
+			(
+				!multi,
+				"To create a multi-line query, end your lines with a (\\) backslash, and press enter.",
+			),
+			(true, "To exit, send a SIGTERM or press CTRL+C"),
 		]
 		.iter()
 		.filter(|(show, _)| *show)
@@ -191,41 +197,25 @@ pub async fn init(
 		// Complete the request
 		match surrealdb_core::syn::parse_with_capabilities(&line, &capabilities) {
 			Ok(mut query) => {
-				let mut namespace = None;
-				let mut database = None;
-				let mut vars = Vec::new();
-				let init_length = query.len();
-				// Capture `use` and `set/let` statements from the query
-				for statement in query.iter() {
-					match statement {
-						Statement::Use(stmt) => {
-							if let Some(ns) = &stmt.ns {
-								namespace = Some(ns.clone());
-							}
-							if let Some(db) = &stmt.db {
-								database = Some(db.clone());
-							}
-						}
-						Statement::Set(stmt) => vars.push(stmt.name.clone()),
-						_ => {}
-					}
-				}
+				let init_length = query.num_statements();
+
+				let namespace = query.get_used_namespace();
+				let database = query.get_used_database();
+				let vars = query.get_let_statements();
 
 				for var in &vars {
-					query.push(Statement::Value(CoreValue::Param(Param::from(var.as_str()))))
+					query.add_param(var.clone());
 				}
 
 				// Extract the namespace and database from the current prompt
 				let (prompt_ns, prompt_db) = split_prompt(&prompt);
 				// The namespace should be set before the database can be set
 				if namespace.is_none() && prompt_ns.is_empty() && database.is_some() {
-					eprintln!(
-						"There was a problem with the database: Specify a namespace to use\n"
-					);
+					eprintln!("Specify a namespace to use\n");
 					continue;
 				}
 				// Run the query provided
-				let mut result = client.query(query).with_stats().await;
+				let mut result = client.query(query.to_string()).with_stats().await;
 
 				if let Ok(WithStats(res)) = &mut result {
 					for (i, n) in vars.into_iter().enumerate() {
@@ -244,9 +234,11 @@ pub async fn init(
 
 				// Process the last `use` statements, if any
 				if namespace.is_some() || database.is_some() {
-					// Use the namespace provided in the query if any, otherwise use the one in the prompt
+					// Use the namespace provided in the query if any, otherwise use the one in the
+					// prompt
 					let namespace = namespace.as_deref().unwrap_or(prompt_ns);
-					// Use the database provided in the query if any, otherwise use the one in the prompt
+					// Use the database provided in the query if any, otherwise use the one in the
+					// prompt
 					let database = database.as_deref().unwrap_or(prompt_db);
 					// If the database is empty we should only use the namespace
 					if database.is_empty() {
@@ -274,22 +266,19 @@ pub async fn init(
 fn process(
 	pretty: bool,
 	json: bool,
-	res: surrealdb::Result<WithStats<Response>>,
-) -> Result<String, Error> {
+	res: surrealdb::Result<WithStats<IndexedResults>>,
+) -> Result<String> {
 	// Check query response for an error
 	let mut response = res?;
 	// Get the number of statements the query contained
 	let num_statements = response.num_statements();
 	// Prepare a single value from the query response
-	let mut vec = Vec::<(Stats, Value)>::with_capacity(num_statements);
+	let mut vec = Vec::<(DbResultStats, Value)>::with_capacity(num_statements);
 	for index in 0..num_statements {
-		let (stats, result) = response
-			.take(index)
-			.ok_or_else(|| {
-				format!("Expected some result for a query with index {index}, but found none")
-			})
-			.map_err(Error::Other)?;
-		let output = result.unwrap_or_else(|e| Value::from_inner(CoreValue::from(e.to_string())));
+		let (stats, result) = response.take(index).ok_or_else(|| {
+			anyhow!("Expected some result for a query with index {index}, but found none")
+		})?;
+		let output = result.unwrap_or_else(|e| Value::String(e.to_string()));
 		vec.push((stats, output));
 	}
 
@@ -301,35 +290,42 @@ fn process(
 				return;
 			}
 		};
-		while let Some(Notification {
-			query_id,
-			action,
-			data,
-			..
-		}) = stream.next().await
-		{
+		while let Some(result) = stream.next().await {
+			let Notification {
+				query_id,
+				action,
+				data,
+				..
+			} = match result {
+				Ok(notification) => notification,
+				Err(error) => {
+					print(Err(error.into()));
+					continue;
+				}
+			};
 			let message = match (json, pretty) {
 				// Don't prettify the SurrealQL response
 				(false, false) => {
-					let value = CoreValue::from(map! {
-						String::from("id") => CoreValue::from(CoreUuid::from(query_id)),
-						String::from("action") => format!("{action:?}").to_ascii_uppercase().into(),
-						String::from("result") => data.into_inner(),
+					let value = Value::Object(object! {
+						"id": Value::Uuid(query_id),
+						"action": action.into_value(),
+						"result": data,
 					});
-					value.to_string()
+					value.to_sql()
 				}
 				// Yes prettify the SurrealQL response
 				(false, true) => format!(
-					"-- Notification (action: {action:?}, live query ID: {query_id})\n{data:#}"
+					"-- Notification (action: {action:?}, live query ID: {query_id})\n{}",
+					data.to_sql()
 				),
 				// Don't pretty print the JSON response
 				(true, false) => {
-					let value = CoreValue::from(map! {
-						String::from("id") => CoreValue::from(CoreUuid::from(query_id)),
-						String::from("action") => format!("{action:?}").to_ascii_uppercase().into(),
-						String::from("result") => data.into_inner(),
+					let value = Value::Object(object! {
+						"id": Value::Uuid(query_id),
+						"action": action.into_value(),
+						"result": data,
 					});
-					value.into_json().to_string()
+					value.into_json_value().to_string()
 				}
 				// Yes prettify the JSON response
 				(true, true) => {
@@ -338,9 +334,11 @@ fn process(
 						&mut buf,
 						PrettyFormatter::with_indent(b"\t"),
 					);
-					data.into_inner().into_json().serialize(&mut serializer).unwrap();
+					data.into_json_value().serialize(&mut serializer).unwrap();
 					let output = String::from_utf8(buf).unwrap();
-					format!("-- Notification (action: {action:?}, live query ID: {query_id})\n{output:#}")
+					format!(
+						"-- Notification (action: {action:?}, live query ID: {query_id})\n{output:#}"
+					)
 				}
 			};
 			print(Ok(format!("\n{message}")));
@@ -350,10 +348,7 @@ fn process(
 	// Check if we should emit JSON and/or prettify
 	Ok(match (json, pretty) {
 		// Don't prettify the SurrealQL response
-		(false, false) => {
-			CoreValue::from(vec.into_iter().map(|(_, x)| x.into_inner()).collect::<Vec<_>>())
-				.to_string()
-		}
+		(false, false) => vec.into_iter().map(|(_, x)| x).collect::<Value>().to_sql(),
 		// Yes prettify the SurrealQL response
 		(false, true) => vec
 			.into_iter()
@@ -361,15 +356,17 @@ fn process(
 			.map(|(index, (stats, value))| {
 				let query_num = index + 1;
 				let execution_time = stats.execution_time.unwrap_or_default();
-				format!("-- Query {query_num} (execution time: {execution_time:?})\n{value:#}",)
+				format!(
+					"-- Query {query_num} (execution time: {execution_time:?})\n{:#}",
+					value.to_sql()
+				)
 			})
 			.collect::<Vec<String>>()
 			.join("\n"),
 		// Don't pretty print the JSON response
 		(true, false) => {
-			let value =
-				CoreValue::from(vec.into_iter().map(|(_, x)| x.into_inner()).collect::<Vec<_>>());
-			serde_json::to_string(&value.into_json()).unwrap()
+			let value = Value::from_vec(vec.into_iter().map(|(_, x)| x).collect::<Vec<_>>());
+			serde_json::to_string(&value.into_json_value()).unwrap()
 		}
 		// Yes prettify the JSON response
 		(true, true) => vec
@@ -381,7 +378,8 @@ fn process(
 					&mut buf,
 					PrettyFormatter::with_indent(b"\t"),
 				);
-				value.into_inner().into_json().serialize(&mut serializer).unwrap();
+				let x = value.into_json_value();
+				x.serialize(&mut serializer).unwrap();
 				let output = String::from_utf8(buf).unwrap();
 				let query_num = index + 1;
 				let execution_time = stats.execution_time.unwrap_or_default();
@@ -392,7 +390,7 @@ fn process(
 	})
 }
 
-fn print(result: Result<String, Error>) {
+fn print(result: Result<String>) {
 	match result {
 		Ok(v) => {
 			println!("{v}\n");
@@ -427,10 +425,11 @@ impl Validator for InputValidator<'_> {
 			Incomplete // The line ends with a backslash
 		} else if input.is_empty() {
 			Valid(None) // Ignore empty lines
-		} else if let Err(e) = surrealdb::syn::parse_with_capabilities(input, self.capabilities) {
-			Invalid(Some(format!(" --< {e}")))
 		} else {
-			Valid(None)
+			match surrealdb_core::syn::parse_with_capabilities(input, self.capabilities) {
+				Err(e) => Invalid(Some(format!(" --< {e}"))),
+				_ => Valid(None),
+			}
 		};
 		// Validation complete
 		Ok(result)

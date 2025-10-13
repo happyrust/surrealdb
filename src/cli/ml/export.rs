@@ -1,12 +1,13 @@
+use anyhow::{Result, bail};
+use clap::Args;
+use futures_util::StreamExt;
+use surrealdb::engine::any::{self, connect};
+use tokio::io::{self, AsyncWriteExt};
+
 use crate::cli::abstraction::auth::{CredentialsBuilder, CredentialsLevel};
 use crate::cli::abstraction::{
 	AuthArguments, DatabaseConnectionArguments, DatabaseSelectionArguments,
 };
-use crate::err::Error;
-use clap::Args;
-use futures_util::StreamExt;
-use surrealdb::engine::any::{connect, IntoEndpoint};
-use tokio::io::{self, AsyncWriteExt};
 
 #[derive(Args, Debug)]
 pub struct ModelArguments {
@@ -56,19 +57,20 @@ pub async fn init(
 			database,
 		},
 	}: ExportCommandArguments,
-) -> Result<(), Error> {
-	// If username and password are specified, and we are connecting to a remote SurrealDB server, then we need to authenticate.
-	// If we are connecting directly to a datastore (i.e. surrealkv://local.skv or tikv://...), then we don't need to authenticate because we use an embedded (local) SurrealDB instance with auth disabled.
-	let client = if username.is_some()
-		&& password.is_some()
-		&& !endpoint.clone().into_endpoint()?.parse_kind()?.is_local()
-	{
+) -> Result<()> {
+	let is_local = any::__into_endpoint(&endpoint)?.parse_kind()?.is_local();
+	// If username and password are specified, and we are connecting to a remote
+	// SurrealDB server, then we need to authenticate. If we are connecting
+	// directly to a datastore (i.e. surrealkv://local.skv or tikv://...), then we
+	// don't need to authenticate because we use an embedded (local) SurrealDB
+	// instance with auth disabled.
+	let client = if username.is_some() && password.is_some() && !is_local {
 		debug!("Connecting to the database engine with authentication");
 		let creds = CredentialsBuilder::default()
-			.with_username(username.as_deref())
-			.with_password(password.as_deref())
-			.with_namespace(namespace.as_str())
-			.with_database(database.as_str());
+			.with_username(username.clone())
+			.with_password(password.clone())
+			.with_namespace(namespace.clone())
+			.with_database(database.clone());
 
 		let client = connect(endpoint).await?;
 
@@ -80,7 +82,7 @@ pub async fn init(
 		};
 
 		client
-	} else if token.is_some() && !endpoint.clone().into_endpoint()?.parse_kind()?.is_local() {
+	} else if token.is_some() && !is_local {
 		let client = connect(endpoint).await?;
 		client.authenticate(token.unwrap()).await?;
 
@@ -94,7 +96,7 @@ pub async fn init(
 	let version = match version.parse() {
 		Ok(version) => version,
 		Err(_) => {
-			return Err(Error::Other(format!("`{version}` is not a valid semantic version")));
+			bail!("`{version}` is not a valid semantic version")
 		}
 	};
 

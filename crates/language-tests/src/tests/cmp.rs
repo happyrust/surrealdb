@@ -1,10 +1,11 @@
-use std::{collections::BTreeMap, ops::Bound, sync::LazyLock};
+use std::collections::BTreeMap;
+use std::ops::Bound;
+use std::sync::LazyLock;
 
 use rust_decimal::Decimal;
-use surrealdb_core::sql::{
-	Array, Block, Bytes, Cast, Closure, Constant, Datetime, Duration, Edges, Expression, File,
-	Function, Future, Geometry, Id, IdRange, Idiom, Mock, Model, Number, Object, Param, Query,
-	Range, Regex, Subquery, Thing, Uuid, Value,
+use surrealdb_types::{
+	Array, Bytes, Datetime, Duration, File, Geometry, Number, Object, Range, RecordId,
+	RecordIdKey, RecordIdKeyRange, Regex, Uuid, Value,
 };
 
 #[derive(Debug, Clone)]
@@ -105,7 +106,7 @@ macro_rules! impl_roughly_eq_enum {
     };
 
 
-    (@match_pattern $this:expr, $other:expr, $ty_name:ident, $config:ident, $name:ident) => {
+    (@match_pattern $this:expr_2021, $other:expr_2021, $ty_name:ident, $config:ident, $name:ident) => {
         if let $ty_name::$name = $this{
             if let $ty_name::$name = $other{
                 return true
@@ -114,17 +115,17 @@ macro_rules! impl_roughly_eq_enum {
         }
     };
 
-    (@match_pattern $this:expr, $other:expr, $ty_name:ident, $config:ident, $name:ident($($field:ident),* $(,)?)) => {
+    (@match_pattern $this:expr_2021, $other:expr_2021, $ty_name:ident, $config:ident, $name:ident($($field:ident),* $(,)?)) => {
         #[expect(non_camel_case_types)]
         struct $name<$($field,)*> {
             $($field: $field),*
         }
 
-        if let $ty_name::$name($(ref $field),*) = $this{
+        if let $ty_name::$name($($field),*) = $this{
             let __tmp = $name{
                 $($field,)*
             };
-            if let $ty_name::$name($(ref $field),*) = $other {
+            if let $ty_name::$name($($field),*) = $other {
                 return true $(&& __tmp.$field.roughly_equal($field,$config))*;
             }else{
                 return false
@@ -139,34 +140,32 @@ macro_rules! impl_roughly_eq_enum {
 /// don't check the parts of id that are often randomly generated.
 ///
 /// Do check if they are of the same type.
-impl RoughlyEq for Id {
+impl RoughlyEq for RecordIdKey {
 	fn roughly_equal(&self, other: &Self, config: &RoughlyEqConfig) -> bool {
 		if config.record_id_keys {
 			match (self, other) {
-				(Id::Number(a), Id::Number(b)) => a == b,
-				(Id::String(a), Id::String(b)) => a == b,
-				(Id::Uuid(a), Id::Uuid(b)) => {
+				(RecordIdKey::Number(a), RecordIdKey::Number(b)) => a == b,
+				(RecordIdKey::String(a), RecordIdKey::String(b)) => a == b,
+				(RecordIdKey::Uuid(a), RecordIdKey::Uuid(b)) => {
 					if config.uuid {
 						a == b
 					} else {
 						true
 					}
 				}
-				(Id::Array(a), Id::Array(b)) => a.roughly_equal(b, config),
-				(Id::Object(a), Id::Object(b)) => a.roughly_equal(b, config),
-				(Id::Generate(a), Id::Generate(b)) => a == b,
-				(Id::Range(a), Id::Range(b)) => a.roughly_equal(b, config),
+				(RecordIdKey::Array(a), RecordIdKey::Array(b)) => a.roughly_equal(b, config),
+				(RecordIdKey::Object(a), RecordIdKey::Object(b)) => a.roughly_equal(b, config),
+				(RecordIdKey::Range(a), RecordIdKey::Range(b)) => a.roughly_equal(b, config),
 				_ => false,
 			}
 		} else {
 			match (self, other) {
-				(Id::Number(_), Id::Number(_)) => true,
-				(Id::String(_), Id::String(_)) => true,
-				(Id::Uuid(_), Id::Uuid(_)) => true,
-				(Id::Array(a), Id::Array(b)) => a.roughly_equal(b, config),
-				(Id::Object(a), Id::Object(b)) => a.roughly_equal(b, config),
-				(Id::Generate(a), Id::Generate(b)) => a == b,
-				(Id::Range(a), Id::Range(b)) => a.roughly_equal(b, config),
+				(RecordIdKey::Number(_), RecordIdKey::Number(_)) => true,
+				(RecordIdKey::String(_), RecordIdKey::String(_)) => true,
+				(RecordIdKey::Uuid(_), RecordIdKey::Uuid(_)) => true,
+				(RecordIdKey::Array(a), RecordIdKey::Array(b)) => a.roughly_equal(b, config),
+				(RecordIdKey::Object(a), RecordIdKey::Object(b)) => a.roughly_equal(b, config),
+				(RecordIdKey::Range(a), RecordIdKey::Range(b)) => a.roughly_equal(b, config),
 				_ => false,
 			}
 		}
@@ -233,47 +232,53 @@ impl RoughlyEq for Number {
 }
 
 impl_roughly_eq_delegate!(
-	i64, Query, bool, String, Closure, Expression, Geometry, Bytes, Param, Model, Subquery,
-	Function, Constant, Future, Edges, Range, Block, Cast, Regex, Mock, Idiom, Duration, File
+	i64, bool, String, Geometry, Bytes, Range, Regex, Duration, File
 );
 
-impl_roughly_eq_struct!(Array, 0);
-impl_roughly_eq_struct!(Object, 0);
-impl_roughly_eq_struct!(Thing, tb, id);
-impl_roughly_eq_struct!(IdRange, beg, end);
+// impl_roughly_eq_struct!(Array, 0);
+// impl_roughly_eq_struct!(Object, 0);
+
+impl RoughlyEq for Array {
+	fn roughly_equal(&self, other: &Self, config: &RoughlyEqConfig) -> bool {
+		if self.len() != other.len() {
+			return false;
+		}
+		self.iter().zip(other.iter()).all(|(a, b)| a.roughly_equal(b, config))
+	}
+}
+
+impl RoughlyEq for Object {
+
+	fn roughly_equal(&self, other: &Self, config: &RoughlyEqConfig) -> bool {
+		if self.len() != other.len() {
+			return false;
+		}
+		self.iter().zip(other.iter()).all(|((ak, av), (bk, bv))| {
+			String::roughly_equal(ak, bk, config) && Value::roughly_equal(av, bv, config)
+		})
+	}
+}
+
+impl_roughly_eq_struct!(RecordId, table, key);
+impl_roughly_eq_struct!(RecordIdKeyRange, start, end);
 
 impl_roughly_eq_enum!(
 	Value{
-	None,
-	Null,
-	Bool(b),
-	Number(n),
-	Strand(s),
-	Duration(d),
-	Datetime(d),
-	Uuid(u),
-	Array(a),
-	Object(o),
-	Geometry(g),
-	Bytes(b),
-	Thing(t),
-	Param(p),
-	Idiom(i),
-	Table(t),
-	Mock(m),
-	Regex(r),
-	Cast(c),
-	Block(b),
-	Range(r),
-	Edges(e),
-	Future(f),
-	Constant(c),
-	Function(f),
-	Subquery(s),
-	Expression(s),
-	Query(q),
-	Model(m),
-	Closure(c),
-	File(f),
+		None,
+		Null,
+		Bool(b),
+		Number(n),
+		String(s),
+		Duration(d),
+		Datetime(d),
+		Uuid(u),
+		Array(a),
+		Object(o),
+		Geometry(g),
+		Bytes(b),
+		RecordId(t),
+		Regex(r),
+		Range(r),
+		File(f),
 	}
 );

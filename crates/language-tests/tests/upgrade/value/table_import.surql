@@ -6,7 +6,6 @@ value = "NONE"
 
 */
 
-DEFINE FIELD f ON t VALUE <future> {
-	// This will be parsed as `Value::table`
-	a;
+DEFINE FIELD f ON t COMPUTED {
+	a // This will be parsed as `Value::table`
 };

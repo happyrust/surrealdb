@@ -1,21 +1,17 @@
-use std::{
-	fmt::{self, Write},
-	io::{self, IsTerminal as _},
-	time::{Duration, Instant},
-};
+use std::fmt::{self, Write};
+use std::io::{self, IsTerminal as _};
+use std::time::{Duration, Instant};
 
-use crate::{
-	cli::ColorMode,
-	format::{ansi, IndentFormatter},
-	tests::TestSet,
-};
+use similar::{Algorithm, TextDiff};
+use surrealdb_types::{Value as SurValue, ToSql};
 
 use super::{
-	MatchValueType, MatcherMismatch, Mismatch, MismatchKind, TestError, TestGrade, TestOutputs,
-	TestReport, TestValueExpectation, TypeMismatchReport, ValueMismatchKind,
+	MatchValueType, MatcherMismatch, Mismatch, MismatchKind, ResultTypeMismatchReport, TestError,
+	TestGrade, TestOutputs, TestReport, TestValueExpectation, ValueMismatchKind,
 };
-use similar::{Algorithm, TextDiff};
-use surrealdb_core::sql::Value as SurValue;
+use crate::cli::ColorMode;
+use crate::format::{IndentFormatter, ansi};
+use crate::tests::TestSet;
 
 type Fmt<'a> = IndentFormatter<&'a mut String>;
 
@@ -59,6 +55,30 @@ impl TestReport {
 					f.indent(|f| writeln!(f, "- Parsing error: {expected}"))?;
 					writeln!(f, "= Got:")?;
 					f.indent(|f| writeln!(f, "- Parsing error: {got}"))
+				})
+			}
+			super::TestReportKind::MismatchedSignin {
+				ref got,
+				ref expected,
+			} => {
+				writeln!(f, "> Test returned invalid signin error")?;
+				f.indent(|f| {
+					writeln!(f, "= Expected:")?;
+					f.indent(|f| writeln!(f, "- Signin error: {expected}"))?;
+					writeln!(f, "= Got:")?;
+					f.indent(|f| writeln!(f, "- Signin error: {got}"))
+				})
+			}
+			super::TestReportKind::MismatchedSignup {
+				ref got,
+				ref expected,
+			} => {
+				writeln!(f, "> Test returned invalid signup error")?;
+				f.indent(|f| {
+					writeln!(f, "= Expected:")?;
+					f.indent(|f| writeln!(f, "- Signup error: {expected}"))?;
+					writeln!(f, "= Got:")?;
+					f.indent(|f| writeln!(f, "- Signup error: {got}"))
 				})
 			}
 			super::TestReportKind::MismatchedValues(ref v) => {
@@ -194,49 +214,50 @@ impl TestReport {
 		f.indent(|f| {
 			writeln!(f, "= Got:")?;
 			f.indent(|f| match outputs {
-				TestOutputs::Values(res) => Self::display_value_list(res, f),
+				TestOutputs::Values(res) => Self::display_value_list(&res, f),
 				TestOutputs::ParsingError(res) => {
 					writeln!(f, "- Parsing error: {res}")
+				}
+				TestOutputs::SignupError(res) => {
+					writeln!(f, "- Signup error: {res}")
+				}
+				TestOutputs::SigninError(res) => {
+					writeln!(f, "- Signin error: {res}")
 				}
 			})
 		})
 	}
 
-	fn display_type_mismatch(mismatch: &TypeMismatchReport, f: &mut Fmt) -> fmt::Result {
-		match mismatch {
-			TypeMismatchReport::ExpectedParsingError {
-				got,
-				expected,
-			} => {
-				writeln!(f, "> Test returned a value when a parsing error was expected")?;
-				f.indent(|f| {
-					writeln!(f, "= Expected:")?;
-					f.indent(|f| match expected {
-						Some(x) => writeln!(f, "- Error: {x}"),
-						None => writeln!(f, "- Any parsing error"),
-					})?;
-					writeln!(f, "= Got:")?;
-					f.indent(|f| Self::display_value_list(got, f))
-				})
-			}
-			TypeMismatchReport::ExpectedValues {
-				got,
-				expected,
-			} => {
-				writeln!(f, "> Test returned a parsing error when normal values were expected")?;
-				f.indent(|f| {
-					writeln!(f, "= Expected:")?;
-					match expected {
-						None => f.indent(|f| writeln!(f, "- Any non parsing error result"))?,
-						Some(expected) => {
-							f.indent(|f| Self::display_expectation_list(expected, f))?
-						}
-					}
-					writeln!(f, "= Got:")?;
-					f.indent(|f| writeln!(f, "- Parsing error: {got}"))
-				})
-			}
-		}
+	fn display_type_mismatch(mismatch: &ResultTypeMismatchReport, f: &mut Fmt) -> fmt::Result {
+		writeln!(f, "> Test returned a different result type then was expected")?;
+		f.indent(|f| {
+			writeln!(f, "= Expected:")?;
+			f.indent(|f| match &mismatch.expected {
+				super::TestExpectation::Parsing(e) => match e {
+					Some(x) => writeln!(f, "- Parsing Error: {x}"),
+					None => writeln!(f, "- Any parsing error"),
+				},
+				super::TestExpectation::Values(e) => match e {
+					Some(e) => Self::display_expectation_list(&e, f),
+					None => writeln!(f, "- Any list of query result values"),
+				},
+				super::TestExpectation::Signin(e) => match e {
+					Some(x) => writeln!(f, "- Signin Error: {x}"),
+					None => writeln!(f, "- Any signin error"),
+				},
+				super::TestExpectation::Signup(e) => match e {
+					Some(x) => writeln!(f, "- Signup Error: {x}"),
+					None => writeln!(f, "- Any signup error"),
+				},
+			})?;
+			writeln!(f, "= Got:")?;
+			f.indent(|f| match &mismatch.got {
+				TestOutputs::Values(values) => Self::display_value_list(values, f),
+				TestOutputs::ParsingError(e) => writeln!(f, "- Parsing error: {e}"),
+				TestOutputs::SigninError(e) => writeln!(f, "- Signin error: {e}"),
+				TestOutputs::SignupError(e) => writeln!(f, "- Signup error: {e}"),
+			})
+		})
 	}
 
 	fn display_mismatched_values(values: &[Mismatch], use_color: bool, f: &mut Fmt) -> fmt::Result {
@@ -292,11 +313,11 @@ impl TestReport {
 							writeln!(f, "> Got a different value then was expected")?;
 							f.indent(|f| {
 								writeln!(f, "= Expected:")?;
-								f.indent(|f| writeln!(f, "- Value: {expected}"))?;
+								f.indent(|f| writeln!(f, "- Value: {}", expected.to_sql()))?;
 								writeln!(f, "= Got:")?;
-								f.indent(|f| writeln!(f, "- Value: {got}"))?;
+								f.indent(|f| writeln!(f, "- Value: {}", got.to_sql()))?;
 								writeln!(f, "= Diff:")?;
-								f.indent(|f| Self::display_diff(got, expected, use_color, f))
+								f.indent(|f| Self::display_diff(&got.to_sql(), &expected.to_sql(), use_color, f))
 							})
 						}
 						ValueMismatchKind::ExpectedError {
@@ -312,7 +333,7 @@ impl TestReport {
 									f.indent(|f| writeln!(f, "- Any error"))?;
 								}
 								writeln!(f, "= Got:")?;
-								f.indent(|f| writeln!(f, "- Value: {got}"))
+								f.indent(|f| writeln!(f, "- Value: {}", got.to_sql()))
 							})
 						}
 						ValueMismatchKind::ExpectedValue {
@@ -323,12 +344,12 @@ impl TestReport {
 							f.indent(|f| {
 								writeln!(f, "= Expected:")?;
 								if let Some(expected) = expected {
-									f.indent(|f| writeln!(f, "- Value: {expected}"))?;
+									f.indent(|f| writeln!(f, "- Value: {}", expected.to_sql()))?;
 								} else {
 									f.indent(|f| writeln!(f, "- Any value"))?;
 								}
 								writeln!(f, "= Got:")?;
-								f.indent(|f| writeln!(f, "- Value: {got}"))
+								f.indent(|f| writeln!(f, "- Error: {got}"))
 							})
 						}
 					}
@@ -345,7 +366,7 @@ impl TestReport {
 					}
 					MatcherMismatch::Failed {
 						matcher,
-						ref value,
+						value,
 					} => {
 						writeln!(f, "> Value failed to match matching expression")?;
 						f.indent(|f| {
@@ -361,7 +382,7 @@ impl TestReport {
 						writeln!(f, "> Matcher expected a value but got an error")?;
 						f.indent(|f| {
 							writeln!(f, "= Got:")?;
-							f.indent(|f| writeln!(f, "- Value: {got}"))
+							f.indent(|f| writeln!(f, "- Value: {}", got.to_sql()))
 						})?
 					}
 					MatcherMismatch::UnexpectedError {
@@ -379,7 +400,7 @@ impl TestReport {
 						writeln!(f, "> Matching expression did not return a boolean.")?;
 						f.indent(|f| {
 							writeln!(f, "= Matching expression returned value:")?;
-							f.indent(|f| writeln!(f, "- Value: {got}"))
+							f.indent(|f| writeln!(f, "- Value: {}", got.to_sql()))
 						})?
 					}
 				},
@@ -397,7 +418,7 @@ impl TestReport {
 	fn display_value(v: &Result<SurValue, String>, f: &mut Fmt) -> fmt::Result {
 		match v {
 			Ok(x) => {
-				writeln!(f, "- Value: {x}")
+				writeln!(f, "- Value: {}", x.to_sql())
 			}
 			Err(e) => {
 				writeln!(f, "- Error: {e}")
@@ -419,18 +440,18 @@ impl TestReport {
 				None => writeln!(f, "- Any Error"),
 			},
 			TestValueExpectation::Value(v) => match v {
-				Some(v) => writeln!(f, "- Value: {}", v.expected),
+				Some(v) => writeln!(f, "- Value: {}", v.expected.to_sql()),
 				None => writeln!(f, "- Any value"),
 			},
 			TestValueExpectation::Matcher(m) => match m.matcher_value_type {
 				MatchValueType::Both => {
-					writeln!(f, "- A result to match matching expression: {}", m.value)
+					writeln!(f, "- A result to match matching expression: {}", m.value_str)
 				}
 				MatchValueType::Error => {
-					writeln!(f, "- A error to match matching expression: {}", m.value)
+					writeln!(f, "- A error to match matching expression: {}", m.value_str)
 				}
 				MatchValueType::Value => {
-					writeln!(f, "- A value to match matching expression: {}", m.value)
+					writeln!(f, "- A value to match matching expression: {}", m.value_str)
 				}
 			},
 		}

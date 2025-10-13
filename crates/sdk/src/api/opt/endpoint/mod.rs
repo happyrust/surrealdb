@@ -16,12 +16,11 @@ mod surrealkv;
 #[cfg(feature = "kv-tikv")]
 mod tikv;
 
-use crate::api::err::Error;
-use crate::api::Connection;
-use crate::api::Result;
 use url::Url;
 
 use super::Config;
+use crate::api::err::Error;
+use crate::api::{Connection, Result};
 
 /// A server address used to connect to the server
 #[derive(Debug, Clone)]
@@ -45,19 +44,22 @@ impl Endpoint {
 	#[doc(hidden)]
 	pub fn parse_kind(&self) -> Result<EndpointKind> {
 		match EndpointKind::from(self.url.scheme()) {
-			EndpointKind::Unsupported(s) => Err(Error::Scheme(s).into()),
+			EndpointKind::Unsupported(s) => Err(Error::Scheme(s)),
 			kind => Ok(kind),
 		}
 	}
 }
 
 /// A trait for converting inputs to a server address object
-pub trait IntoEndpoint<Scheme> {
-	/// The client implied by this scheme and address combination
-	type Client: Connection;
-	/// Converts an input into a server address object
-	#[deprecated(since = "2.3.0")]
-	fn into_endpoint(self) -> Result<Endpoint>;
+pub trait IntoEndpoint<Scheme>: into_endpoint::Sealed<Scheme> {}
+
+pub(crate) mod into_endpoint {
+	pub trait Sealed<Scheme> {
+		/// The client implied by this scheme and address combination
+		type Client: super::Connection;
+		/// Converts an input into a server address object
+		fn into_endpoint(self) -> super::Result<super::Endpoint>;
+	}
 }
 
 fn replace_tilde(path: &str) -> String {
@@ -73,8 +75,9 @@ fn replace_tilde(path: &str) -> String {
 }
 
 pub(crate) fn path_to_string(protocol: &str, path: impl AsRef<std::path::Path>) -> String {
-	use path_clean::PathClean;
 	use std::path::Path;
+
+	use path_clean::PathClean;
 
 	let path = path.as_ref().display().to_string();
 	let expanded = replace_tilde(&path);
@@ -123,7 +126,6 @@ pub enum EndpointKind {
 	IndxDb,
 	Memory,
 	RocksDb,
-	File,
 	TiKv,
 	Unsupported(String),
 	SurrealKv,
@@ -141,7 +143,6 @@ impl From<&str> for EndpointKind {
 			#[cfg(target_family = "wasm")]
 			"indxdb" => Self::IndxDb,
 			"mem" => Self::Memory,
-			"file" => Self::File,
 			"rocksdb" => Self::RocksDb,
 			"tikv" => Self::TiKv,
 			"surrealkv" => Self::SurrealKv,

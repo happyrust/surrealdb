@@ -1,10 +1,10 @@
-use crate::err::Error;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Extension, Router};
-use surrealdb::dbs::capabilities::RouteTarget;
+use surrealdb_core::dbs::capabilities::RouteTarget;
 
 use super::AppState;
+use crate::net::error::Error as NetError;
 
 pub(super) fn router<S>() -> Router<S>
 where
@@ -21,7 +21,7 @@ async fn load(
 	// Check if capabilities allow querying the requested HTTP route
 	if !db.allows_http_route(&RouteTarget::Sync) {
 		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Sync);
-		return Err(Error::ForbiddenRoute(RouteTarget::Sync.to_string()));
+		return Err(NetError::ForbiddenRoute(RouteTarget::Sync.to_string()));
 	}
 
 	Ok("Load")
@@ -35,7 +35,7 @@ async fn save(
 	// Check if capabilities allow querying the requested HTTP route
 	if !db.allows_http_route(&RouteTarget::Sync) {
 		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Sync);
-		return Err(Error::ForbiddenRoute(RouteTarget::Sync.to_string()));
+		return Err(NetError::ForbiddenRoute(RouteTarget::Sync.to_string()));
 	}
 
 	Ok("Save")

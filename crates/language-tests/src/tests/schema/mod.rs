@@ -1,19 +1,19 @@
 //! Module defining the configuration schema.
 
-mod bytes_hack;
+//mod bytes_hack;
 
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
 use semver::VersionReq;
-use serde::{de, Deserialize, Serialize};
-use surrealdb_core::{
-	dbs::capabilities::{
-		Capabilities as CoreCapabilities, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget,
-		RouteTarget, Targets,
-	},
-	sql::{Thing, Value as CoreValue},
-	syn,
+use serde::{Deserialize, Serialize, de};
+use surrealdb_core::dbs::capabilities::{
+	ExperimentalTarget, FuncTarget, MethodTarget, NetTarget, RouteTarget,
 };
+use surrealdb_core::syn::parser::ParserSettings;
+use surrealdb_core::syn::{self};
+use surrealdb_types::{Object, RecordId, Value, ToSql};
 
 /// Root test config struct.
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
@@ -48,12 +48,15 @@ impl TestConfig {
 
 	/// Returns if this test must be run without other test running.
 	pub fn should_run_sequentially(&self) -> bool {
-		self.env.as_ref().map(|x| x.sequential).unwrap_or(false)
+		self.env.as_ref().map(|x| x.sequential).unwrap_or(
+			// TODO(ssttuu): This should be `true` but we're currently having flakiness issues.
+			false,
+		)
 	}
 
 	/// Whether this test can use one of the datastorage struct which are reused between tests.
 	pub fn can_use_reusable_ds(&self) -> bool {
-		self.env.as_ref().map(|x| !x.clean).unwrap_or(true)
+		self.env.as_ref().map(|x| !x.clean).unwrap_or(false)
 	}
 
 	/// Returns a list of keys which are not in the schema but still define.
@@ -81,12 +84,14 @@ pub struct TestEnv {
 	pub clean: bool,
 
 	#[serde(default)]
-	pub auth: bool,
+	pub strict: bool,
 
 	pub namespace: Option<BoolOr<String>>,
 	pub database: Option<BoolOr<String>>,
 
-	pub login: Option<TestLogin>,
+	pub auth: Option<TestAuth>,
+	pub signup: Option<SurrealObject>,
+	pub signin: Option<SurrealObject>,
 
 	#[serde(default)]
 	pub imports: Vec<String>,
@@ -140,11 +145,11 @@ impl TestEnv {
 #[serde(untagged)]
 pub enum TestExpectation {
 	// NOTE! Ordering of variants here is important.
-	// Match must come before Error so that they are deserialized correctely.
+	// Match must come before Error so that they are deserialized correctly.
 	// Swapping match with error causes the error variant to be chosen when
 	// match specifies if it expects an error.
-	/// The result is a nomral value
-	Plain(SurrealValue),
+	/// The result is a normal value
+	Plain(SurrealConfigValue),
 	/// The result is a value but specified as a table.
 	Match(MatchTestResult),
 	/// The result should be an error.
@@ -164,7 +169,7 @@ impl<'de> Deserialize<'de> for TestExpectation {
 	{
 		let v = toml::Value::deserialize(deserializer)?;
 		if v.is_str() {
-			SurrealValue::deserialize(v).map_err(to_deser_error).map(TestExpectation::Plain)
+			SurrealConfigValue::deserialize(v).map_err(to_deser_error).map(TestExpectation::Plain)
 		} else if let Some(x) = v.as_table() {
 			if x.contains_key("match") {
 				MatchTestResult::deserialize(v).map_err(to_deser_error).map(TestExpectation::Match)
@@ -173,7 +178,9 @@ impl<'de> Deserialize<'de> for TestExpectation {
 			} else if x.contains_key("error") {
 				ErrorTestResult::deserialize(v).map_err(to_deser_error).map(TestExpectation::Error)
 			} else {
-				Err(to_deser_error("Table does not match any the options, expected table to contain altleast one `match`, `value` or `error` field"))
+				Err(to_deser_error(
+					"Table does not match any the options, expected table to contain altleast one `match`, `value` or `error` field",
+				))
 			}
 		} else {
 			Err(to_deser_error("Expected a string or a table"))
@@ -190,7 +197,7 @@ pub struct ErrorTestResult {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ValueTestResult {
-	pub value: SurrealValue,
+	pub value: SurrealConfigValue,
 	#[serde(default)]
 	pub skip_datetime: Option<bool>,
 	#[serde(default)]
@@ -207,7 +214,7 @@ pub struct ValueTestResult {
 #[serde(rename_all = "kebab-case")]
 pub struct MatchTestResult {
 	#[serde(rename = "match")]
-	pub _match: SurrealValue,
+	pub _match: SurrealExpr,
 	#[serde(default)]
 	pub error: Option<bool>,
 }
@@ -261,38 +268,14 @@ impl<T> BoolOr<T> {
 		}
 	}
 
-	/// Returns the value of this bool/or returning the default in case of BoolOr::Bool(true), the value in
-	/// case of BoolOr::Value(_) or None in case of BoolOr::Bool(false)
+	/// Returns the value of this bool/or returning the default in case of BoolOr::Bool(true), the
+	/// value in case of BoolOr::Value(_) or None in case of BoolOr::Bool(false)
 	pub fn into_value(self, default: T) -> Option<T> {
 		match self {
 			BoolOr::Bool(false) => None,
 			BoolOr::Bool(true) => Some(default),
 			BoolOr::Value(x) => Some(x),
 		}
-	}
-}
-
-#[derive(Default, Clone, Debug)]
-pub struct Version(semver::VersionReq);
-
-impl<'de> Deserialize<'de> for Version {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		let str = String::deserialize(deserializer)?;
-		let version = semver::VersionReq::parse(&str).map_err(to_deser_error)?;
-		Ok(Version(version))
-	}
-}
-
-impl Serialize for Version {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		let str = self.0.to_string();
-		str.serialize(serializer)
 	}
 }
 
@@ -309,9 +292,9 @@ pub struct TestDetails {
 	pub upgrade: bool,
 
 	#[serde(default)]
-	pub version: VersionReq,
+	pub version: Option<VersionReq>,
 	#[serde(default)]
-	pub importing_version: VersionReq,
+	pub importing_version: Option<VersionReq>,
 
 	pub results: Option<TestDetailsResults>,
 
@@ -345,6 +328,12 @@ impl TestDetails {
 				TestDetailsResults::ParserError(x) => res.append(
 					&mut x._unused_keys.keys().map(|x| format!("test.results.{x}")).collect(),
 				),
+				TestDetailsResults::SignupError(x) => res.append(
+					&mut x._unused_keys.keys().map(|x| format!("test.results.{x}")).collect(),
+				),
+				TestDetailsResults::SigninError(x) => res.append(
+					&mut x._unused_keys.keys().map(|x| format!("test.results.{x}")).collect(),
+				),
 			}
 		}
 		res
@@ -357,6 +346,8 @@ impl TestDetails {
 pub enum TestDetailsResults {
 	QueryResult(Vec<TestExpectation>),
 	ParserError(ParsingTestResult),
+	SigninError(SigninErrorResult),
+	SignupError(SignupErrorResult),
 }
 
 impl<'de> Deserialize<'de> for TestDetailsResults {
@@ -369,10 +360,20 @@ impl<'de> Deserialize<'de> for TestDetailsResults {
 			Deserialize::deserialize(value)
 				.map_err(to_deser_error)
 				.map(TestDetailsResults::QueryResult)
-		} else if value.is_table() {
-			Deserialize::deserialize(value)
-				.map_err(to_deser_error)
-				.map(TestDetailsResults::ParserError)
+		} else if let Some(t) = value.as_table() {
+			if t.contains_key("signin-error") {
+				Deserialize::deserialize(value)
+					.map_err(to_deser_error)
+					.map(TestDetailsResults::SigninError)
+			} else if t.contains_key("signup-error") {
+				Deserialize::deserialize(value)
+					.map_err(to_deser_error)
+					.map(TestDetailsResults::SignupError)
+			} else {
+				Deserialize::deserialize(value)
+					.map_err(to_deser_error)
+					.map(TestDetailsResults::ParserError)
+			}
 		} else {
 			Err(to_deser_error("Expected table or array"))
 		}
@@ -388,42 +389,98 @@ pub struct ParsingTestResult {
 	_unused_keys: BTreeMap<String, toml::Value>,
 }
 
-#[derive(Clone, Debug)]
-pub struct SurrealValue(pub CoreValue);
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SigninErrorResult {
+	pub signin_error: BoolOr<String>,
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
+}
 
-impl Serialize for SurrealValue {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SignupErrorResult {
+	pub signup_error: BoolOr<String>,
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
+}
+
+/// A wrapper around the `Value` type for SurrealDB in order to support parsing from toml.
+#[derive(Clone, Debug)]
+pub struct SurrealConfigValue(pub Value);
+
+impl Serialize for SurrealConfigValue {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
 	{
-		let v = self.0.to_string();
+		let v = self.0.to_sql();
 		v.serialize(serializer)
 	}
 }
 
-impl<'de> Deserialize<'de> for SurrealValue {
+impl<'de> Deserialize<'de> for SurrealConfigValue {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
 		let source = String::deserialize(deserializer)?;
-		let capabilities = CoreCapabilities::all().with_experimental(Targets::All);
-		let mut v = syn::value_with_capabilities(&source, &capabilities)
-			.map_err(<D::Error as serde::de::Error>::custom)?;
-		bytes_hack::compute_bytes_inplace(&mut v);
-		Ok(SurrealValue(v))
+		let settings = ParserSettings {
+			object_recursion_limit: 100,
+			query_recursion_limit: 100,
+			legacy_strands: false,
+			flexible_record_id: true,
+			references_enabled: true,
+			bearer_access_enabled: true,
+			define_api_enabled: true,
+			files_enabled: true,
+		};
+
+		let v = syn::parse_with_settings(source.as_bytes(), settings, async |parser, stk| {
+			parser.parse_value(stk).await
+		})
+		.map_err(<D::Error as serde::de::Error>::custom)?;
+
+		Ok(SurrealConfigValue(v))
 	}
 }
 
 #[derive(Clone, Debug)]
-pub struct SurrealRecordId(pub Thing);
+pub struct SurrealExpr(pub String);
+
+impl Serialize for SurrealExpr {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		self.0.serialize(serializer)
+	}
+}
+
+impl<'de> Deserialize<'de> for SurrealExpr {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let source = String::deserialize(deserializer)?;
+		// We can't validate the expression anymore since parse_expr_start is private
+		// and parse_value doesn't handle variables like $error
+		// We'll rely on runtime validation when the expression is executed
+		Ok(SurrealExpr(source))
+	}
+}
+
+#[derive(Clone, Debug)]
+pub struct SurrealRecordId(pub RecordId);
 
 impl Serialize for SurrealRecordId {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
 	{
-		let v = self.0.to_string();
+		let v = self.0.to_sql();
 		v.serialize(serializer)
 	}
 }
@@ -434,10 +491,22 @@ impl<'de> Deserialize<'de> for SurrealRecordId {
 		D: serde::Deserializer<'de>,
 	{
 		let source = String::deserialize(deserializer)?;
-		let capabilities = CoreCapabilities::all().with_experimental(Targets::All);
-		let v = syn::value_with_capabilities(&source, &capabilities)
-			.map_err(<D::Error as serde::de::Error>::custom)?;
-		if let CoreValue::Thing(x) = v {
+		let settings = ParserSettings {
+			object_recursion_limit: 100,
+			query_recursion_limit: 100,
+			legacy_strands: false,
+			flexible_record_id: true,
+			references_enabled: true,
+			bearer_access_enabled: true,
+			define_api_enabled: true,
+			files_enabled: true,
+		};
+
+		let v = syn::parse_with_settings(source.as_bytes(), settings, async |parser, stk| {
+			parser.parse_value(stk).await
+		})
+		.map_err(<D::Error as serde::de::Error>::custom)?;
+		if let Value::RecordId(x) = v {
 			Ok(SurrealRecordId(x))
 		} else {
 			Err(<D::Error as serde::de::Error>::custom(format_args!(
@@ -447,70 +516,81 @@ impl<'de> Deserialize<'de> for SurrealRecordId {
 	}
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
-#[serde(rename_all = "kebab-case")]
-pub enum TestLogin {
-	Leveled(TestLeveledLogin),
-	Record(TestRecordLogin),
-}
+#[derive(Clone, Debug)]
+pub struct SurrealObject(pub Object);
 
-impl<'de> Deserialize<'de> for TestLogin {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl Serialize for SurrealObject {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
-		D: de::Deserializer<'de>,
+		S: serde::Serializer,
 	{
-		let v = toml::Value::deserialize(deserializer)?;
-		if let Some(x) = v.as_table() {
-			if x.contains_key("level") {
-				TestLeveledLogin::deserialize(v).map_err(to_deser_error).map(TestLogin::Leveled)
-			} else if x.contains_key("rid") {
-				TestRecordLogin::deserialize(v).map_err(to_deser_error).map(TestLogin::Record)
-			} else {
-				Err(to_deser_error("Table does not match any the options, expected table to contain altleast one `level` or `rid` field"))
-			}
-		} else {
-			Err(to_deser_error("Expected a table"))
-		}
+		let v = self.0.to_sql();
+		v.serialize(serializer)
 	}
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct TestLeveledLogin {
-	pub level: TestLevel,
-	pub role: Option<TestRole>,
+impl<'de> Deserialize<'de> for SurrealObject {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let source = String::deserialize(deserializer)?;
+		let settings = ParserSettings {
+			object_recursion_limit: 100,
+			query_recursion_limit: 100,
+			legacy_strands: false,
+			flexible_record_id: true,
+			references_enabled: true,
+			bearer_access_enabled: true,
+			define_api_enabled: true,
+			files_enabled: true,
+		};
 
-	#[serde(skip_serializing)]
-	#[serde(flatten)]
-	_unused_keys: BTreeMap<String, toml::Value>,
+		let v = syn::parse_with_settings(source.as_bytes(), settings, async |parser, stk| {
+			parser.parse_value(stk).await
+		})
+		.map_err(<D::Error as serde::de::Error>::custom)?;
+
+		v.into_object().map(SurrealObject).or_else(|err| {
+			Err(<D::Error as serde::de::Error>::custom(format_args!(
+				"Expected a object, found '{source}': {err}"
+			)))
+		})
+	}
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum TestRole {
-	Viewer,
-	Editor,
+pub enum AuthLevel {
+	#[default]
 	Owner,
+	Editor,
+	Viewer,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TestLevel {
-	Root,
-	Namespace,
-	Database,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct TestRecordLogin {
-	pub access: String,
-	pub rid: SurrealRecordId,
-
-	#[serde(skip_serializing)]
-	#[serde(flatten)]
-	_unused_keys: BTreeMap<String, toml::Value>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", untagged)]
+pub enum TestAuth {
+	Record {
+		namespace: String,
+		database: String,
+		access: String,
+		rid: SurrealRecordId,
+	},
+	Database {
+		namespace: String,
+		database: String,
+		#[serde(default)]
+		level: AuthLevel,
+	},
+	Namespace {
+		namespace: String,
+		#[serde(default)]
+		level: AuthLevel,
+	},
+	Root {
+		level: AuthLevel,
+	},
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

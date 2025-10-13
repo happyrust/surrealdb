@@ -1,14 +1,15 @@
-use crate::api::conn::Command;
-use crate::api::method::BoxFuture;
-use crate::api::Connection;
-use crate::api::Result;
-use crate::method::OnceLockExt;
-use crate::Surreal;
-use crate::Value;
-use serde::de::DeserializeOwned;
 use std::borrow::Cow;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
+
+use surrealdb_types::{SurrealValue, Value};
+use uuid::Uuid;
+
+use crate::Surreal;
+use crate::api::conn::Command;
+use crate::api::method::BoxFuture;
+use crate::api::{Connection, Result};
+use crate::method::OnceLockExt;
 
 /// A content future
 ///
@@ -16,6 +17,8 @@ use std::marker::PhantomData;
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Content<'r, C: Connection, R> {
+	#[allow(dead_code)]
+	pub(super) txn: Option<Uuid>,
 	pub(super) client: Cow<'r, Surreal<C>>,
 	pub(super) command: Result<Command>,
 	pub(super) response_type: PhantomData<R>,
@@ -25,18 +28,20 @@ impl<'r, C, R> Content<'r, C, R>
 where
 	C: Connection,
 {
-	pub(crate) fn from_closure<F>(client: Cow<'r, Surreal<C>>, f: F) -> Self
+	pub(crate) fn from_closure<F>(client: Cow<'r, Surreal<C>>, txn: Option<Uuid>, f: F) -> Self
 	where
 		F: FnOnce() -> Result<Command>,
 	{
 		Content {
+			txn,
 			client,
 			command: f(),
 			response_type: PhantomData,
 		}
 	}
 
-	/// Converts to an owned type which can easily be moved to a different thread
+	/// Converts to an owned type which can easily be moved to a different
+	/// thread
 	pub fn into_owned(self) -> Content<'static, C, R> {
 		Content {
 			client: Cow::Owned(self.client.into_owned()),
@@ -74,7 +79,7 @@ where
 impl<'r, Client, R> IntoFuture for Content<'r, Client, Option<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Option<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;
@@ -85,7 +90,7 @@ where
 impl<'r, Client, R> IntoFuture for Content<'r, Client, Vec<R>>
 where
 	Client: Connection,
-	R: DeserializeOwned,
+	R: SurrealValue,
 {
 	type Output = Result<Vec<R>>;
 	type IntoFuture = BoxFuture<'r, Self::Output>;

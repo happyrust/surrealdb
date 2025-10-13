@@ -3,22 +3,20 @@ use crate::fnc::script::modules::impl_module_def;
 
 mod distance;
 mod html;
-mod is;
 mod semver;
 mod similarity;
 
-#[non_exhaustive]
 pub struct Package;
 
 impl_module_def!(
 	Package,
 	"string",
+	"capitalize" => run,
 	"concat" => run,
 	"contains" => run,
 	"distance" => (distance::Package),
 	"ends_with" => run,
 	"html" => (html::Package),
-	"is" => (is::Package),
 	"join" => run,
 	"len" => run,
 	"lowercase" => run,
@@ -35,8 +33,23 @@ impl_module_def!(
 	"uppercase" => run,
 	"words" => run,
 	"semver" => (semver::Package),
-
-	//e3d functions
-	"e3d_dehash" => run,
-	"e3d_hash" => run
+	"is_alphanum" => run,
+	"is_alpha" => run,
+	"is_ascii" => run,
+	"is_datetime" => run,
+	"is_domain" => run,
+	"is_email" => run,
+	"is_email" => run,
+	"is_hexadecimal" => run,
+	"is_ip" => run,
+	"is_ipv4" => run,
+	"is_ipv6" => run,
+	"is_latitude" => run,
+	"is_longitude" => run,
+	"is_numeric" => run,
+	"is_semver" => run,
+	"is_url" => run,
+	"is_ulid" => run,
+	"is_uuid" => run,
+	"is_record" => run
 );

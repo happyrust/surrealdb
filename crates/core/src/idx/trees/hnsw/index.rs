@@ -1,4 +1,12 @@
-use crate::err::Error;
+use std::collections::VecDeque;
+
+#[cfg(debug_assertions)]
+use ahash::HashMap;
+use anyhow::Result;
+use reblessive::tree::Stk;
+
+use crate::catalog::{DatabaseDefinition, HnswParams, VectorType};
+use crate::idx::IndexKeyBase;
 use crate::idx::planner::checker::HnswConditionChecker;
 use crate::idx::planner::iterators::KnnIteratorResult;
 use crate::idx::trees::hnsw::docs::{HnswDocs, VecDocs};
@@ -7,16 +15,10 @@ use crate::idx::trees::hnsw::flavor::HnswFlavor;
 use crate::idx::trees::hnsw::{ElementId, HnswSearch};
 use crate::idx::trees::knn::{KnnResult, KnnResultBuilder};
 use crate::idx::trees::vector::{SharedVector, Vector};
-use crate::idx::IndexKeyBase;
 use crate::kvs::Transaction;
-use crate::sql::index::{HnswParams, VectorType};
-use crate::sql::{Id, Number, Value};
-#[cfg(debug_assertions)]
-use ahash::HashMap;
-use reblessive::tree::Stk;
-use std::collections::VecDeque;
+use crate::val::{Number, RecordIdKey, Value};
 
-pub struct HnswIndex {
+pub(crate) struct HnswIndex {
 	dim: usize,
 	vector_type: VectorType,
 	hnsw: HnswFlavor,
@@ -71,12 +73,12 @@ impl<'a> HnswCheckedSearchContext<'a> {
 }
 
 impl HnswIndex {
-	pub async fn new(
+	pub(crate) async fn new(
 		tx: &Transaction,
 		ikb: IndexKeyBase,
 		tb: String,
 		p: &HnswParams,
-	) -> Result<Self, Error> {
+	) -> Result<Self> {
 		Ok(Self {
 			dim: p.dimension as usize,
 			vector_type: p.vector_type,
@@ -89,15 +91,15 @@ impl HnswIndex {
 	pub async fn index_document(
 		&mut self,
 		tx: &Transaction,
-		id: &Id,
+		id: &RecordIdKey,
 		content: &[Value],
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Ensure the layers are up-to-date
 		self.hnsw.check_state(tx).await?;
 		// Resolve the doc_id
 		let doc_id = self.docs.resolve(tx, id).await?;
 		// Index the values
-		for value in content.iter().filter(|v| v.is_some()) {
+		for value in content.iter().filter(|v| !v.is_nullish()) {
 			// Extract the vector
 			let vector = Vector::try_from_value(self.vector_type, self.dim, value)?;
 			vector.check_dimension(self.dim)?;
@@ -111,13 +113,13 @@ impl HnswIndex {
 	pub(crate) async fn remove_document(
 		&mut self,
 		tx: &Transaction,
-		id: Id,
+		id: RecordIdKey,
 		content: &[Value],
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		if let Some(doc_id) = self.docs.remove(tx, id).await? {
 			// Ensure the layers are up-to-date
 			self.hnsw.check_state(tx).await?;
-			for v in content.iter().filter(|v| v.is_some()) {
+			for v in content.iter().filter(|v| !v.is_nullish()) {
 				// Extract the vector
 				let vector = Vector::try_from_value(self.vector_type, self.dim, v)?;
 				vector.check_dimension(self.dim)?;
@@ -130,42 +132,45 @@ impl HnswIndex {
 	}
 
 	// Ensure the layers are up-to-date
-	pub async fn check_state(&mut self, tx: &Transaction) -> Result<(), Error> {
+	pub async fn check_state(&mut self, tx: &Transaction) -> Result<()> {
 		self.hnsw.check_state(tx).await
 	}
 
+	#[expect(clippy::too_many_arguments)]
 	pub async fn knn_search(
 		&self,
+		db: &DatabaseDefinition,
 		tx: &Transaction,
 		stk: &mut Stk,
 		pt: &[Number],
 		k: usize,
 		ef: usize,
 		mut chk: HnswConditionChecker<'_>,
-	) -> Result<VecDeque<KnnIteratorResult>, Error> {
+	) -> Result<VecDeque<KnnIteratorResult>> {
 		// Extract the vector
 		let vector: SharedVector = Vector::try_from_vector(self.vector_type, pt)?.into();
 		vector.check_dimension(self.dim)?;
 		let search = HnswSearch::new(vector, k, ef);
 		// Do the search
-		let result = self.search(tx, stk, &search, &mut chk).await?;
+		let result = self.search(db, tx, stk, &search, &mut chk).await?;
 		let res = chk.convert_result(tx, &self.docs, result.docs).await?;
 		Ok(res)
 	}
 
 	pub(super) async fn search(
 		&self,
+		db: &DatabaseDefinition,
 		tx: &Transaction,
 		stk: &mut Stk,
 		search: &HnswSearch,
 		chk: &mut HnswConditionChecker<'_>,
-	) -> Result<KnnResult, Error> {
+	) -> Result<KnnResult> {
 		// Do the search
 		let neighbors = match chk {
 			HnswConditionChecker::Hnsw(_) => self.hnsw.knn_search(tx, search).await?,
 			HnswConditionChecker::HnswCondition(_) => {
 				self.hnsw
-					.knn_search_checked(tx, stk, search, &self.docs, &self.vec_docs, chk)
+					.knn_search_checked(db, tx, stk, search, &self.docs, &self.vec_docs, chk)
 					.await?
 			}
 		};
@@ -178,7 +183,7 @@ impl HnswIndex {
 		neighbors: Vec<(f64, ElementId)>,
 		n: usize,
 		chk: &mut HnswConditionChecker<'_>,
-	) -> Result<KnnResult, Error> {
+	) -> Result<KnnResult> {
 		let mut builder = KnnResultBuilder::new(n);
 		for (e_dist, e_id) in neighbors {
 			if builder.check_add(e_dist) {

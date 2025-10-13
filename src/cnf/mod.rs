@@ -1,3 +1,4 @@
+use std::env;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -29,7 +30,8 @@ pub const PKG_NAME: &str = "surrealdb";
 /// The public endpoint for the administration interface
 pub const APP_ENDPOINT: &str = "https://surrealdb.com/surrealist";
 
-/// How many concurrent network requests can be handled at once (default: 1,048,576)
+/// How many concurrent network requests can be handled at once (default:
+/// 1,048,576)
 pub static NET_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
 	lazy_env_parse!("SURREAL_NET_MAX_CONCURRENT_REQUESTS", usize, 1 << 20);
 
@@ -68,27 +70,70 @@ pub static HTTP_MAX_IMPORT_BODY_SIZE: LazyLock<usize> =
 /// Specifies the frequency with which ping messages are sent to the client
 pub const WEBSOCKET_PING_FREQUENCY: Duration = Duration::from_secs(5);
 
-/// What is the maximum WebSocket frame size (default: 16 MiB)
-pub static WEBSOCKET_MAX_FRAME_SIZE: LazyLock<usize> =
-	lazy_env_parse!(bytes, "SURREAL_WEBSOCKET_MAX_FRAME_SIZE", usize, 16 << 20);
-
 /// What is the maximum WebSocket message size (default: 128 MiB)
 pub static WEBSOCKET_MAX_MESSAGE_SIZE: LazyLock<usize> =
 	lazy_env_parse!(bytes, "SURREAL_WEBSOCKET_MAX_MESSAGE_SIZE", usize, 128 << 20);
 
-/// How many messages can be queued for sending down the WebSocket (default: 100)
+/// The size of the read buffer for WebSocket connections (default: 128 KiB)
+///
+/// This controls how much data can be buffered when reading from WebSocket connections.
+/// Larger values can improve performance for high-throughput connections but consume
+/// more memory per connection. The value can be configured via the
+/// `SURREAL_WEBSOCKET_READ_BUFFER_SIZE` environment variable.
+pub static WEBSOCKET_READ_BUFFER_SIZE: LazyLock<usize> =
+	lazy_env_parse!(bytes, "SURREAL_WEBSOCKET_READ_BUFFER_SIZE", usize, 128 * 1024);
+
+/// The size of the write buffer for WebSocket connections (default: 128 KiB)
+///
+/// This controls how much data can be buffered when writing to WebSocket connections.
+/// Larger values can improve performance for high-throughput connections but consume
+/// more memory per connection. The value can be configured via the
+/// `SURREAL_WEBSOCKET_WRITE_BUFFER_SIZE` environment variable.
+pub static WEBSOCKET_WRITE_BUFFER_SIZE: LazyLock<usize> =
+	lazy_env_parse!(bytes, "SURREAL_WEBSOCKET_WRITE_BUFFER_SIZE", usize, 128 * 1024);
+
+/// The maximum write buffer size before backpressure is applied (default: unlimited)
+///
+/// When the write buffer reaches this size, the WebSocket connection will apply
+/// backpressure to prevent memory exhaustion. By default, this is set to unlimited
+/// (`usize::MAX`), but it can be configured via the
+/// `SURREAL_WEBSOCKET_MAX_WRITE_BUFFER_SIZE` environment variable.
+///
+/// # Environment Variable
+///
+/// Set `SURREAL_WEBSOCKET_MAX_WRITE_BUFFER_SIZE` to configure this value. The value
+/// must be greater than `WEBSOCKET_WRITE_BUFFER_SIZE` to be effective. If not set
+/// or if the value is invalid, unlimited buffering is used.
+pub static WEBSOCKET_MAX_WRITE_BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
+	let buffer_size = || {
+		let var = env::var("SURREAL_WEBSOCKET_MAX_WRITE_BUFFER_SIZE").ok()?;
+		let size = var.parse().ok()?;
+		if size > *WEBSOCKET_WRITE_BUFFER_SIZE {
+			Some(size)
+		} else {
+			None
+		}
+	};
+	buffer_size().unwrap_or(usize::MAX)
+});
+
+/// How many messages can be queued for sending down the WebSocket (default:
+/// 100)
 pub static WEBSOCKET_RESPONSE_CHANNEL_SIZE: LazyLock<usize> =
 	lazy_env_parse!("SURREAL_WEBSOCKET_RESPONSE_CHANNEL_SIZE", usize, 100);
 
-/// How many responses can be buffered when delivering to the client (default: 0)
+/// How many responses can be buffered when delivering to the client (default:
+/// 0)
 pub static WEBSOCKET_RESPONSE_BUFFER_SIZE: LazyLock<usize> =
 	lazy_env_parse!("SURREAL_WEBSOCKET_RESPONSE_BUFFER_SIZE", usize, 0);
 
-/// How often are any buffered responses flushed to the WebSocket client (default: 3 ms)
+/// How often are any buffered responses flushed to the WebSocket client
+/// (default: 3 ms)
 pub static WEBSOCKET_RESPONSE_FLUSH_PERIOD: LazyLock<u64> =
 	lazy_env_parse!("SURREAL_WEBSOCKET_RESPONSE_FLUSH_PERIOD", u64, 3);
 
-/// The number of runtime worker threads to start (default: the number of CPU cores, minimum 4)
+/// The number of runtime worker threads to start (default: the number of CPU
+/// cores, minimum 4)
 pub static RUNTIME_WORKER_THREADS: LazyLock<usize> =
 	lazy_env_parse!("SURREAL_RUNTIME_WORKER_THREADS", usize, || {
 		std::cmp::max(4, num_cpus::get())
@@ -117,11 +162,13 @@ pub static TELEMETRY_PROVIDER: LazyLock<String> =
 pub static TELEMETRY_NAMESPACE: LazyLock<Option<String>> =
 	lazy_env_parse!("SURREAL_TELEMETRY_NAMESPACE", Option<String>);
 
-/// Whether to disable sending traces to the OpenTelemetry collector (default: false)
+/// Whether to disable sending traces to the OpenTelemetry collector (default:
+/// false)
 pub static TELEMETRY_DISABLE_TRACING: LazyLock<bool> =
 	lazy_env_parse!("SURREAL_TELEMETRY_DISABLE_TRACING", bool);
 
-/// Whether to disable sending metrics to the OpenTelemetry collector (default: false)
+/// Whether to disable sending metrics to the OpenTelemetry collector (default:
+/// false)
 pub static TELEMETRY_DISABLE_METRICS: LazyLock<bool> =
 	lazy_env_parse!("SURREAL_TELEMETRY_DISABLE_METRICS", bool);
 
@@ -134,3 +181,15 @@ pub static PKG_VERSION: LazyLock<String> =
 		}
 		_ => env!("CARGO_PKG_VERSION").to_owned(),
 	});
+
+/// Whether to enable Tokio Console
+pub static ENABLE_TOKIO_CONSOLE: LazyLock<bool> =
+	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_ENABLED", bool, false);
+
+/// The socket address that Tokio Console will bind on
+pub static TOKIO_CONSOLE_SOCKET_ADDR: LazyLock<Option<String>> =
+	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_SOCKET_ADDR", Option<String>);
+
+/// How long, in seconds, to retain data for completed events (default: 60)
+pub static TOKIO_CONSOLE_RETENTION: LazyLock<u64> =
+	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_RETENTION", u64, 60);

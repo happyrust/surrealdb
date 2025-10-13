@@ -1,90 +1,116 @@
+use std::ops::Bound;
+
+use anyhow::{Result, ensure};
+
+use super::args::{Any, Cast, Optional};
 use crate::cnf::GENERATION_ALLOCATION_LIMIT;
 use crate::err::Error;
 use crate::fnc::util::string;
-use crate::sql::value::Value;
-use crate::sql::{Number, Regex};
-
-use super::args::{Any, Cast, Optional};
+use crate::val::range::TypedRange;
+use crate::val::{Regex, Value};
 
 /// Returns `true` if a string of this length is too much to allocate.
-fn limit(name: &str, n: usize) -> Result<(), Error> {
-	if n > *GENERATION_ALLOCATION_LIMIT {
-		Err(Error::InvalidArguments {
+fn limit(name: &str, n: usize) -> Result<()> {
+	ensure!(
+		n <= *GENERATION_ALLOCATION_LIMIT,
+		Error::InvalidArguments {
 			name: name.to_owned(),
 			message: format!("Output must not exceed {} bytes.", *GENERATION_ALLOCATION_LIMIT),
-		})
-	} else {
-		Ok(())
-	}
+		}
+	);
+	Ok(())
 }
 
-pub fn concat(Any(args): Any) -> Result<Value, Error> {
-	let strings = args.into_iter().map(Value::as_string).collect::<Vec<_>>();
+pub fn capitalize((string,): (String,)) -> Result<Value> {
+	if string.is_empty() {
+		return Ok(string.into());
+	}
+
+	let mut new_str = String::with_capacity(string.len());
+	let mut is_previous_whitespace = true;
+
+	for c in string.chars() {
+		if is_previous_whitespace && c.is_lowercase() {
+			// Capitalize the character
+			for upper_c in c.to_uppercase() {
+				new_str.push(upper_c);
+			}
+		} else {
+			// Keep the character as-is
+			new_str.push(c);
+		}
+
+		is_previous_whitespace = c.is_whitespace();
+	}
+
+	Ok(new_str.into())
+}
+
+pub fn concat(Any(args): Any) -> Result<Value> {
+	let strings = args.into_iter().map(Value::into_raw_string).collect::<Vec<_>>();
 	limit("string::concat", strings.iter().map(String::len).sum::<usize>())?;
 	Ok(strings.concat().into())
 }
 
-pub fn contains((val, check): (String, String)) -> Result<Value, Error> {
+pub fn contains((val, check): (String, String)) -> Result<Value> {
 	Ok(val.contains(&check).into())
 }
 
-pub fn ends_with((val, chr): (String, String)) -> Result<Value, Error> {
+pub fn ends_with((val, chr): (String, String)) -> Result<Value> {
 	Ok(val.ends_with(&chr).into())
 }
 
-pub fn join(Any(args): Any) -> Result<Value, Error> {
-	let mut args = args.into_iter().map(Value::as_string);
+pub fn join(Any(args): Any) -> Result<Value> {
+	let mut args = args.into_iter().map(Value::into_raw_string);
 	let chr = args.next().ok_or_else(|| Error::InvalidArguments {
 		name: String::from("string::join"),
 		message: String::from("Expected at least one argument"),
 	})?;
 
-	let strings = args.collect::<Vec<_>>();
-	limit(
-		"string::join",
-		strings
-			.len()
-			.saturating_mul(chr.len())
-			.saturating_add(strings.iter().map(String::len).sum::<usize>()),
-	)?;
+	let mut res = args.next().unwrap_or_else(String::new);
 
-	// FIXME: Use intersperse to avoid intermediate allocation once stable
-	// https://github.com/rust-lang/rust/issues/79524
-	Ok(strings.join(&chr).into())
+	for a in args {
+		limit("string::join", res.len() + a.len() + chr.len())?;
+		res.push_str(&chr);
+		res.push_str(&a);
+	}
+
+	Ok(res.into())
 }
 
-pub fn len((string,): (String,)) -> Result<Value, Error> {
+pub fn len((string,): (String,)) -> Result<Value> {
 	let num = string.chars().count() as i64;
 	Ok(num.into())
 }
 
-pub fn lowercase((string,): (String,)) -> Result<Value, Error> {
+pub fn lowercase((string,): (String,)) -> Result<Value> {
 	Ok(string.to_lowercase().into())
 }
 
-pub fn repeat((val, num): (String, i64)) -> Result<Value, Error> {
+pub fn repeat((val, num): (String, i64)) -> Result<Value> {
 	//TODO: Deal with truncation of neg:
 	let num = num as usize;
 	limit("string::repeat", val.len().saturating_mul(num))?;
 	Ok(val.repeat(num).into())
 }
 
-pub fn matches((val, Cast(regex)): (String, Cast<Regex>)) -> Result<Value, Error> {
+pub fn matches((val, Cast(regex)): (String, Cast<Regex>)) -> Result<Value> {
 	Ok(regex.0.is_match(&val).into())
 }
 
-pub fn replace((val, search, replace): (String, Value, String)) -> Result<Value, Error> {
+pub fn replace((val, search, replace): (String, Value, String)) -> Result<Value> {
 	match search {
-		Value::Strand(search) => {
+		Value::String(search) => {
 			if replace.len() > search.len() {
 				let increase = replace.len() - search.len();
 				limit(
 					"string::replace",
-					val.len()
-						.saturating_add(val.matches(&search.0).count().saturating_mul(increase)),
+					val.len().saturating_add(
+						val.matches(search.as_str()).count().saturating_mul(increase),
+					),
 				)?;
 			}
-			Ok(val.replace(&search.0, &replace).into())
+			Ok(val.replace(search.as_str(), &replace).into())
 		}
 		Value::Regex(search) => {
 			let mut new_val = String::with_capacity(val.len());
@@ -108,242 +134,322 @@ pub fn replace((val, search, replace): (String, Value, String)) -> Result<Value,
 			limit("string::replace", new_val.len())?;
 			Ok(new_val.into())
 		}
-		_ => Err(Error::InvalidArguments {
+		_ => Err(anyhow::Error::new(Error::InvalidArguments {
 			name: "string::replace".to_string(),
 			message: format!(
 				"Argument 2 was the wrong type. Expected a string but found {}",
 				search
 			),
-		}),
+		})),
 	}
 }
-pub fn reverse((string,): (String,)) -> Result<Value, Error> {
+pub fn reverse((string,): (String,)) -> Result<Value> {
 	Ok(string.chars().rev().collect::<String>().into())
 }
 
 pub fn slice(
-	(val, Optional(beg), Optional(lim)): (String, Optional<i64>, Optional<i64>),
-) -> Result<Value, Error> {
+	(val, Optional(range_start), Optional(end)): (String, Optional<Value>, Optional<i64>),
+) -> Result<Value> {
+	let Some(range_start) = range_start else {
+		return Ok(val.into());
+	};
+
+	let range = if let Some(end) = end {
+		let start = range_start.coerce_to::<i64>().map_err(|e| Error::InvalidArguments {
+			name: String::from("array::range"),
+			message: format!("Argument 1 was the wrong type. {e}"),
+		})?;
+
+		TypedRange {
+			start: Bound::Included(start),
+			end: Bound::Excluded(end),
+		}
+	} else if range_start.is_range() {
+		// Condition checked above, unwrap cannot trigger.
+		let range = range_start.into_range().unwrap();
+		range.coerce_to_typed::<i64>().map_err(|e| Error::InvalidArguments {
+			name: String::from("array::range"),
+			message: format!("Argument 1 was the wrong type. {e}"),
+		})?
+	} else {
+		let start = range_start.coerce_to::<i64>().map_err(|e| Error::InvalidArguments {
+			name: String::from("array::range"),
+			message: format!("Argument 1 was the wrong type. {e}"),
+		})?;
+		TypedRange {
+			start: Bound::Included(start),
+			end: Bound::Unbounded,
+		}
+	};
+
 	// Only count the chars if we need to and only do it once.
 	let mut str_len_cache = None;
 	let mut str_len = || *str_len_cache.get_or_insert_with(|| val.chars().count() as i64);
 
-	let beg = if let Some(v) = beg {
-		if v < 0 {
-			str_len().saturating_add(v).max(0) as usize
-		} else {
-			v as usize
-		}
-	} else {
-		0
-	};
-
-	let take = match lim {
-		Some(v) => {
-			if v < 0 {
-				let len = str_len().saturating_add(v).max(0) as usize;
-				len.saturating_sub(beg)
+	let start = match range.start {
+		Bound::Included(x) => {
+			if x < 0 {
+				str_len().saturating_add(x).max(0) as usize
 			} else {
-				v as usize
+				x as usize
 			}
 		}
-		None => usize::MAX,
+		Bound::Excluded(x) => {
+			if x < 0 {
+				str_len().saturating_add(x).saturating_add(1).max(0) as usize
+			} else {
+				let Some(x) = x.checked_add(1) else {
+					return Ok(String::new().into());
+				};
+				x as usize
+			}
+		}
+		Bound::Unbounded => 0,
 	};
 
-	if take == 0 {
-		return Ok(String::new().into());
-	}
+	let end = match range.end {
+		Bound::Included(x) => {
+			if x < 0 {
+				str_len().saturating_add(x).max(0) as usize
+			} else {
+				x as usize
+			}
+		}
+		Bound::Excluded(x) => {
+			if x < 0 {
+				let end = str_len().saturating_add(x).saturating_sub(1);
+				if end < 0 {
+					return Ok(String::new().into());
+				}
+				end as usize
+			} else {
+				if x == 0 {
+					return Ok(String::new().into());
+				}
+				x.saturating_sub(1) as usize
+			}
+		}
+		Bound::Unbounded => usize::MAX,
+	};
 
-	Ok(val.chars().skip(beg).take(take).collect::<String>().into())
+	let len = end.saturating_add(1).saturating_sub(start);
+
+	Ok(val.chars().skip(start).take(len).collect::<String>().into())
 }
 
-pub fn slug((string,): (String,)) -> Result<Value, Error> {
+pub fn slug((string,): (String,)) -> Result<Value> {
 	Ok(string::slug::slug(string).into())
 }
 
-pub fn split((val, chr): (String, String)) -> Result<Value, Error> {
-	Ok(val.split(&chr).collect::<Vec<&str>>().into())
+pub fn split((val, chr): (String, String)) -> Result<Value> {
+	Ok(val.split(&chr).map(|x| Value::from(x.to_owned())).collect::<Vec<_>>().into())
 }
 
-pub fn starts_with((val, chr): (String, String)) -> Result<Value, Error> {
+pub fn starts_with((val, chr): (String, String)) -> Result<Value> {
 	Ok(val.starts_with(&chr).into())
 }
 
-pub fn trim((string,): (String,)) -> Result<Value, Error> {
+pub fn trim((string,): (String,)) -> Result<Value> {
 	Ok(string.trim().into())
 }
 
-pub fn uppercase((string,): (String,)) -> Result<Value, Error> {
+pub fn uppercase((string,): (String,)) -> Result<Value> {
 	Ok(string.to_uppercase().into())
 }
 
-pub fn words((string,): (String,)) -> Result<Value, Error> {
-	Ok(string.split_whitespace().collect::<Vec<&str>>().into())
+pub fn words((string,): (String,)) -> Result<Value> {
+	Ok(string.split_whitespace().map(|v| Value::from(v.to_owned())).collect::<Vec<_>>().into())
 }
 
 pub mod distance {
 
-	use crate::err::Error;
-	use crate::sql::Value;
-
+	use anyhow::Result;
 	use strsim;
+
+	use crate::err::Error;
+	use crate::val::Value;
 
 	/// Calculate the Damerau-Levenshtein distance between two strings
 	/// via [`strsim::damerau_levenshtein`].
-	pub fn damerau_levenshtein((a, b): (String, String)) -> Result<Value, Error> {
+	pub fn damerau_levenshtein((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::damerau_levenshtein(&a, &b).into())
 	}
 
-	/// Calculate the normalized Damerau-Levenshtein distance between two strings
-	/// via [`strsim::normalized_damerau_levenshtein`].
-	pub fn normalized_damerau_levenshtein((a, b): (String, String)) -> Result<Value, Error> {
+	/// Calculate the normalized Damerau-Levenshtein distance between two
+	/// strings via [`strsim::normalized_damerau_levenshtein`].
+	pub fn normalized_damerau_levenshtein((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::normalized_damerau_levenshtein(&a, &b).into())
 	}
 
 	/// Calculate the Hamming distance between two strings
 	/// via [`strsim::hamming`].
 	///
-	/// Will result in an [`Error::InvalidArguments`] if the given strings are of different lengths.
-	pub fn hamming((a, b): (String, String)) -> Result<Value, Error> {
+	/// Will result in an [`Error::InvalidArguments`] if the given strings are
+	/// of different lengths.
+	pub fn hamming((a, b): (String, String)) -> Result<Value> {
 		match strsim::hamming(&a, &b) {
 			Ok(v) => Ok(v.into()),
-			Err(_) => Err(Error::InvalidArguments {
+			Err(_) => Err(anyhow::Error::new(Error::InvalidArguments {
 				name: "string::distance::hamming".into(),
 				message: "Strings must be of equal length.".into(),
-			}),
+			})),
 		}
 	}
 
 	/// Calculate the Levenshtein distance between two strings
 	/// via [`strsim::levenshtein`].
-	pub fn levenshtein((a, b): (String, String)) -> Result<Value, Error> {
+	pub fn levenshtein((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::levenshtein(&a, &b).into())
 	}
 
 	/// Calculate the normalized Levenshtein distance between two strings
 	/// via [`strsim::normalized_levenshtein`].
-	pub fn normalized_levenshtein((a, b): (String, String)) -> Result<Value, Error> {
+	pub fn normalized_levenshtein((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::normalized_levenshtein(&a, &b).into())
 	}
 
 	/// Calculate the OSA distance &ndash; a variant of the Levenshtein distance
-	/// that allows for transposition of adjacent characters &ndash; between two strings
-	/// via [`strsim::osa_distance`].
-	pub fn osa_distance((a, b): (String, String)) -> Result<Value, Error> {
+	/// that allows for transposition of adjacent characters &ndash; between two
+	/// strings via [`strsim::osa_distance`].
+	pub fn osa_distance((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::osa_distance(&a, &b).into())
 	}
 }
 
 pub mod html {
-	use crate::err::Error;
-	use crate::sql::value::Value;
+	use anyhow::Result;
 
-	pub fn encode((arg,): (String,)) -> Result<Value, Error> {
+	use crate::val::Value;
+
+	pub fn encode((arg,): (String,)) -> Result<Value> {
 		Ok(ammonia::clean_text(&arg).into())
 	}
 
-	pub fn sanitize((arg,): (String,)) -> Result<Value, Error> {
+	pub fn sanitize((arg,): (String,)) -> Result<Value> {
 		Ok(ammonia::clean(&arg).into())
 	}
 }
 
 pub mod is {
-	use crate::err::Error;
-	use crate::fnc::args::Optional;
-	use crate::sql::value::Value;
-	use crate::sql::{Datetime, Thing};
-	use chrono::NaiveDateTime;
-	use regex::Regex;
-	use semver::Version;
 	use std::char;
 	use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 	use std::sync::LazyLock;
+
+	use anyhow::{Result, bail};
+	use chrono::NaiveDateTime;
+	use regex::Regex;
+	use semver::Version;
 	use ulid::Ulid;
 	use url::Url;
 	use uuid::Uuid;
 
+	use crate::err::Error;
+	use crate::fnc::args::Optional;
+	use crate::syn;
+	use crate::val::{Datetime, Value};
+
 	#[rustfmt::skip] static LATITUDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("^[-+]?([1-8]?\\d(\\.\\d+)?|90(\\.0+)?)$").unwrap());
 	#[rustfmt::skip] static LONGITUDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("^[-+]?(180(\\.0+)?|((1[0-7]\\d)|([1-9]?\\d))(\\.\\d+)?)$").unwrap());
 
-	pub fn alphanum((arg,): (String,)) -> Result<Value, Error> {
-		Ok(arg.chars().all(char::is_alphanumeric).into())
+	pub fn alphanum((arg,): (String,)) -> Result<Value> {
+		if arg.is_empty() {
+			Ok(Value::Bool(false))
+		} else {
+			Ok(arg.chars().all(char::is_alphanumeric).into())
+		}
 	}
 
-	pub fn alpha((arg,): (String,)) -> Result<Value, Error> {
-		Ok(arg.chars().all(char::is_alphabetic).into())
+	pub fn alpha((arg,): (String,)) -> Result<Value> {
+		if arg.is_empty() {
+			Ok(Value::Bool(false))
+		} else {
+			Ok(arg.chars().all(char::is_alphabetic).into())
+		}
 	}
 
-	pub fn ascii((arg,): (String,)) -> Result<Value, Error> {
-		Ok(arg.is_ascii().into())
+	pub fn ascii((arg,): (String,)) -> Result<Value> {
+		if arg.is_empty() {
+			Ok(Value::Bool(false))
+		} else {
+			Ok(arg.is_ascii().into())
+		}
 	}
 
-	pub fn datetime((arg, Optional(fmt)): (String, Optional<String>)) -> Result<Value, Error> {
+	pub fn datetime((arg, Optional(fmt)): (String, Optional<String>)) -> Result<Value> {
 		Ok(match fmt {
 			Some(fmt) => NaiveDateTime::parse_from_str(&arg, &fmt).is_ok().into(),
-			None => Datetime::try_from(arg.as_ref()).is_ok().into(),
+			None => arg.parse::<Datetime>().is_ok().into(),
 		})
 	}
 
-	pub fn domain((arg,): (String,)) -> Result<Value, Error> {
+	pub fn domain((arg,): (String,)) -> Result<Value> {
 		Ok(addr::parse_domain_name(arg.as_str()).is_ok().into())
 	}
 
-	pub fn email((arg,): (String,)) -> Result<Value, Error> {
+	pub fn email((arg,): (String,)) -> Result<Value> {
 		Ok(addr::parse_email_address(arg.as_str()).is_ok().into())
 	}
 
-	pub fn hexadecimal((arg,): (String,)) -> Result<Value, Error> {
-		Ok(arg.chars().all(|x| char::is_ascii_hexdigit(&x)).into())
+	pub fn hexadecimal((arg,): (String,)) -> Result<Value> {
+		if arg.is_empty() {
+			Ok(Value::Bool(false))
+		} else {
+			Ok(arg.chars().all(|x| char::is_ascii_hexdigit(&x)).into())
+		}
 	}
 
-	pub fn ip((arg,): (String,)) -> Result<Value, Error> {
+	pub fn ip((arg,): (String,)) -> Result<Value> {
 		Ok(arg.parse::<IpAddr>().is_ok().into())
 	}
 
-	pub fn ipv4((arg,): (String,)) -> Result<Value, Error> {
+	pub fn ipv4((arg,): (String,)) -> Result<Value> {
 		Ok(arg.parse::<Ipv4Addr>().is_ok().into())
 	}
 
-	pub fn ipv6((arg,): (String,)) -> Result<Value, Error> {
+	pub fn ipv6((arg,): (String,)) -> Result<Value> {
 		Ok(arg.parse::<Ipv6Addr>().is_ok().into())
 	}
 
-	pub fn latitude((arg,): (String,)) -> Result<Value, Error> {
+	pub fn latitude((arg,): (String,)) -> Result<Value> {
 		Ok(LATITUDE_RE.is_match(arg.as_str()).into())
 	}
 
-	pub fn longitude((arg,): (String,)) -> Result<Value, Error> {
+	pub fn longitude((arg,): (String,)) -> Result<Value> {
 		Ok(LONGITUDE_RE.is_match(arg.as_str()).into())
 	}
 
-	pub fn numeric((arg,): (String,)) -> Result<Value, Error> {
-		Ok(arg.chars().all(char::is_numeric).into())
+	pub fn numeric((arg,): (String,)) -> Result<Value> {
+		if arg.is_empty() {
+			Ok(Value::Bool(false))
+		} else {
+			Ok(arg.chars().all(char::is_numeric).into())
+		}
 	}
 
-	pub fn semver((arg,): (String,)) -> Result<Value, Error> {
+	pub fn semver((arg,): (String,)) -> Result<Value> {
 		Ok(Version::parse(arg.as_str()).is_ok().into())
 	}
 
-	pub fn url((arg,): (String,)) -> Result<Value, Error> {
+	pub fn url((arg,): (String,)) -> Result<Value> {
 		Ok(Url::parse(&arg).is_ok().into())
 	}
 
-	pub fn uuid((arg,): (String,)) -> Result<Value, Error> {
+	pub fn uuid((arg,): (String,)) -> Result<Value> {
 		Ok(Uuid::parse_str(arg.as_ref()).is_ok().into())
 	}
 
-	pub fn ulid((arg,): (String,)) -> Result<Value, Error> {
+	pub fn ulid((arg,): (String,)) -> Result<Value> {
 		Ok(Ulid::from_string(arg.as_ref()).is_ok().into())
 	}
 
-	pub fn record((arg, Optional(tb)): (String, Optional<Value>)) -> Result<Value, Error> {
-		let res = match Thing::try_from(arg) {
+	pub fn record((arg, Optional(tb)): (String, Optional<Value>)) -> Result<Value> {
+		let res = match syn::record_id(&arg) {
 			Ok(t) => match tb {
-				Some(Value::Strand(tb)) => t.tb == *tb,
-				Some(Value::Table(tb)) => t.tb == tb.0,
+				Some(Value::String(tb)) => t.table.as_str() == tb.as_str(),
+				Some(Value::Table(tb)) => t.table.as_str() == tb.as_str(),
 				Some(_) => {
-					return Err(Error::InvalidArguments {
-						name: "string::is::record()".into(),
+					bail!(Error::InvalidArguments {
+						name: "string::is_record()".into(),
 						message:
 							"Expected an optional string or table type for the second argument"
 								.into(),
@@ -359,54 +465,63 @@ pub mod is {
 }
 
 pub mod similarity {
+	use std::sync::LazyLock;
 
-	use crate::err::Error;
-	use crate::fnc::util::string::fuzzy::Fuzzy;
-	use crate::sql::Value;
+	use anyhow::Result;
+	use fuzzy_matcher::FuzzyMatcher;
+	use fuzzy_matcher::skim::SkimMatcherV2;
+
+	use crate::val::Value;
+	static MATCHER: LazyLock<SkimMatcherV2> =
+		LazyLock::new(|| SkimMatcherV2::default().ignore_case());
 
 	use strsim;
 
-	pub fn fuzzy((a, b): (String, String)) -> Result<Value, Error> {
-		Ok(a.as_str().fuzzy_score(b.as_str()).into())
+	pub fn fuzzy(arg: (String, String)) -> Result<Value> {
+		smithwaterman(arg)
 	}
 
 	/// Calculate the Jaro similarity between two strings
 	/// via [`strsim::jaro`].
-	pub fn jaro((a, b): (String, String)) -> Result<Value, Error> {
+	pub fn jaro((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::jaro(&a, &b).into())
 	}
 
 	/// Calculate the Jaro-Winkler similarity between two strings
 	/// via [`strsim::jaro_winkler`].
-	pub fn jaro_winkler((a, b): (String, String)) -> Result<Value, Error> {
+	pub fn jaro_winkler((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::jaro_winkler(&a, &b).into())
 	}
 
-	pub fn smithwaterman((a, b): (String, String)) -> Result<Value, Error> {
-		Ok(a.as_str().fuzzy_score(b.as_str()).into())
+	pub fn smithwaterman((a, b): (String, String)) -> Result<Value> {
+		Ok(MATCHER.fuzzy_match(&a, &b).unwrap_or(0).into())
 	}
 
 	/// Calculate the Sørensen-Dice similarity between two strings
 	/// via [`strsim::sorensen_dice`].
-	pub fn sorensen_dice((a, b): (String, String)) -> Result<Value, Error> {
+	pub fn sorensen_dice((a, b): (String, String)) -> Result<Value> {
 		Ok(strsim::sorensen_dice(&a, &b).into())
 	}
 }
 
 pub mod semver {
 
-	use crate::err::Error;
-	use crate::sql::Value;
+	use anyhow::Result;
 	use semver::Version;
 
-	fn parse_version(ver: &str, func: &str, msg: &str) -> Result<Version, Error> {
-		Version::parse(ver).map_err(|_| Error::InvalidArguments {
-			name: String::from(func),
-			message: String::from(msg),
-		})
+	use crate::err::Error;
+	use crate::val::Value;
+
+	fn parse_version(ver: &str, func: &str, msg: &str) -> Result<Version> {
+		Version::parse(ver)
+			.map_err(|_| Error::InvalidArguments {
+				name: String::from(func),
+				message: String::from(msg),
+			})
+			.map_err(anyhow::Error::new)
 	}
 
-	pub fn compare((left, right): (String, String)) -> Result<Value, Error> {
+	pub fn compare((left, right): (String, String)) -> Result<Value> {
 		let left = parse_version(
 			&left,
 			"string::semver::compare",
@@ -421,27 +536,28 @@ pub mod semver {
 		Ok((left.cmp(&right) as i32).into())
 	}
 
-	pub fn major((version,): (String,)) -> Result<Value, Error> {
+	pub fn major((version,): (String,)) -> Result<Value> {
 		parse_version(&version, "string::semver::major", "Invalid semantic version")
 			.map(|v| v.major.into())
 	}
 
-	pub fn minor((version,): (String,)) -> Result<Value, Error> {
+	pub fn minor((version,): (String,)) -> Result<Value> {
 		parse_version(&version, "string::semver::minor", "Invalid semantic version")
 			.map(|v| v.minor.into())
 	}
 
-	pub fn patch((version,): (String,)) -> Result<Value, Error> {
+	pub fn patch((version,): (String,)) -> Result<Value> {
 		parse_version(&version, "string::semver::patch", "Invalid semantic version")
 			.map(|v| v.patch.into())
 	}
 
 	pub mod inc {
-		use crate::err::Error;
-		use crate::fnc::string::semver::parse_version;
-		use crate::sql::Value;
+		use anyhow::Result;
 
-		pub fn major((version,): (String,)) -> Result<Value, Error> {
+		use crate::fnc::string::semver::parse_version;
+		use crate::val::Value;
+
+		pub fn major((version,): (String,)) -> Result<Value> {
 			parse_version(&version, "string::semver::inc::major", "Invalid semantic version").map(
 				|mut version| {
 					version.major += 1;
@@ -452,7 +568,7 @@ pub mod semver {
 			)
 		}
 
-		pub fn minor((version,): (String,)) -> Result<Value, Error> {
+		pub fn minor((version,): (String,)) -> Result<Value> {
 			parse_version(&version, "string::semver::inc::minor", "Invalid semantic version").map(
 				|mut version| {
 					version.minor += 1;
@@ -462,7 +578,7 @@ pub mod semver {
 			)
 		}
 
-		pub fn patch((version,): (String,)) -> Result<Value, Error> {
+		pub fn patch((version,): (String,)) -> Result<Value> {
 			parse_version(&version, "string::semver::inc::patch", "Invalid semantic version").map(
 				|mut version| {
 					version.patch += 1;
@@ -473,11 +589,12 @@ pub mod semver {
 	}
 
 	pub mod set {
-		use crate::err::Error;
-		use crate::fnc::string::semver::parse_version;
-		use crate::sql::Value;
+		use anyhow::Result;
 
-		pub fn major((version, value): (String, i64)) -> Result<Value, Error> {
+		use crate::fnc::string::semver::parse_version;
+		use crate::val::Value;
+
+		pub fn major((version, value): (String, i64)) -> Result<Value> {
 			// TODO: Deal with negative trunc:
 			let value = value as u64;
 			parse_version(&version, "string::semver::set::major", "Invalid semantic version").map(
@@ -488,7 +605,7 @@ pub mod semver {
 			)
 		}
 
-		pub fn minor((version, value): (String, i64)) -> Result<Value, Error> {
+		pub fn minor((version, value): (String, i64)) -> Result<Value> {
 			// TODO: Deal with negative trunc:
 			let value = value as u64;
 			parse_version(&version, "string::semver::set::minor", "Invalid semantic version").map(
@@ -499,7 +616,7 @@ pub mod semver {
 			)
 		}
 
-		pub fn patch((version, value): (String, i64)) -> Result<Value, Error> {
+		pub fn patch((version, value): (String, i64)) -> Result<Value> {
 			// TODO: Deal with negative trunc:
 			let value = value as u64;
 
@@ -513,70 +630,18 @@ pub mod semver {
 	}
 }
 
-#[inline]
-pub fn db1_dehash(hash: u32) -> String {
-	let mut result = String::new();
-	if hash > 0x171FAD39 {
-		let mut k = ((hash - 0x171FAD39) % 0x1000000) as i32;
-		result.push(':');
-		for _i in 0..6 {
-			if k <= 0 {
-				break;
-			}
-			result.push((k % 64 + 32) as u8 as char);
-			k /= 64;
-		}
-	} else {
-		if hash <= 0x81BF1 {
-			return "".to_string();
-		}
-		let mut k = (hash - 0x81BF1) as i32;
-		while k > 0 {
-			result.push((k % 27 + 64) as u8 as char);
-			k /= 27;
-		}
-	}
-	result
-}
-
-pub fn e3d_dehash((number,): (Number,)) -> Result<Value, Error> {
-	Ok(db1_dehash(u32::try_from(number).unwrap_or_default()).into())
-}
-
-#[inline]
-pub fn db1_hash(hash_str: &str) -> u32 {
-	let chars = hash_str.as_bytes();
-	if chars.len() < 1 {
-		return 0; //出错的暂时用0 表达
-	}
-	let mut val = 0i64;
-	let mut i = (chars.len() - 1) as i32;
-	while i >= 0 {
-		val = val.overflowing_mul(27).0 + (chars[i as usize] as i64 - 64);
-		i -= 1;
-	}
-	val.saturating_add_unsigned(0x81BF1) as u32
-}
-
-pub fn e3d_hash((string,): (String,)) -> Result<Value, Error> {
-	Ok(db1_hash(string.as_str()).into())
-}
-
 #[cfg(test)]
 mod tests {
-	use super::{contains, matches, replace, slice};
-	use crate::{
-		err::Error,
-		fnc::args::{Cast, Optional},
-		sql::{Number, Value},
-	};
+	use super::{matches, replace, slice};
+	use crate::fnc::args::{Cast, Optional};
+	use crate::val::Value;
 
 	#[test]
 	fn string_slice() {
 		#[track_caller]
 		fn test(initial: &str, beg: Option<i64>, end: Option<i64>, expected: &str) {
 			assert_eq!(
-				slice((initial.to_owned(), Optional(beg), Optional(end))).unwrap(),
+				slice((initial.to_owned(), Optional(beg.map(Value::from)), Optional(end))).unwrap(),
 				Value::from(expected)
 			);
 		}
@@ -584,36 +649,18 @@ mod tests {
 		let string = "abcdefg";
 		test(string, None, None, string);
 		test(string, Some(2), None, &string[2..]);
-		test(string, Some(2), Some(3), &string[2..5]);
+		test(string, Some(2), Some(3), &string[2..3]);
 		test(string, Some(2), Some(-1), "cdef");
 		test(string, Some(-2), None, "fg");
-		test(string, Some(-4), Some(2), "de");
+		test(string, Some(-4), Some(2), "");
 		test(string, Some(-4), Some(-1), "def");
 
 		let string = "你好世界";
 		test(string, None, None, string);
 		test(string, Some(1), None, "好世界");
 		test(string, Some(-1), None, "界");
-		test(string, Some(-2), Some(1), "世");
-	}
-
-	#[test]
-	fn string_contains() {
-		#[track_caller]
-		fn test(base: &str, contained: &str, expected: bool) {
-			assert_eq!(
-				contains((base.to_string(), contained.to_string())).unwrap(),
-				Value::from(expected)
-			);
-		}
-
-		test("", "", true);
-		test("", "a", false);
-		test("a", "", true);
-		test("abcde", "bcd", true);
-		test("abcde", "cbcd", false);
-		test("好世界", "世", true);
-		test("好世界", "你好", false);
+		test(string, Some(-2), Some(1), "");
+		test(string, Some(-2), Some(3), "世");
 	}
 
 	#[test]
@@ -632,21 +679,6 @@ mod tests {
 
 		test("foo bar", Value::Regex("foo".parse().unwrap()), "bar", "bar bar");
 		test("foo bar", "bar".into(), "foo", "foo foo");
-	}
-
-	#[test]
-	fn string_replace_limit() {
-		let r = replace(("A".repeat(1000), Value::Regex("()".parse().unwrap()), "B".repeat(10000)));
-		match r {
-			Err(Error::InvalidArguments {
-				name,
-				message,
-			}) => {
-				assert_eq!(name, "string::replace");
-				assert_eq!(message, "Output must not exceed 1048576 bytes.");
-			}
-			_ => panic!("Unexpected result: {:?}", r),
-		}
 	}
 
 	#[test]
@@ -669,166 +701,21 @@ mod tests {
 	}
 
 	#[test]
-	fn is_alphanum() {
-		let value = super::is::alphanum((String::from("abc123"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::alphanum((String::from("y%*"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_alpha() {
-		let value = super::is::alpha((String::from("abc"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::alpha((String::from("1234"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_ascii() {
-		let value = super::is::ascii((String::from("abc"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::ascii((String::from("中国"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_domain() {
-		let value = super::is::domain((String::from("食狮.中国"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::domain((String::from("example-.com"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_email() {
-		let input = (String::from("user@[fd79:cdcb:38cc:9dd:f686:e06d:32f3:c123]"),);
-		let value = super::is::email(input).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let input = (String::from("john..doe@example.com"),);
-		let value = super::is::email(input).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_hexadecimal() {
-		let value = super::is::hexadecimal((String::from("00FF00"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::hexadecimal((String::from("SurrealDB"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_ip() {
-		let value = super::is::ip((String::from("127.0.0.1"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::ip((String::from("127.0.0"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_ipv4() {
-		let value = super::is::ipv4((String::from("127.0.0.1"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::ipv4((String::from("127.0.0"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_ipv6() {
-		let value = super::is::ipv6((String::from("::1"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::ipv6((String::from("200t:db8::"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_latitude() {
-		let value = super::is::latitude((String::from("-0.118092"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::latitude((String::from("12345"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_longitude() {
-		let value = super::is::longitude((String::from("91.509865"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::longitude((String::from("-91.509865"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::longitude((String::from("-180.00000"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::longitude((String::from("-180.00001"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-
-		let value = super::is::longitude((String::from("180.00000"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::longitude((String::from("180.00001"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-
-		let value = super::is::longitude((String::from("12345"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_numeric() {
-		let value = super::is::numeric((String::from("12345"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::numeric((String::from("abcde"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_semver() {
-		let value = super::is::semver((String::from("1.0.0"),)).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let value = super::is::semver((String::from("1.0"),)).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
-	fn is_uuid() {
-		let input = (String::from("123e4567-e89b-12d3-a456-426614174000"),);
-		let value = super::is::uuid(input).unwrap();
-		assert_eq!(value, Value::Bool(true));
-
-		let input = (String::from("foo-bar"),);
-		let value = super::is::uuid(input).unwrap();
-		assert_eq!(value, Value::Bool(false));
-	}
-
-	#[test]
 	fn html_encode() {
 		let value = super::html::encode((String::from("<div>Hello world!</div>"),)).unwrap();
-		assert_eq!(value, Value::Strand("&lt;div&gt;Hello&#32;world!&lt;&#47;div&gt;".into()));
+		assert_eq!(value, Value::String("&lt;div&gt;Hello&#32;world!&lt;&#47;div&gt;".into()));
 
 		let value = super::html::encode((String::from("SurrealDB"),)).unwrap();
-		assert_eq!(value, Value::Strand("SurrealDB".into()));
+		assert_eq!(value, Value::String("SurrealDB".into()));
 	}
 
 	#[test]
 	fn html_sanitize() {
 		let value = super::html::sanitize((String::from("<div>Hello world!</div>"),)).unwrap();
-		assert_eq!(value, Value::Strand("<div>Hello world!</div>".into()));
+		assert_eq!(value, Value::String("<div>Hello world!</div>".into()));
 
 		let value = super::html::sanitize((String::from("XSS<script>attack</script>"),)).unwrap();
-		assert_eq!(value, Value::Strand("XSS".into()));
+		assert_eq!(value, Value::String("XSS".into()));
 	}
 
 	#[test]
@@ -877,15 +764,5 @@ mod tests {
 
 		let value = super::semver::set::patch((String::from("1.2.3"), 9)).unwrap();
 		assert_eq!(value, Value::from("1.2.9"));
-	}
-
-
-	#[test]
-	fn db1_hash_dehash() {
-		let value = super::e3d_dehash( (Number::from(0x107684ca), )).unwrap();
-		dbg!(&value);
-
-		let value = super::e3d_hash( (String::from("ELBO"), )).unwrap();
-		dbg!(value);
 	}
 }

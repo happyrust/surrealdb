@@ -1,6 +1,6 @@
+use std::sync::{LazyLock, OnceLock};
+
 use criterion::Criterion;
-use std::sync::LazyLock;
-use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 mod lib;
@@ -30,7 +30,10 @@ fn rt() -> &'static Runtime {
 
 /// Create a benchmark group for the given target.
 pub(super) fn benchmark_group(c: &mut Criterion, target: String) {
-	println!("### Benchmark config: target={}, num_ops={}, duration={}, sample_size={}, worker_threads={} ###", target, *NUM_OPS, *DURATION_SECS, *SAMPLE_SIZE, *WORKER_THREADS);
+	println!(
+		"### Benchmark config: target={}, num_ops={}, duration={}, sample_size={}, worker_threads={} ###",
+		target, *NUM_OPS, *DURATION_SECS, *SAMPLE_SIZE, *WORKER_THREADS
+	);
 
 	match &target {
 		t if t.starts_with("lib") => lib::benchmark_group(c, target),

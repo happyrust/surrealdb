@@ -1,117 +1,17 @@
 //! Functionality for connecting to local and remote databases
 
-use method::BoxFuture;
-use semver::BuildMetadata;
-use semver::Version;
-use semver::VersionReq;
 use std::fmt;
 use std::fmt::Debug;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+// Removed anyhow::ensure - will implement custom ensure macro if needed
+use method::BoxFuture;
+use semver::{BuildMetadata, Version, VersionReq};
 use tokio::sync::watch;
 
-macro_rules! transparent_wrapper{
-	(
-		$(#[$m:meta])*
-		$vis:vis struct $name:ident($field_vis:vis $inner:ty)
-	) => {
-		$(#[$m])*
-		#[repr(transparent)]
-		$vis struct $name($field_vis $inner);
-
-		#[allow(dead_code)]
-		impl $name{
-			#[doc(hidden)]
-			pub fn from_inner(inner: $inner) -> Self{
-				$name(inner)
-			}
-
-			#[doc(hidden)]
-			pub fn from_inner_ref(inner: &$inner) -> &Self{
-				unsafe{
-					std::mem::transmute::<&$inner,&$name>(inner)
-				}
-			}
-
-			#[doc(hidden)]
-			pub fn from_inner_mut(inner: &mut $inner) -> &mut Self{
-				unsafe{
-					std::mem::transmute::<&mut $inner,&mut $name>(inner)
-				}
-			}
-
-			#[doc(hidden)]
-			pub fn into_inner(self) -> $inner{
-				self.0
-			}
-
-			#[doc(hidden)]
-			pub fn into_inner_ref(&self) -> &$inner{
-				&self.0
-			}
-
-			#[doc(hidden)]
-			pub fn into_inner_mut(&mut self) -> &mut $inner{
-				&mut self.0
-			}
-		}
-
-		impl std::fmt::Display for $name{
-			fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result{
-				self.0.fmt(fmt)
-			}
-		}
-		impl std::fmt::Debug for $name{
-			fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result{
-				self.0.fmt(fmt)
-			}
-		}
-	};
-}
-
-macro_rules! impl_serialize_wrapper {
-	($ty:ty) => {
-		impl ::revision::Revisioned for $ty {
-			fn revision() -> u16 {
-				CoreValue::revision()
-			}
-
-			fn serialize_revisioned<W: std::io::Write>(
-				&self,
-				w: &mut W,
-			) -> Result<(), revision::Error> {
-				self.0.serialize_revisioned(w)
-			}
-
-			fn deserialize_revisioned<R: std::io::Read>(r: &mut R) -> Result<Self, revision::Error>
-			where
-				Self: Sized,
-			{
-				::revision::Revisioned::deserialize_revisioned(r).map(Self::from_inner)
-			}
-		}
-
-		impl ::serde::Serialize for $ty {
-			fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-			where
-				S: ::serde::ser::Serializer,
-			{
-				self.0.serialize(serializer)
-			}
-		}
-
-		impl<'de> ::serde::de::Deserialize<'de> for $ty {
-			fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-			where
-				D: ::serde::de::Deserializer<'de>,
-			{
-				Ok(Self::from_inner(::serde::de::Deserialize::deserialize(deserializer)?))
-			}
-		}
-	};
-}
+use crate::Result;
 
 pub mod engine;
 pub mod err;
@@ -119,20 +19,14 @@ pub mod err;
 pub mod headers;
 pub mod method;
 pub mod opt;
-pub mod value;
 
 mod conn;
 
+pub use method::query::IndexedResults;
+
 use self::conn::Router;
 use self::err::Error;
-use self::opt::Endpoint;
-use self::opt::EndpointKind;
-use self::opt::WaitFor;
-
-pub use method::query::Response;
-
-/// A specialized `Result` type
-pub type Result<T> = std::result::Result<T, crate::Error>;
+use self::opt::{Endpoint, EndpointKind, WaitFor};
 
 // Channel for waiters
 type Waiter = (watch::Sender<Option<WaitFor>>, watch::Receiver<Option<WaitFor>>);
@@ -140,7 +34,7 @@ type Waiter = (watch::Sender<Option<WaitFor>>, watch::Receiver<Option<WaitFor>>)
 const SUPPORTED_VERSIONS: (&str, &str) = (">=1.2.0, <4.0.0", "20230701.55918b7c");
 
 /// Connection trait implemented by supported engines
-pub trait Connection: conn::Connection {}
+pub trait Connection: conn::Sealed {}
 
 /// The future returned when creating a new SurrealDB instance
 #[derive(Debug)]
@@ -229,7 +123,7 @@ where
 		Box::pin(async move {
 			// Avoid establishing another connection if already connected
 			if self.surreal.inner.router.get().is_some() {
-				return Err(Error::AlreadyConnected.into());
+				return Err(Error::AlreadyConnected);
 			}
 			let endpoint = self.address?;
 			let endpoint_kind = EndpointKind::from(endpoint.url.scheme());
@@ -270,9 +164,9 @@ struct Inner {
 
 /// A database client instance for embedded or remote databases.
 ///
-/// See [Running SurrealDB embedded in Rust](crate#running-surrealdb-embedded-in-rust)
-/// for tips on how to optimize performance for the client when working
-/// with embedded instances.
+/// See [Running SurrealDB embedded in
+/// Rust](crate#running-surrealdb-embedded-in-rust) for tips on how to optimize
+/// performance for the client when working with embedded instances.
 pub struct Surreal<C: Connection> {
 	inner: Arc<Inner>,
 	engine: PhantomData<C>,
@@ -334,14 +228,14 @@ where
 			return Err(Error::VersionMismatch {
 				server_version: version.clone(),
 				supported_versions: versions.to_owned(),
-			}
-			.into());
-		} else if !server_build.is_empty() && server_build < &build_meta {
+			});
+		}
+
+		if !server_build.is_empty() && server_build < &build_meta {
 			return Err(Error::BuildMetadataMismatch {
 				server_metadata: server_build.clone(),
 				supported_metadata: build_meta,
-			}
-			.into());
+			});
 		}
 		Ok(())
 	}

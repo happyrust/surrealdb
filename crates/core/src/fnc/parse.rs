@@ -1,10 +1,11 @@
 pub mod email {
 
-	use crate::err::Error;
-	use crate::sql::value::Value;
 	use addr::email::Host;
+	use anyhow::Result;
 
-	pub fn host((string,): (String,)) -> Result<Value, Error> {
+	use crate::val::Value;
+
+	pub fn host((string,): (String,)) -> Result<Value> {
 		// Parse the email address
 		Ok(match addr::parse_email_address(&string) {
 			// Return the host part
@@ -16,7 +17,7 @@ pub mod email {
 		})
 	}
 
-	pub fn user((string,): (String,)) -> Result<Value, Error> {
+	pub fn user((string,): (String,)) -> Result<Value> {
 		// Parse the email address
 		Ok(match addr::parse_email_address(&string) {
 			// Return the user part
@@ -27,29 +28,32 @@ pub mod email {
 
 	#[cfg(test)]
 	mod tests {
+		use super::*;
+
 		#[test]
 		fn host() {
 			let input = (String::from("john.doe@example.com"),);
 			let value = super::host(input).unwrap();
-			assert_eq!(value, "example.com".into());
+			assert_eq!(value, Value::from("example.com"));
 		}
 
 		#[test]
 		fn user() {
 			let input = (String::from("john.doe@example.com"),);
 			let value = super::user(input).unwrap();
-			assert_eq!(value, "john.doe".into());
+			assert_eq!(value, Value::from("john.doe"));
 		}
 	}
 }
 
 pub mod url {
 
-	use crate::err::Error;
-	use crate::sql::value::Value;
+	use anyhow::Result;
 	use url::Url;
 
-	pub fn domain((string,): (String,)) -> Result<Value, Error> {
+	use crate::val::Value;
+
+	pub fn domain((string,): (String,)) -> Result<Value> {
 		match Url::parse(&string) {
 			Ok(v) => match v.domain() {
 				Some(v) => Ok(v.into()),
@@ -59,7 +63,7 @@ pub mod url {
 		}
 	}
 
-	pub fn fragment((string,): (String,)) -> Result<Value, Error> {
+	pub fn fragment((string,): (String,)) -> Result<Value> {
 		// Parse the URL
 		match Url::parse(&string) {
 			Ok(v) => match v.fragment() {
@@ -70,7 +74,7 @@ pub mod url {
 		}
 	}
 
-	pub fn host((string,): (String,)) -> Result<Value, Error> {
+	pub fn host((string,): (String,)) -> Result<Value> {
 		// Parse the URL
 		match Url::parse(&string) {
 			Ok(v) => match v.host_str() {
@@ -81,7 +85,7 @@ pub mod url {
 		}
 	}
 
-	pub fn path((string,): (String,)) -> Result<Value, Error> {
+	pub fn path((string,): (String,)) -> Result<Value> {
 		// Parse the URL
 		match Url::parse(&string) {
 			Ok(v) => Ok(v.path().into()),
@@ -89,7 +93,7 @@ pub mod url {
 		}
 	}
 
-	pub fn port((string,): (String,)) -> Result<Value, Error> {
+	pub fn port((string,): (String,)) -> Result<Value> {
 		// Parse the URL
 		match Url::parse(&string) {
 			Ok(v) => match v.port_or_known_default() {
@@ -100,7 +104,7 @@ pub mod url {
 		}
 	}
 
-	pub fn query((string,): (String,)) -> Result<Value, Error> {
+	pub fn query((string,): (String,)) -> Result<Value> {
 		// Parse the URL
 		match Url::parse(&string) {
 			Ok(v) => match v.query() {
@@ -111,7 +115,7 @@ pub mod url {
 		}
 	}
 
-	pub fn scheme((string,): (String,)) -> Result<Value, Error> {
+	pub fn scheme((string,): (String,)) -> Result<Value> {
 		// Parse the URL
 		match Url::parse(&string) {
 			Ok(v) => Ok(v.scheme().into()),
@@ -121,24 +125,24 @@ pub mod url {
 
 	#[cfg(test)]
 	mod tests {
-		use crate::sql::value::Value;
+		use crate::val::Value;
 
 		#[test]
 		fn port_default_port_specified() {
 			let value = super::port(("http://www.google.com:80".to_string(),)).unwrap();
-			assert_eq!(value, 80.into());
+			assert_eq!(value, Value::from(80));
 		}
 
 		#[test]
 		fn port_nondefault_port_specified() {
 			let value = super::port(("http://www.google.com:8080".to_string(),)).unwrap();
-			assert_eq!(value, 8080.into());
+			assert_eq!(value, Value::from(8080));
 		}
 
 		#[test]
 		fn port_no_port_specified() {
 			let value = super::port(("http://www.google.com".to_string(),)).unwrap();
-			assert_eq!(value, 80.into());
+			assert_eq!(value, Value::from(80));
 		}
 
 		#[test]

@@ -1,45 +1,46 @@
 use std::fmt::Display;
 use std::sync::Arc;
 
+use crate::catalog::{DatabaseId, NamespaceId, TableDefinition};
 use crate::dbs::Session;
+use crate::expr::order::{OrderList, Ordering};
+use crate::expr::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
+use crate::expr::{self, Cond, Expr, Fields, Idiom, Kind, LogicalPlan, Part, Table};
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
 use crate::kvs::{Datastore, Transaction};
-use crate::sql::order::{OrderList, Ordering};
-use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
-use crate::sql::{self, Table};
-use crate::sql::{Cond, Fields};
-use crate::sql::{Expression, Value as SqlValue};
-use crate::sql::{Idiom, Kind};
-use crate::sql::{Statement, Thing};
+use crate::sql::BinaryOperator;
+use crate::val::{RecordId, Value as SqlValue};
 use async_graphql::dynamic::indexmap::IndexMap;
-use async_graphql::dynamic::FieldFuture;
-use async_graphql::dynamic::InputValue;
-use async_graphql::dynamic::TypeRef;
-use async_graphql::dynamic::{Enum, FieldValue, Type};
-use async_graphql::dynamic::{Field, ResolverContext};
-use async_graphql::dynamic::{InputObject, Object};
-use async_graphql::Name;
-use async_graphql::Value as GqlValue;
+use async_graphql::dynamic::{
+	Enum, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, ResolverContext, Type,
+	TypeRef,
+};
+use async_graphql::{Name, Value as GqlValue};
 
-use super::error::{resolver_error, GqlError};
+use super::error::{GqlError, resolver_error};
 use super::ext::IntoExt;
 use super::schema::{gql_to_sql_kind, sql_value_to_gql_value};
 use crate::gql::error::internal_error;
-use crate::gql::utils::{field_val_erase_owned, ErasedRecord, GQLTx, GqlValueUtils};
+use crate::gql::utils::{ErasedRecord, GQLTx, GqlValueUtils, field_val_erase_owned};
 
-macro_rules! order {
-	(asc, $field:expr) => {{
-		let mut tmp = sql::Order::default();
-		tmp.value = $field.into();
-		tmp.direction = true;
-		tmp
-	}};
-	(desc, $field:expr) => {{
-		let mut tmp = sql::Order::default();
-		tmp.value = $field.into();
-		tmp
-	}};
+fn order_asc<T>(t: T) -> expr::Order
+where
+	Value: From<T>,
+{
+	let mut tmp = expr::Order::default();
+	tmp.value = t.into();
+	tmp.direction = true;
+	tmp
+}
+
+fn order_desc<T>(t: T) -> expr::Order
+where
+	Value: From<T>,
+{
+	let mut tmp = expr::Order::default();
+	tmp.value = t.into();
+	tmp
 }
 
 macro_rules! limit_input {
@@ -66,12 +67,12 @@ fn filter_name_from_table(tb_name: impl Display) -> String {
 
 #[expect(clippy::too_many_arguments)]
 pub async fn process_tbs(
-	tbs: Arc<[DefineTableStatement]>,
+	tbs: Arc<[TableDefinition]>,
 	mut query: Object,
 	types: &mut Vec<Type>,
 	tx: &Transaction,
-	ns: &str,
-	db: &str,
+	ns: NamespaceId,
+	db: DatabaseId,
 	session: &Session,
 	datastore: &Arc<Datastore>,
 ) -> Result<Object, GqlError> {
@@ -107,7 +108,7 @@ pub async fn process_tbs(
 		types.push(Type::InputObject(filter_id()));
 
 		let sess1 = session.to_owned();
-		let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
+		let fds = tx.all_tb_fields(ns, db, &tb.name, None).await?;
 		let fds1 = fds.clone();
 		let kvs1 = datastore.clone();
 
@@ -146,10 +147,10 @@ pub async fn process_tbs(
 										return Err("Found both ASC and DESC in order".into());
 									}
 									(Some(GqlValue::Enum(a)), None) => {
-										orders.push(order!(asc, a.as_str()))
+										orders.push(order_asc(a.as_str()))
 									}
 									(None, Some(GqlValue::Enum(d))) => {
-										orders.push(order!(desc, d.as_str()))
+										orders.push(order_desc(d.as_str()))
 									}
 									(_, _) => {
 										break;
@@ -188,24 +189,23 @@ pub async fn process_tbs(
                     trace!("parsed filter: {cond:?}");
 
                     // SELECT VALUE id FROM ...
-                    let ast = Statement::Select({
-                        SelectStatement {
-                            what: vec![SqlValue::Table(tb_name.intox())].into(),
-                            expr: Fields(
-                                vec![sql::Field::Single {
-                                    expr: SqlValue::Idiom(Idiom::from("id")),
+                    let ast = expr::Expr::Select(
+                        Box::new(SelectStatement {
+                            what: vec![Expr::Table(tb_name.intox())].into(),
+                            expr: Fields{
+								fields: vec![expr::Field::Single {
+                                    expr: expr::Expr::Idiom(Idiom::from("id")),
                                     alias: None,
                                 }],
-                                // this means the `value` keyword
-                                true,
-                            ),
+                                value: true,
+                            },
                             order: orders.map(|x| Ordering::Order(OrderList(x))),
                             cond,
                             limit,
                             start,
                             ..Default::default()
-                        }
-                    });
+                        })
+                    );
 
                     trace!("generated query ast: {ast:?}");
 
@@ -240,7 +240,7 @@ pub async fn process_tbs(
                 })
             },
         )
-        .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
+        .description(if let Some(c) = &tb.comment { c.to_string() } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
         .argument(limit_input!())
         .argument(start_input!())
         .argument(InputValue::new("order", TypeRef::named(&table_order_name)))
@@ -249,52 +249,58 @@ pub async fn process_tbs(
 
 		let sess2 = session.to_owned();
 		let kvs2 = datastore.to_owned();
-		query =
-			query.field(
-				Field::new(
-					format!("_get_{}", tb.name),
-					TypeRef::named(tb.name.to_string()),
-					move |ctx| {
-						let tb_name = second_tb_name.clone();
-						let kvs2 = kvs2.clone();
-						FieldFuture::new({
-							let sess2 = sess2.clone();
-							async move {
-								let gtx = GQLTx::new(&kvs2, &sess2).await?;
+		query = query.field(
+			Field::new(
+				format!("_get_{}", tb.name),
+				TypeRef::named(tb.name.to_string()),
+				move |ctx| {
+					let tb_name = second_tb_name.clone();
+					let kvs2 = kvs2.clone();
+					FieldFuture::new({
+						let sess2 = sess2.clone();
+						async move {
+							let gtx = GQLTx::new(&kvs2, &sess2).await?;
 
-								let args = ctx.args.as_index_map();
-								let id = match args.get("id").and_then(GqlValueUtils::as_string) {
-									Some(i) => i,
-									None => {
-										return Err(internal_error(
-											"Schema validation failed: No id found in _get_",
-										)
-										.into());
-									}
-								};
-								let thing = match id.clone().try_into() {
-									Ok(t) => t,
-									Err(_) => Thing::from((tb_name, id)),
-								};
-
-								match gtx.get_record_field(thing, "id").await? {
-									SqlValue::Thing(t) => {
-										let erased: ErasedRecord = (gtx, t);
-										Ok(Some(field_val_erase_owned(erased)))
-									}
-									_ => Ok(None),
+							let args = ctx.args.as_index_map();
+							let id = match args.get("id").and_then(GqlValueUtils::as_string) {
+								Some(i) => i,
+								None => {
+									return Err(internal_error(
+										"Schema validation failed: No id found in _get_",
+									)
+									.into());
 								}
+							};
+							// TODO: Parse record id.
+							let thing = match id.clone().try_into() {
+								Ok(t) => t,
+								Err(_) => RecordId {
+									table: tb_name,
+									key: RecordIdKey::String(id),
+								},
+							};
+
+							match gtx.get_record_field(thing, Part::Field("id".to_owned())).await? {
+								SqlValue::RecordId(t) => {
+									let erased: ErasedRecord = (gtx, t);
+									Ok(Some(field_val_erase_owned(erased)))
+								}
+								_ => Ok(None),
 							}
-						})
-					},
+						}
+					})
+				},
+			)
+			.description(if let Some(c) = &tb.comment {
+				c.to_string()
+			} else {
+				format!(
+					"Generated from table `{}`\nallows querying a single record in a table by ID",
+					tb.name
 				)
-				.description(if let Some(ref c) = &tb.comment {
-					format!("{c}")
-				} else {
-					format!("Generated from table `{}`\nallows querying a single record in a table by ID", tb.name)
-				})
-				.argument(id_input!()),
-			);
+			})
+			.argument(id_input!()),
+		);
 
 		let mut table_ty_obj = Object::new(tb.name.to_string())
 			.field(Field::new(
@@ -369,13 +375,13 @@ pub async fn process_tbs(
 						}
 					};
 
-					let thing: Thing = match id.clone().try_into() {
+					let thing: RecordId = match id.clone().try_into() {
 						Ok(t) => t,
 						Err(_) => return Err(resolver_error(format!("invalid id: {id}")).into()),
 					};
 
 					match gtx.get_record_field(thing, "id").await? {
-						SqlValue::Thing(t) => {
+						SqlValue::RecordId(t) => {
 							let ty = t.tb.to_string();
 							let out = field_val_erase_owned((gtx, t)).with_type(ty);
 							Ok(Some(out))
@@ -402,15 +408,15 @@ fn make_table_field_resolver(
 		let field_kind = kind.clone();
 		FieldFuture::new({
 			async move {
-				let (ref gtx, ref rid) = ctx
+				let (gtx, rid) = ctx
 					.parent_value
 					.downcast_ref::<ErasedRecord>()
 					.ok_or_else(|| internal_error("failed to downcast"))?;
 
 				let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
 
-				let out = match val {
-					SqlValue::Thing(rid) if fd_name != "id" => {
+				match val {
+					SqlValue::RecordId(rid) if fd_name != "id" => {
 						let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
 						match field_kind {
 							Some(Kind::Record(ts)) if ts.len() != 1 => {
@@ -430,15 +436,14 @@ fn make_table_field_resolver(
 							.map_err(|_| "SQL to GQL translation failed")?;
 						Ok(Some(FieldValue::value(out)))
 					}
-				};
-				out
+				}
 			}
 		})
 	}
 }
 
 macro_rules! filter_impl {
-	($filter:ident, $ty:ident, $name:expr) => {
+	($filter:ident, $ty:ident, $name:expr_2021) => {
 		$filter = $filter.field(InputValue::new($name, $ty.clone()));
 	};
 }
@@ -450,6 +455,7 @@ fn filter_id() -> InputObject {
 	filter_impl!(filter, ty, "ne");
 	filter
 }
+#[allow(clippy::result_large_err)]
 fn filter_from_type(
 	kind: Kind,
 	filter_name: String,
@@ -471,6 +477,7 @@ fn filter_from_type(
 
 	match kind {
 		Kind::Any => {}
+		Kind::None => {}
 		Kind::Null => {}
 		Kind::Bool => {}
 		Kind::Bytes => {}
@@ -481,25 +488,23 @@ fn filter_from_type(
 		Kind::Int => {}
 		Kind::Number => {}
 		Kind::Object => {}
-		Kind::Point => {}
 		Kind::String => {}
 		Kind::Uuid => {}
 		Kind::Regex => {}
 		Kind::Record(_) => {}
 		Kind::Geometry(_) => {}
-		Kind::Option(_) => {}
 		Kind::Either(_) => {}
 		Kind::Set(_, _) => {}
 		Kind::Array(_, _) => {}
 		Kind::Function(_, _) => {}
 		Kind::Range => {}
 		Kind::Literal(_) => {}
-		Kind::References(_, _) => {}
 		Kind::File(_) => {}
 	};
 	Ok(filter)
 }
 
+#[allow(clippy::result_large_err)]
 fn cond_from_filter(
 	filter: &IndexMap<Name, GqlValue>,
 	fds: &[DefineFieldStatement],
@@ -507,43 +512,43 @@ fn cond_from_filter(
 	val_from_filter(filter, fds).map(IntoExt::intox)
 }
 
+#[allow(clippy::result_large_err)]
 fn val_from_filter(
 	filter: &IndexMap<Name, GqlValue>,
 	fds: &[DefineFieldStatement],
-) -> Result<SqlValue, GqlError> {
+) -> Result<Expr, GqlError> {
 	if filter.len() != 1 {
 		return Err(resolver_error("Table Filter must have one item"));
 	}
 
 	let (k, v) = filter.iter().next().unwrap();
 
-	let cond = match k.as_str().to_lowercase().as_str() {
+	match k.as_str().to_lowercase().as_str() {
 		"or" => aggregate(v, AggregateOp::Or, fds),
 		"and" => aggregate(v, AggregateOp::And, fds),
 		"not" => negate(v, fds),
 		_ => binop(k.as_str(), v, fds),
-	};
-
-	cond
+	}
 }
 
-fn parse_op(name: impl AsRef<str>) -> Result<sql::Operator, GqlError> {
+#[allow(clippy::result_large_err)]
+fn parse_op(name: impl AsRef<str>) -> Result<expr::BinaryOperator, GqlError> {
 	match name.as_ref() {
-		"eq" => Ok(sql::Operator::Equal),
-		"ne" => Ok(sql::Operator::NotEqual),
+		"eq" => Ok(expr::BinaryOperator::Equal),
+		"ne" => Ok(expr::BinaryOperator::NotEqual),
 		op => Err(resolver_error(format!("Unsupported op: {op}"))),
 	}
 }
 
-fn negate(filter: &GqlValue, fds: &[DefineFieldStatement]) -> Result<SqlValue, GqlError> {
+#[allow(clippy::result_large_err)]
+fn negate(filter: &GqlValue, fds: &[DefineFieldStatement]) -> Result<Expr, GqlError> {
 	let obj = filter.as_object().ok_or(resolver_error("Value of NOT must be object"))?;
 	let inner_cond = val_from_filter(obj, fds)?;
 
-	Ok(Expression::Unary {
-		o: sql::Operator::Not,
-		v: inner_cond,
-	}
-	.into())
+	Ok(Expr::Prefix {
+		op: expr::PrefixOperator::Not,
+		expr: inner_cond,
+	})
 }
 
 enum AggregateOp {
@@ -551,18 +556,19 @@ enum AggregateOp {
 	Or,
 }
 
+#[allow(clippy::result_large_err)]
 fn aggregate(
 	filter: &GqlValue,
 	op: AggregateOp,
 	fds: &[DefineFieldStatement],
-) -> Result<SqlValue, GqlError> {
+) -> Result<Expr, GqlError> {
 	let op_str = match op {
 		AggregateOp::And => "AND",
 		AggregateOp::Or => "OR",
 	};
 	let op = match op {
-		AggregateOp::And => sql::Operator::And,
-		AggregateOp::Or => sql::Operator::Or,
+		AggregateOp::And => BinaryOperator::And,
+		AggregateOp::Or => BinaryOperator::Or,
 	};
 	let list =
 		filter.as_list().ok_or(resolver_error(format!("Value of {op_str} should be a list")))?;
@@ -579,22 +585,18 @@ fn aggregate(
 		.ok_or(resolver_error(format!("List of {op_str} should contain at least one object")))?;
 
 	for clause in iter {
-		cond = Expression::Binary {
-			l: clause,
-			o: op.clone(),
-			r: cond,
+		cond = Expr::Binary {
+			left: clause,
+			op: op.clone(),
+			right: Box::new(cond),
 		}
-		.into();
 	}
 
 	Ok(cond)
 }
 
-fn binop(
-	field_name: &str,
-	val: &GqlValue,
-	fds: &[DefineFieldStatement],
-) -> Result<SqlValue, GqlError> {
+#[allow(clippy::result_large_err)]
+fn binop(field_name: &str, val: &GqlValue, fds: &[DefineFieldStatement]) -> Result<Expr, GqlError> {
 	let obj = val.as_object().ok_or(resolver_error("Field filter should be object"))?;
 
 	let Some(fd) = fds.iter().find(|fd| fd.name.to_string() == field_name) else {
@@ -605,17 +607,17 @@ fn binop(
 		return Err(resolver_error("Field Filter must have one item"));
 	}
 
-	let lhs = sql::Value::Idiom(field_name.intox());
+	let lhs = Expr::Idiom(field_name.intox());
 
 	let (k, v) = obj.iter().next().unwrap();
 	let op = parse_op(k)?;
 
 	let rhs = gql_to_sql_kind(v, fd.kind.clone().unwrap_or_default())?;
 
-	let expr = sql::Expression::Binary {
-		l: lhs,
-		o: op,
-		r: rhs,
+	let expr = Expr::Binary {
+		left: Box::new(lhs),
+		op,
+		right: Box::new(rhs),
 	};
 
 	Ok(expr.into())

@@ -1,8 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::time::Duration;
-use surrealdb::dbs::Session;
-use surrealdb::kvs::Datastore;
-use surrealdb_core::sql::Value;
+
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use surrealdb_core::dbs::Session;
+use surrealdb_core::kvs::Datastore;
+use surrealdb_types::Value;
 use tokio::runtime::{Builder, Runtime};
 
 fn bench_order(c: &mut Criterion) {
@@ -55,10 +56,10 @@ struct Input {
 }
 
 async fn prepare_data(n: usize, n_value: usize) -> Input {
-	let value = (0..n_value).map(|_| "rand::guid()").collect::<Vec<_>>().join(" + ");
+	let value = (0..n_value).map(|_| "rand::id()").collect::<Vec<_>>().join(" + ");
 	let dbs = Datastore::new("memory").await.unwrap();
 	let ses = Session::owner().with_ns("bench").with_db("bench");
-	let sql = format!(" CREATE |i:{n}| SET v = rand::guid(), d = {value} RETURN NONE");
+	let sql = format!(" CREATE |i:{n}| SET v = rand::id(), d = {value} RETURN NONE");
 	let res = &mut dbs.execute(&sql, &ses, None).await.unwrap();
 	let _ = res.remove(0).result.is_ok();
 	Input {
@@ -71,10 +72,13 @@ async fn run(i: &Input, q: &str, expected: usize) {
 	let mut r = i.dbs.execute(black_box(q), &i.ses, None).await.unwrap();
 	if cfg!(debug_assertions) {
 		assert_eq!(r.len(), 1);
-		if let Value::Array(a) = r.remove(0).result.unwrap() {
-			assert_eq!(a.len(), expected);
-		} else {
-			panic!("Fail");
+		match r.remove(0).result.unwrap() {
+			Value::Array(a) => {
+				assert_eq!(a.len(), expected);
+			}
+			_ => {
+				panic!("Fail");
+			}
 		}
 	}
 	black_box(r);

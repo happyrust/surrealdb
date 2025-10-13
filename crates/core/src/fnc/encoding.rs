@@ -1,12 +1,14 @@
 pub mod base64 {
-	use crate::err::Error;
-	use crate::fnc::args::Optional;
-	use crate::sql::{Bytes, Value};
+	use anyhow::Result;
+	use base64::engine::DecodePaddingMode;
 	use base64::engine::general_purpose::{
 		GeneralPurpose, GeneralPurposeConfig, STANDARD, STANDARD_NO_PAD,
 	};
-	use base64::engine::DecodePaddingMode;
-	use base64::{alphabet, Engine};
+	use base64::{Engine, alphabet};
+
+	use crate::err::Error;
+	use crate::fnc::args::Optional;
+	use crate::val::{Bytes, Value};
 
 	/// Base64 configuration which supports decoding with or without padding.
 	const STANDARD_GENERIC_DECODER: GeneralPurpose = GeneralPurpose::new(
@@ -17,7 +19,7 @@ pub mod base64 {
 	);
 
 	/// Encodes a `Bytes` value to a base64 string without padding.
-	pub fn encode((arg, Optional(padded)): (Bytes, Optional<bool>)) -> Result<Value, Error> {
+	pub fn encode((arg, Optional(padded)): (Bytes, Optional<bool>)) -> Result<Value> {
 		let padded = padded.unwrap_or_default();
 		let engine = if padded {
 			STANDARD
@@ -29,7 +31,7 @@ pub mod base64 {
 
 	/// Decodes a base64 string to a `Bytes` value. It accepts both padded and
 	/// non-padded base64 strings.
-	pub fn decode((arg,): (String,)) -> Result<Value, Error> {
+	pub fn decode((arg,): (String,)) -> Result<Value> {
 		Ok(Value::from(Bytes(STANDARD_GENERIC_DECODER.decode(arg).map_err(|_| {
 			Error::InvalidArguments {
 				name: "encoding::base64::decode".to_owned(),
@@ -38,52 +40,40 @@ pub mod base64 {
 		})?)))
 	}
 }
+
 pub mod cbor {
+	use anyhow::Result;
+
 	use crate::err::Error;
-	use crate::rpc::format::cbor::Cbor;
-	use crate::sql::{Bytes, Value};
-	use ciborium::Value as Data;
+	use crate::rpc::format::cbor;
+	use crate::val::{Bytes, Value};
 
-	pub fn encode((arg,): (Value,)) -> Result<Value, Error> {
-		let val: Cbor = arg.try_into().map_err(|_| Error::InvalidArguments {
+	pub fn encode((arg,): (Value,)) -> Result<Value> {
+		// Convert internal value to public, encode, then convert back
+		let public_val = crate::val::convert_value_to_public_value(arg)?;
+		let val = cbor::encode(public_val).map_err(|_| Error::InvalidArguments {
 			name: "encoding::cbor::encode".to_owned(),
 			message: "Value could not be encoded into CBOR".to_owned(),
 		})?;
 
-		// Create a new vector for encoding output
-		let mut res = Vec::new();
-		// Serialize the value into CBOR binary data
-		ciborium::into_writer(&val.0, &mut res).map_err(|_| Error::InvalidArguments {
-			name: "encoding::cbor::encode".to_owned(),
-			message: "Value could not be encoded into CBOR".to_owned(),
-		})?;
-
-		Ok(Value::Bytes(Bytes(res)))
+		Ok(Value::Bytes(Bytes(val)))
 	}
 
-	pub fn decode((arg,): (Bytes,)) -> Result<Value, Error> {
-		let cbor = ciborium::from_reader::<Data, _>(&mut arg.as_slice())
-			.map_err(|_| Error::InvalidArguments {
-				name: "encoding::cbor::decode".to_owned(),
-				message: "invalid cbor".to_owned(),
-			})
-			.map(Cbor)?;
-
-		Value::try_from(cbor).map_err(|v: &str| Error::InvalidArguments {
+	pub fn decode((arg,): (Bytes,)) -> Result<Value> {
+		let public_val = cbor::decode(arg.as_slice()).map_err(|_| Error::InvalidArguments {
 			name: "encoding::cbor::decode".to_owned(),
-			message: v.to_owned(),
-		})
+			message: "invalid cbor".to_owned(),
+		})?;
+		// Convert public value back to internal
+		Ok(crate::sql::expression::convert_public_value_to_internal(public_val))
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	use crate::{
-		fnc::args::Optional,
-		sql::{Bytes, Value},
-	};
+	use crate::fnc::args::Optional;
+	use crate::val::{Bytes, Value};
 
 	#[test]
 	fn test_base64_encode() {

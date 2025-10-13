@@ -1,4 +1,14 @@
+use std::mem;
+
+use ahash::HashSet;
+use anyhow::Result;
+use reblessive::tree::Stk;
+use revision::revisioned;
+use serde::{Deserialize, Serialize};
+
+use crate::catalog::DatabaseDefinition;
 use crate::err::Error;
+use crate::idx::IndexKeyBase;
 use crate::idx::planner::checker::HnswConditionChecker;
 use crate::idx::trees::dynamicset::DynamicSet;
 use crate::idx::trees::graph::UndirectedGraph;
@@ -7,13 +17,7 @@ use crate::idx::trees::hnsw::index::HnswCheckedSearchContext;
 use crate::idx::trees::hnsw::{ElementId, HnswElements};
 use crate::idx::trees::knn::DoublePriorityQueue;
 use crate::idx::trees::vector::SharedVector;
-use crate::idx::IndexKeyBase;
 use crate::kvs::Transaction;
-use ahash::HashSet;
-use reblessive::tree::Stk;
-use revision::revisioned;
-use serde::{Deserialize, Serialize};
-use std::mem;
 
 #[revisioned(revision = 1)]
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -59,7 +63,7 @@ where
 		tx: &Transaction,
 		node: ElementId,
 		st: &mut LayerState,
-	) -> Result<bool, Error> {
+	) -> Result<bool> {
 		if !self.graph.add_empty_node(node) {
 			return Ok(false);
 		}
@@ -74,7 +78,7 @@ where
 		ep_dist: f64,
 		ep_id: ElementId,
 		ef: usize,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let visited = HashSet::from_iter([ep_id]);
 		let candidates = DoublePriorityQueue::from(ep_dist, ep_id);
 		let w = candidates.clone();
@@ -88,7 +92,7 @@ where
 		pt: &SharedVector,
 		ignore_id: ElementId,
 		ef: usize,
-	) -> Result<Option<ElementId>, Error> {
+	) -> Result<Option<ElementId>> {
 		let visited = HashSet::from_iter([ignore_id]);
 		let mut candidates = DoublePriorityQueue::default();
 		if let Some(dist) = elements.get_distance(tx, pt, &ignore_id).await? {
@@ -102,6 +106,7 @@ where
 	#[expect(clippy::too_many_arguments)]
 	pub(super) async fn search_single_checked(
 		&self,
+		db: &DatabaseDefinition,
 		tx: &Transaction,
 		stk: &mut Stk,
 		search: &HnswCheckedSearchContext<'_>,
@@ -109,12 +114,12 @@ where
 		ep_dist: f64,
 		ep_id: ElementId,
 		chk: &mut HnswConditionChecker<'_>,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let visited = HashSet::from_iter([ep_id]);
 		let candidates = DoublePriorityQueue::from(ep_dist, ep_id);
 		let mut w = DoublePriorityQueue::default();
-		Self::add_if_truthy(tx, stk, search, &mut w, ep_pt, ep_dist, ep_id, chk).await?;
-		self.search_checked(tx, stk, search, candidates, visited, w, chk).await
+		Self::add_if_truthy(db, tx, stk, search, &mut w, ep_pt, ep_dist, ep_id, chk).await?;
+		self.search_checked(db, tx, stk, search, candidates, visited, w, chk).await
 	}
 
 	pub(super) async fn search_multi(
@@ -124,7 +129,7 @@ where
 		pt: &SharedVector,
 		candidates: DoublePriorityQueue,
 		ef: usize,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let w = candidates.clone();
 		let visited = w.to_set();
 		self.search(tx, elements, pt, candidates, visited, w, ef).await
@@ -137,7 +142,7 @@ where
 		pt: &SharedVector,
 		ignore_ids: Vec<ElementId>,
 		efc: usize,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let mut candidates = DoublePriorityQueue::default();
 		for id in &ignore_ids {
 			if let Some(dist) = elements.get_distance(tx, pt, id).await? {
@@ -159,7 +164,7 @@ where
 		mut visited: HashSet<ElementId>,     // set of visited elements
 		mut w: DoublePriorityQueue,          // dynamic list of found nearest neighbors
 		ef: usize,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let mut fq_dist = w.peek_last_dist().unwrap_or(f64::MAX);
 		while let Some((cq_dist, doc)) = candidates.pop_first() {
 			if cq_dist > fq_dist {
@@ -191,6 +196,7 @@ where
 	#[expect(clippy::too_many_arguments)]
 	pub(super) async fn search_checked(
 		&self,
+		db: &DatabaseDefinition,
 		tx: &Transaction,
 		stk: &mut Stk,
 		search: &HnswCheckedSearchContext<'_>,
@@ -198,7 +204,7 @@ where
 		mut visited: HashSet<ElementId>,
 		mut w: DoublePriorityQueue,
 		chk: &mut HnswConditionChecker<'_>,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let mut f_dist = w.peek_last_dist().unwrap_or(f64::MAX);
 
 		let ef = search.ef();
@@ -220,7 +226,7 @@ where
 						if e_dist < f_dist || w.len() < ef {
 							candidates.push(e_dist, e_id);
 							if Self::add_if_truthy(
-								tx, stk, search, &mut w, &e_pt, e_dist, e_id, chk,
+								db, tx, stk, search, &mut w, &e_pt, e_dist, e_id, chk,
 							)
 							.await?
 							{
@@ -236,6 +242,7 @@ where
 
 	#[expect(clippy::too_many_arguments)]
 	pub(super) async fn add_if_truthy(
+		db: &DatabaseDefinition,
 		tx: &Transaction,
 		stk: &mut Stk,
 		search: &HnswCheckedSearchContext<'_>,
@@ -244,9 +251,9 @@ where
 		e_dist: f64,
 		e_id: ElementId,
 		chk: &mut HnswConditionChecker<'_>,
-	) -> Result<bool, Error> {
+	) -> Result<bool> {
 		if let Some(docs) = search.vec_docs().get_docs(tx, e_pt).await? {
-			if chk.check_truthy(tx, stk, search.docs(), docs).await? {
+			if chk.check_truthy(db, tx, stk, search.docs(), docs).await? {
 				w.push(e_dist, e_id);
 				if w.len() > search.ef() {
 					if let Some((_, id)) = w.pop_last() {
@@ -267,7 +274,7 @@ where
 		efc: usize,
 		(q_id, q_pt): (ElementId, &SharedVector),
 		mut eps: DoublePriorityQueue,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let w;
 		let mut neighbors = self.graph.new_edges();
 		{
@@ -307,7 +314,7 @@ where
 		elements: &HnswElements,
 		e_id: ElementId,
 		neighbors: &S,
-	) -> Result<DoublePriorityQueue, Error> {
+	) -> Result<DoublePriorityQueue> {
 		let mut w = DoublePriorityQueue::default();
 		if let Some(e_pt) = elements.get_vector(tx, &e_id).await? {
 			for n_id in neighbors.iter() {
@@ -328,7 +335,7 @@ where
 		heuristic: &Heuristic,
 		e_id: ElementId,
 		efc: usize,
-	) -> Result<bool, Error> {
+	) -> Result<bool> {
 		if let Some(f_ids) = self.graph.remove_node_and_bidirectional_edges(&e_id) {
 			for &q_id in f_ids.iter() {
 				if let Some(q_pt) = elements.get_vector(tx, &q_id).await? {
@@ -364,32 +371,34 @@ where
 	// Base on FoundationDB max value size (100K)
 	// https://apple.github.io/foundationdb/known-limitations.html#large-keys-and-values
 	const CHUNK_SIZE: usize = 100_000;
-	async fn save(&mut self, tx: &Transaction, st: &mut LayerState) -> Result<(), Error> {
+	async fn save(&mut self, tx: &Transaction, st: &mut LayerState) -> Result<()> {
 		// Serialise the graph
 		let val = self.graph.to_val()?;
 		// Split it into chunks
 		let chunks = val.chunks(Self::CHUNK_SIZE);
 		let old_chunks_len = mem::replace(&mut st.chunks, chunks.len() as u32);
 		for (i, chunk) in chunks.enumerate() {
-			let key = self.ikb.new_hl_key(self.level, i as u32)?;
-			tx.set(key, chunk, None).await?;
+			let key = self.ikb.new_hl_key(self.level, i as u32);
+			let chunk = chunk.to_vec();
+			tx.set(&key, &chunk, None).await?;
 		}
 		// Delete larger chunks if they exists
 		for i in st.chunks..old_chunks_len {
-			let key = self.ikb.new_hl_key(self.level, i)?;
-			tx.del(key).await?;
+			let key = self.ikb.new_hl_key(self.level, i);
+			tx.del(&key).await?;
 		}
 		// Increase the version
 		st.version += 1;
 		Ok(())
 	}
 
-	pub(super) async fn load(&mut self, tx: &Transaction, st: &LayerState) -> Result<(), Error> {
+	pub(super) async fn load(&mut self, tx: &Transaction, st: &LayerState) -> Result<()> {
 		let mut val = Vec::new();
 		// Load the chunks
 		for i in 0..st.chunks {
-			let key = self.ikb.new_hl_key(self.level, i)?;
-			let chunk = tx.get(key, None).await?.ok_or_else(|| fail!("Missing chunk"))?;
+			let key = self.ikb.new_hl_key(self.level, i);
+			let chunk =
+				tx.get(&key, None).await?.ok_or_else(|| Error::unreachable("Missing chunk"))?;
 			val.extend(chunk);
 		}
 		// Rebuild the graph

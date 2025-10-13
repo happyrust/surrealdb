@@ -2,29 +2,29 @@
 mod common;
 
 mod cli_integration {
-	use crate::remove_debug_info;
-	use assert_fs::prelude::{FileTouch, FileWriteStr, PathChild};
-	use chrono::Duration as ChronoDuration;
-	use chrono::Utc;
-	#[cfg(unix)]
-	use common::Format;
-	#[cfg(unix)]
-	use common::Socket;
-	use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-	use serde::{Deserialize, Serialize};
-	#[cfg(unix)]
-	use serde_json::json;
 	use std::fs::File;
 	use std::io::Write;
 	#[cfg(unix)]
 	use std::time;
 	use std::time::Duration;
+
+	use assert_fs::prelude::{FileTouch, FileWriteStr, PathChild};
+	use chrono::{Duration as ChronoDuration, Utc};
+	#[cfg(unix)]
+	use common::Format;
+	#[cfg(unix)]
+	use common::Socket;
+	use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+	use serde::{Deserialize, Serialize};
+	#[cfg(unix)]
+	use serde_json::json;
 	use test_log::test;
 	use tokio::time::sleep;
 	use tracing::info;
 	use ulid::Ulid;
 
-	use super::common::{self, StartServerArguments, PASS, USER};
+	use super::common::{self, PASS, StartServerArguments, USER};
+	use crate::remove_debug_info;
 
 	#[test]
 	fn version_command() {
@@ -101,7 +101,9 @@ mod cli_integration {
 
 		info!("* Export to stdout");
 		{
-			let args = format!("export --conn http://{addr} {creds} --ns {ns} --db {db} - --only --tables thing --records");
+			let args = format!(
+				"export --conn http://{addr} {creds} --ns {ns} --db {db} - --only --tables thing --records"
+			);
 			let output = common::run(&args)
 				.output()
 				.unwrap_or_else(|_| panic!("failed to run stdout export: {args}"));
@@ -139,7 +141,7 @@ mod cli_integration {
 			let (line1, rest) = output.split_once('\n').expect("response to have multiple lines");
 			assert!(line1.starts_with("-- Query 1"), "Expected on {line1}, and rest was {rest}");
 			assert!(line1.contains("execution time"));
-			assert_eq!(rest, "[\n\t{\n\t\tid: thing:one\n\t}\n]\n\n", "failed to send sql: {args}");
+			assert_eq!(rest, "[{ id: thing:one }]\n\n", "failed to send sql: {args}");
 		}
 
 		info!("* Advanced uncomputed variable to be computed before saving");
@@ -913,7 +915,9 @@ mod cli_integration {
 			));
 			// Modify the resource that was imported.
 			common::run(&args)
-				.input("DEFINE ACCESS OVERWRITE admin ON ROOT TYPE JWT URL 'https://www.example.com/jwks.json'")
+				.input(
+					"DEFINE ACCESS OVERWRITE admin ON ROOT TYPE JWT URL 'https://www.example.com/jwks.json'",
+				)
 				.output()
 				.expect("success");
 			// Verify that the resource has been modified correctly.
@@ -955,8 +959,9 @@ mod cli_integration {
 				format!("sql --conn http://{addr} --user {USER} --pass {PASS} --namespace {ns}");
 			let output = common::run(&args).input("INFO FOR NAMESPACE").output().expect("success");
 			assert!(output.contains(r#"DEFINE USER test ON NAMESPACE PASSHASH"#));
-			let args =
-				format!("sql --conn http://{addr} --user {USER} --pass {PASS} --namespace {ns} --database {db}");
+			let args = format!(
+				"sql --conn http://{addr} --user {USER} --pass {PASS} --namespace {ns} --database {db}"
+			);
 			let output = common::run(&args).input("SELECT * FROM user").output().expect("success");
 			assert!(output.contains(r#"{ id: user:1 }"#));
 			server.finish().unwrap();
@@ -1059,17 +1064,17 @@ mod cli_integration {
 				.unwrap();
 			let output = remove_debug_info(output).replace('\n', "");
 			let allowed = [
-					// Delete these
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 1 }, { changes: [{ update: { id: thing:one } }], versionstamp: 2 }]]",
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 1 }, { changes: [{ update: { id: thing:one } }], versionstamp: 3 }]]",
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 2 }, { changes: [{ update: { id: thing:one } }], versionstamp: 3 }]]",
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 2 }, { changes: [{ update: { id: thing:one } }], versionstamp: 4 }]]",
-					// Keep these
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 65536 }, { changes: [{ update: { id: thing:one } }], versionstamp: 131072 }]]",
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 65536 }, { changes: [{ update: { id: thing:one } }], versionstamp: 196608 }]]",
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 131072 }, { changes: [{ update: { id: thing:one } }], versionstamp: 196608 }]]",
-					"[[{ changes: [{ define_table: { name: 'thing' } }], versionstamp: 131072 }, { changes: [{ update: { id: thing:one } }], versionstamp: 262144 }]]",
-				];
+				// Delete these
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 1 }, { changes: [{ update: { id: thing:one } }], versionstamp: 2 }]]",
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 1 }, { changes: [{ update: { id: thing:one } }], versionstamp: 3 }]]",
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 2 }, { changes: [{ update: { id: thing:one } }], versionstamp: 3 }]]",
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 2 }, { changes: [{ update: { id: thing:one } }], versionstamp: 4 }]]",
+				// Keep these
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 65536 }, { changes: [{ update: { id: thing:one } }], versionstamp: 131072 }]]",
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 65536 }, { changes: [{ update: { id: thing:one } }], versionstamp: 196608 }]]",
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 131072 }, { changes: [{ update: { id: thing:one } }], versionstamp: 196608 }]]",
+				"[[{ changes: [{ define_table: { changefeed: { expiry: 1s, original: false }, drop: false, kind: { kind: 'ANY' }, name: 'thing', permissions: { create: false, delete: false, select: false, update: false }, schemafull: false } }], versionstamp: 131072 }, { changes: [{ update: { id: thing:one } }], versionstamp: 262144 }]]",
+			];
 			allowed
 				.into_iter()
 				.find(|case| {
@@ -1271,7 +1276,8 @@ mod cli_integration {
 			server.finish().unwrap();
 		}
 
-		// Deny all, denies all users to execute functions and access any network address
+		// Deny all, denies all users to execute functions and access any network
+		// address
 		info!("* When all capabilities are denied");
 		{
 			let (addr, mut server) = common::start_server(StartServerArguments {
@@ -1303,7 +1309,8 @@ mod cli_integration {
 			server.finish().unwrap();
 		}
 
-		// When all capabilities are allowed, anyone (including non-authenticated users) can execute functions and access any network address
+		// When all capabilities are allowed, anyone (including non-authenticated users)
+		// can execute functions and access any network address
 		info!("* When all capabilities are allowed");
 		{
 			let (addr, mut server) = common::start_server(StartServerArguments {
@@ -1374,7 +1381,9 @@ mod cli_integration {
 			server.finish().unwrap();
 		}
 
-		info!("* When capabilities are denied globally, but a function family is allowed specifically");
+		info!(
+			"* When capabilities are denied globally, but a function family is allowed specifically"
+		);
 		{
 			let (addr, mut server) = common::start_server(StartServerArguments {
 				args: "--deny-all --allow-funcs string::len".to_owned(),
@@ -1419,7 +1428,9 @@ mod cli_integration {
 			server.finish().unwrap();
 		}
 
-		info!("* When capabilities are allowed globally, but a function family is denied specifically");
+		info!(
+			"* When capabilities are allowed globally, but a function family is denied specifically"
+		);
 		{
 			let (addr, mut server) = common::start_server(StartServerArguments {
 				args: "--allow-all --deny-funcs string::lowercase".to_owned(),
@@ -1503,7 +1514,9 @@ mod cli_integration {
 			server.finish().unwrap();
 		}
 
-		info!("* When functions are both allowed and denied specifically but denies are more specific");
+		info!(
+			"* When functions are both allowed and denied specifically but denies are more specific"
+		);
 		{
 			let (addr, mut server) = common::start_server(StartServerArguments {
 				args: "--allow-funcs string --deny-funcs string::lowercase".to_owned(),
@@ -1531,7 +1544,9 @@ mod cli_integration {
 			server.finish().unwrap();
 		}
 
-		info!("* When functions are both allowed and denied specifically but allows are more specific");
+		info!(
+			"* When functions are both allowed and denied specifically but allows are more specific"
+		);
 		{
 			let (addr, mut server) = common::start_server(StartServerArguments {
 				args: "--deny-funcs string --allow-funcs string::lowercase".to_owned(),
@@ -1918,6 +1933,41 @@ mod cli_integration {
 			let output = remove_debug_info(output);
 			assert_eq!(output.matches("foo:").count(), 1);
 		}
+	}
+
+	#[tokio::test]
+	async fn test_slow_query_logging() {
+		// Start the server
+		let (addr, mut server) = common::start_server(StartServerArguments {
+			auth: false,
+			args: "--slow-log-threshold=1s --slow-log-param-deny=secret".to_owned(),
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+		// Connect the client
+		let cmd = format!(
+			"sql --conn ws://{addr} --ns {throwaway} --db {throwaway} --multi",
+			throwaway = Ulid::new()
+		);
+
+		// Start a slow query containing a line feed
+		let query = "
+			LET $public = 'foo'; LET $secret = 'bar';
+			RETURN string::concat(sleep(1200ms), '/', $public, '/', $secret);
+		";
+		let _ = common::run(&cmd).input(query).output().unwrap();
+
+		// Extract the stderr
+		let stderr = server.finish().unwrap().stderr();
+
+		// Check the log is present
+		assert!(stderr.contains("Slow query detected - time: "));
+		assert!(stderr.contains(
+			"s - query: RETURN string::concat(sleep(1s200ms), '/', $public, '/', $secret) - params: [ $public='foo' ]"
+		));
+		println!("{stderr}");
 	}
 }
 

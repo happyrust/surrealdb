@@ -1,32 +1,23 @@
-use crate::ctx::Context;
-use crate::ctx::MutableContext;
-use crate::dbs::capabilities::ExperimentalTarget;
-use crate::dbs::Options;
-use crate::dbs::Statement;
-use crate::doc::CursorDoc;
-use crate::doc::CursorValue;
-use crate::doc::Document;
-use crate::err::Error;
-use crate::idx::planner::ScanDirection;
-use crate::key::r#ref::Ref;
-use crate::kvs::KeyDecode;
-use crate::sql::dir::Dir;
-use crate::sql::edges::Edges;
-use crate::sql::graph::GraphSubjects;
-use crate::sql::paths::EDGE;
-use crate::sql::paths::IN;
-use crate::sql::paths::OUT;
-use crate::sql::reference::ReferenceDeleteStrategy;
-use crate::sql::statements::DeleteStatement;
-use crate::sql::statements::UpdateStatement;
-use crate::sql::value::{Value, Values};
-use crate::sql::Data;
-use crate::sql::FlowResultExt as _;
-use crate::sql::Operator;
-use crate::sql::Part;
-use crate::sql::Thing;
+use anyhow::{Result, bail};
 use futures::StreamExt;
 use reblessive::tree::Stk;
+
+use crate::catalog::providers::TableProvider;
+use crate::ctx::{Context, MutableContext};
+use crate::dbs::capabilities::ExperimentalTarget;
+use crate::dbs::{Options, Statement};
+use crate::doc::{CursorDoc, CursorRecord, Document};
+use crate::err::Error;
+use crate::expr::data::Assignment;
+use crate::expr::dir::Dir;
+use crate::expr::lookup::LookupKind;
+use crate::expr::paths::{IN, OUT};
+use crate::expr::reference::ReferenceDeleteStrategy;
+use crate::expr::statements::{DeleteStatement, UpdateStatement};
+use crate::expr::{AssignOperator, Data, Expr, FlowResultExt as _, Idiom, Literal, Lookup, Part};
+use crate::idx::planner::ScanDirection;
+use crate::key::r#ref::Ref;
+use crate::val::{RecordId, Value};
 
 impl Document {
 	pub(super) async fn purge(
@@ -35,7 +26,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		_stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Check if changed
 		if !self.changed() {
 			return Ok(());
@@ -45,43 +36,49 @@ impl Document {
 		// Get the record id
 		if let Some(rid) = &self.id {
 			// Get the namespace / database
-			let (ns, db) = opt.ns_db()?;
+			let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 			// Purge the record data
-			txn.del_record(ns, db, &rid.tb, &rid.id).await?;
+			txn.del_record(ns, db, &rid.table, &rid.key).await?;
 			// Purge the record edges
 			match (
-				self.initial.doc.as_ref().pick(&*EDGE),
+				self.initial.doc.is_edge(),
 				self.initial.doc.as_ref().pick(&*IN),
 				self.initial.doc.as_ref().pick(&*OUT),
 			) {
-				(Value::Bool(true), Value::Thing(ref l), Value::Thing(ref r)) => {
+				(true, Value::RecordId(ref l), Value::RecordId(ref r)) => {
 					// Lock the transaction
 					let mut txn = txn.lock().await;
 					// Get temporary edge references
 					let (ref o, ref i) = (Dir::Out, Dir::In);
 					// Purge the left pointer edge
-					let key = crate::key::graph::new(ns, db, &l.tb, &l.id, o, rid);
-					txn.del(key).await?;
+					let key = crate::key::graph::new(ns, db, &l.table, &l.key, o, rid);
+					txn.del(&key).await?;
 					// Purge the left inner edge
-					let key = crate::key::graph::new(ns, db, &rid.tb, &rid.id, i, l);
-					txn.del(key).await?;
+					let key = crate::key::graph::new(ns, db, &rid.table, &rid.key, i, l);
+					txn.del(&key).await?;
 					// Purge the right inner edge
-					let key = crate::key::graph::new(ns, db, &rid.tb, &rid.id, o, r);
-					txn.del(key).await?;
+					let key = crate::key::graph::new(ns, db, &rid.table, &rid.key, o, r);
+					txn.del(&key).await?;
 					// Purge the right pointer edge
-					let key = crate::key::graph::new(ns, db, &r.tb, &r.id, i, rid);
-					txn.del(key).await?;
+					let key = crate::key::graph::new(ns, db, &r.table, &r.key, i, rid);
+					txn.del(&key).await?;
 					// Release the transaction
 					drop(txn);
 				}
 				_ => {
+					let what = vec![
+						Part::Start(Expr::Literal(Literal::RecordId(
+							(**rid).clone().into_literal(),
+						))),
+						Part::Lookup(Lookup {
+							kind: LookupKind::Graph(Dir::Both),
+							..Default::default()
+						}),
+					];
+
 					// Setup the delete statement
 					let stm = DeleteStatement {
-						what: Values(vec![Value::from(Edges {
-							dir: Dir::Both,
-							from: rid.as_ref().clone(),
-							what: GraphSubjects::default(),
-						})]),
+						what: vec![Expr::Idiom(Idiom(what))],
 						..DeleteStatement::default()
 					};
 					// Execute the delete statement
@@ -90,8 +87,8 @@ impl Document {
 			}
 			// Process any record references
 			if ctx.get_capabilities().allows_experimental(&ExperimentalTarget::RecordReferences) {
-				let prefix = crate::key::r#ref::prefix(ns, db, &rid.tb, &rid.id)?;
-				let suffix = crate::key::r#ref::suffix(ns, db, &rid.tb, &rid.id)?;
+				let prefix = crate::key::r#ref::prefix(ns, db, &rid.table, &rid.key)?;
+				let suffix = crate::key::r#ref::suffix(ns, db, &rid.table, &rid.key)?;
 				let range = prefix..suffix;
 
 				// Obtain a transaction
@@ -103,9 +100,16 @@ impl Document {
 					yield_now!();
 					// Decode the key
 					let key = res?;
-					let r#ref = Ref::decode(&key)?;
+					let ref_key = Ref::decode_key(&key)?;
 					// Obtain the remote field definition
-					let fd = txn.get_tb_field(ns, db, r#ref.ft, r#ref.ff).await?;
+					let Some(fd) =
+						txn.get_tb_field(ns, db, ref_key.ft.as_ref(), ref_key.ff.as_ref()).await?
+					else {
+						return Err(Error::FdNotFound {
+							name: ref_key.ff.to_string(),
+						}
+						.into());
+					};
 					// Check if there is a reference defined on the field
 					if let Some(reference) = &fd.reference {
 						match &reference.on_delete {
@@ -113,26 +117,28 @@ impl Document {
 							ReferenceDeleteStrategy::Ignore => (),
 							// Reject the delete operation, as indicated by the reference
 							ReferenceDeleteStrategy::Reject => {
-								let thing = Thing {
-									tb: r#ref.ft.to_string(),
-									id: r#ref.fk.clone(),
+								let thing = RecordId {
+									table: ref_key.ft.into_owned(),
+									key: ref_key.fk.into_owned(),
 								};
 
-								return Err(Error::DeleteRejectedByReference(
+								bail!(Error::DeleteRejectedByReference(
 									rid.to_string(),
 									thing.to_string(),
 								));
 							}
 							// Delete the remote record which referenced this record
 							ReferenceDeleteStrategy::Cascade => {
-								let thing = Thing {
-									tb: r#ref.ft.to_string(),
-									id: r#ref.fk.clone(),
+								let record_id = RecordId {
+									table: ref_key.ft.into_owned(),
+									key: ref_key.fk.into_owned(),
 								};
 
 								// Setup the delete statement
 								let stm = DeleteStatement {
-									what: Values(vec![Value::from(thing)]),
+									what: vec![Expr::Literal(Literal::RecordId(
+										record_id.into_literal(),
+									))],
 									..DeleteStatement::default()
 								};
 								// Execute the delete statement
@@ -145,26 +151,32 @@ impl Document {
 							}
 							// Delete only the reference on the remote record
 							ReferenceDeleteStrategy::Unset => {
-								let thing = Thing {
-									tb: r#ref.ft.to_string(),
-									id: r#ref.fk.clone(),
+								let thing = RecordId {
+									table: ref_key.ft.into_owned(),
+									key: ref_key.fk.into_owned(),
 								};
 
 								// Determine how we perform the update
 								let data = match fd.name.last() {
 									// This is a part of an array, remove all values like it
-									Some(Part::All) => Data::SetExpression(vec![(
-										fd.name.as_ref()[..fd.name.len() - 1].into(),
-										Operator::Dec,
-										Value::Thing(rid.as_ref().clone()),
-									)]),
+									Some(Part::All) => Data::SetExpression(vec![Assignment {
+										place: Idiom(
+											fd.name.as_ref()[..fd.name.len() - 1].to_vec(),
+										),
+										operator: AssignOperator::Subtract,
+										value: Expr::Literal(Literal::RecordId(
+											(**rid).clone().into_literal(),
+										)),
+									}]),
 									// This is a self contained value, we can set it NONE
-									_ => Data::UnsetExpression(vec![fd.name.as_ref().into()]),
+									_ => Data::UnsetExpression(vec![fd.name.clone()]),
 								};
 
 								// Setup the delete statement
 								let stm = UpdateStatement {
-									what: Values(vec![Value::from(thing)]),
+									what: vec![Expr::Literal(Literal::RecordId(
+										thing.into_literal(),
+									))],
 									data: Some(data),
 									..UpdateStatement::default()
 								};
@@ -182,9 +194,9 @@ impl Document {
 								// Value for the `$reference` variable is the current record
 								let reference = Value::from(rid.as_ref().clone());
 								// Value for the document is the remote record
-								let this = Thing {
-									tb: r#ref.ft.to_string(),
-									id: r#ref.fk.clone(),
+								let this = RecordId {
+									table: ref_key.ft.into_owned(),
+									key: ref_key.fk.into_owned(),
 								};
 
 								// Set the `$reference` variable in the context
@@ -193,7 +205,7 @@ impl Document {
 								let ctx = ctx.freeze();
 
 								// Obtain the document for the remote record
-								let doc: CursorValue = Value::Thing(this)
+								let doc: CursorRecord = Value::RecordId(this)
 									.get(
 										stk,
 										&ctx,
@@ -207,8 +219,9 @@ impl Document {
 								// Construct the document for the compute method
 								let doc = CursorDoc::new(None, None, doc);
 
+								let opt = opt.clone().with_perms(false);
 								// Compute the custom instruction.
-								v.compute(stk, &ctx, &opt.clone().with_perms(false), Some(&doc))
+								stk.run(|stk| v.compute(stk, &ctx, &opt, Some(&doc)))
 									.await
 									.catch_return()
 									// Wrap any error in an error explaining what went wrong

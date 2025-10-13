@@ -1,10 +1,12 @@
-use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput};
-use radix_trie::{Trie, TrieCommon, TrieKey};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::time::Duration;
-use surrealdb::sql::{value, Array, Id, Thing};
+
+use criterion::measurement::WallTime;
+use criterion::{BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main};
+use radix_trie::{Trie, TrieCommon, TrieKey};
+use surrealdb_core::syn;
+use surrealdb_types::{Array, RecordId};
 
 // Common use case: VectorSearch
 fn bench_hash_trie_btree_large_vector(c: &mut Criterion) {
@@ -57,7 +59,10 @@ fn bench_hash_trie_btree_value(c: &mut Criterion) {
 	const N: usize = 100_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
-		let key = value(&format!("{{ test: {{ something: [1, 'two', null, test:{i}, {{ trueee: false, noneee: nulll }}] }} }}")).unwrap();
+		let key = syn::value(&format!(
+			"{{ test: {{ something: [1, 'two', null, test:{i}, {{ trueee: false, noneee: nulll }}] }} }}"
+		))
+		.unwrap();
 		samples.push((key, i));
 	}
 
@@ -71,7 +76,7 @@ fn bench_hash_trie_btree_thing(c: &mut Criterion) {
 	const N: usize = 50_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
-		let key = Thing::from(("test", Id::from(Array::from(vec![i as i32; 5]))));
+		let key = RecordId::new("test".to_owned(), Array::from(vec![i as i32; 5]));
 		samples.push((key, i));
 	}
 

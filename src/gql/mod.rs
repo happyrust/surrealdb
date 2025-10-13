@@ -1,34 +1,28 @@
-use std::{
-	convert::Infallible,
-	sync::Arc,
-	task::{Context, Poll},
-	time::Duration,
-};
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use async_graphql::{
-	http::{create_multipart_mixed_stream, is_accept_multipart_mixed},
-	Executor, ParseRequestError,
-};
-use async_graphql_axum::{
-	rejection::GraphQLRejection, GraphQLBatchRequest, GraphQLRequest, GraphQLResponse,
-};
-use axum::{
-	body::{Body, HttpBody},
-	extract::FromRequest,
-	http::{Request as HttpRequest, Response as HttpResponse},
-	response::IntoResponse,
-	BoxError,
-};
+use async_graphql::http::{create_multipart_mixed_stream, is_accept_multipart_mixed};
+use async_graphql::{Executor, ParseRequestError};
+use async_graphql_axum::rejection::GraphQLRejection;
+use async_graphql_axum::{GraphQLBatchRequest, GraphQLRequest, GraphQLResponse};
+use axum::BoxError;
+use axum::body::{Body, HttpBody};
+use axum::extract::FromRequest;
+use axum::http::{Request as HttpRequest, Response as HttpResponse};
+use axum::response::IntoResponse;
 use bytes::Bytes;
-use futures_util::{future::BoxFuture, StreamExt};
-use surrealdb::dbs::capabilities::RouteTarget;
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use surrealdb::dbs::Session;
+use surrealdb::dbs::capabilities::RouteTarget;
 use surrealdb::gql::cache::{Invalidator, SchemaCache};
 use surrealdb::gql::error::resolver_error;
 use surrealdb::kvs::Datastore;
 use tower_service::Service;
 
-use crate::err::Error as SurrealError;
+use crate::net::error::Error as NetError;
 
 /// A GraphQL service.
 #[derive(Clone)]
@@ -75,7 +69,7 @@ where
 					&RouteTarget::GraphQL
 				);
 				return Ok(
-					SurrealError::ForbiddenRoute(RouteTarget::GraphQL.to_string()).into_response()
+					NetError::ForbiddenRoute(RouteTarget::GraphQL.to_string()).into_response()
 				);
 			}
 
