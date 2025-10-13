@@ -14,6 +14,8 @@ impl_module_def!(
 	"capitalize" => run,
 	"concat" => run,
 	"contains" => run,
+	"e3d_dehash" => run,
+	"e3d_hash" => run,
 	"distance" => (distance::Package),
 	"ends_with" => run,
 	"html" => (html::Package),

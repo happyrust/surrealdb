@@ -15,7 +15,7 @@ use crate::fnc::util::math::top::Top;
 use crate::fnc::util::math::trimean::Trimean;
 use crate::fnc::util::math::variance::Variance;
 use crate::val::number::Sort;
-use crate::val::{Number, TryPow, Value};
+use crate::val::{Array, Number, TryPow, Value};
 
 pub fn abs((arg,): (Number,)) -> Result<Value> {
 	let Some(x) = arg.checked_abs() else {
@@ -148,6 +148,22 @@ pub fn min((array,): (Vec<Number>,)) -> Result<Value> {
 		Some(v) => v.into(),
 		None => f64::INFINITY.into(),
 	})
+}
+
+pub fn max_value((array,): (Array,)) -> Result<Value> {
+	let max = array.into_iter().filter_map(|value| match value {
+		Value::Number(n) => Some(n),
+		_ => None,
+	}).max();
+	Ok(max.map(Value::from).unwrap_or(Value::None))
+}
+
+pub fn min_value((array,): (Array,)) -> Result<Value> {
+	let min = array.into_iter().filter_map(|value| match value {
+		Value::Number(n) => Some(n),
+		_ => None,
+	}).min();
+	Ok(min.map(Value::from).unwrap_or(Value::None))
 }
 
 pub fn mode((array,): (Vec<Number>,)) -> Result<Value> {

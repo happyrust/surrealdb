@@ -1,3 +1,4 @@
+use std::convert::TryFrom;
 use std::ops::Bound;
 
 use anyhow::{Result, ensure};
@@ -7,7 +8,7 @@ use crate::cnf::GENERATION_ALLOCATION_LIMIT;
 use crate::err::Error;
 use crate::fnc::util::string;
 use crate::val::range::TypedRange;
-use crate::val::{Regex, Value};
+use crate::val::{Number, Regex, Value};
 
 /// Returns `true` if a string of this length is too much to allocate.
 fn limit(name: &str, n: usize) -> Result<()> {
@@ -630,11 +631,61 @@ pub mod semver {
 	}
 }
 
+#[inline]
+fn db1_dehash(hash: u32) -> String {
+	let mut result = String::new();
+	if hash > 0x171FAD39 {
+		let mut k = ((hash - 0x171FAD39) % 0x1000000) as i32;
+		result.push(':');
+		for _ in 0..6 {
+			if k <= 0 {
+				break;
+			}
+			result.push((k % 64 + 32) as u8 as char);
+			k /= 64;
+		}
+	} else {
+		if hash <= 0x81BF1 {
+			return String::new();
+		}
+		let mut k = (hash - 0x81BF1) as i32;
+		while k > 0 {
+			result.push((k % 27 + 64) as u8 as char);
+			k /= 27;
+		}
+	}
+	result
+}
+
+pub fn e3d_dehash((number,): (Number,)) -> Result<Value> {
+	let hash = u32::try_from(number).unwrap_or_default();
+	Ok(db1_dehash(hash).into())
+}
+
+#[inline]
+fn db1_hash(hash_str: &str) -> u32 {
+	let chars = hash_str.as_bytes();
+	if chars.is_empty() {
+		return 0;
+	}
+	let mut val = 0i64;
+	let mut i = (chars.len() - 1) as i32;
+	while i >= 0 {
+		val = val.overflowing_mul(27).0 + (chars[i as usize] as i64 - 64);
+		i -= 1;
+	}
+	val.saturating_add_unsigned(0x81_BF1) as u32
+}
+
+pub fn e3d_hash((string,): (String,)) -> Result<Value> {
+	Ok(db1_hash(string.as_str()).into())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{matches, replace, slice};
 	use crate::fnc::args::{Cast, Optional};
-	use crate::val::Value;
+	use crate::val::{Number, Value};
 
 	#[test]
 	fn string_slice() {
@@ -764,5 +815,20 @@ mod tests {
 
 		let value = super::semver::set::patch((String::from("1.2.3"), 9)).unwrap();
 		assert_eq!(value, Value::from("1.2.9"));
+	}
+
+	#[test]
+	fn db1_hash_dehash_roundtrip() {
+		let original = Number::from(0x1076_84CAu32);
+		let decoded = super::e3d_dehash((original,)).unwrap();
+		let Value::String(code) = decoded else {
+			panic!("expected string result");
+		};
+
+		let reencoded = super::e3d_hash((code.clone(),)).unwrap();
+		assert_eq!(reencoded, Value::from(0x1076_84CAu32));
+
+		// ensure hash function accepts the decoded string
+		assert!(!code.is_empty());
 	}
 }
