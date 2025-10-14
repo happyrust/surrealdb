@@ -1046,6 +1046,106 @@ async fn idiom_recursion_shortest_path() -> Result<()> {
 	Ok(())
 }
 
+#[tokio::test]
+async fn idiom_recursion_path_prune() -> Result<()> {
+	let sql = r#"
+		INSERT [
+			{ id: pe:root, owner: pe:1 },
+			{ id: pe:1, owner: pe:2 },
+			{ id: pe:2, owner: NONE },
+			{ id: pe:branch, owner: pe:3 },
+			{ id: pe:3, owner: type::thing("pe:0_0") },
+		];
+
+		pe:root.{..+prune=[NONE, type::thing("pe:0_0")]}(.owner);
+		pe:branch.{..+prune=[NONE, type::thing("pe:0_0")]}(.owner);
+		pe:root.{..+prune=[NONE, type::thing("pe:0_0")]+inclusive}(.owner);
+	"#;
+
+	Test::new(sql)
+		.await?
+		.expect_val(
+			"[
+			{ id: pe:root, owner: pe:1 },
+			{ id: pe:1, owner: pe:2 },
+			{ id: pe:2 },
+			{ id: pe:branch, owner: pe:3 },
+			{ id: pe:3, owner: pe:0_0 },
+		]",
+		)?
+		.expect_val(
+			"[
+			[
+				pe:1,
+				pe:2,
+			],
+		]",
+		)?
+		.expect_val(
+			"[
+			[
+				pe:3,
+			],
+		]",
+		)?
+		.expect_val(
+			"[
+			[
+				pe:root,
+				pe:1,
+				pe:2,
+			],
+		]",
+		)?;
+	Ok(())
+}
+
+#[tokio::test]
+async fn idiom_recursion_path_prune_expression() -> Result<()> {
+	let sql = r#"
+		INSERT [
+			{ id: pe:root, owner: pe:1 },
+			{ id: pe:1, owner: pe:stop },
+			{ id: pe:stop, owner: pe:after },
+			{ id: pe:after },
+			{ id: pe:branch, owner: pe:stop },
+		];
+
+		pe:root.{..+prune=type::is_none($value) OR $value = type::thing("pe:stop")}(.owner);
+		pe:branch.{..+prune=type::is_none($value) OR $value = type::thing("pe:stop")}(.owner);
+		pe:root.{..+prune=(type::is_none($value) OR $value = type::thing("pe:stop"))+inclusive}(.owner);
+	"#;
+
+	Test::new(sql)
+		.await?
+		.expect_val(
+			"[
+			{ id: pe:root, owner: pe:1 },
+			{ id: pe:1, owner: pe:stop },
+			{ id: pe:stop, owner: pe:after },
+			{ id: pe:after },
+			{ id: pe:branch, owner: pe:stop },
+		]",
+		)?
+		.expect_val(
+			"[
+			[
+				pe:1,
+			],
+		]",
+		)?
+	.expect_val("[]")?
+	.expect_val(
+		"[
+		[
+			pe:root,
+			pe:1,
+		],
+	]",
+	)?;
+	Ok(())
+}
+
 macro_rules! expect_parse_error {
 	($query:expr, $error:expr) => {{
 		let res = Test::new($query).await;
@@ -1063,7 +1163,7 @@ macro_rules! expect_parse_error {
 async fn idiom_recursion_invalid_instruction() -> Result<()> {
 	expect_parse_error!(
 		"a:1.{..+invalid}",
-		"Unexpected instruction `invalid` expected `path`, `collect`, or `shortest`"
+		"Unexpected instruction `invalid` expected `path`, `collect`, `prune`, or `shortest`"
 	);
 	expect_parse_error!(
 		"a:1.{..+path+invalid}",

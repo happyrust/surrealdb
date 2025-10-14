@@ -236,6 +236,12 @@ pub enum RecurseInstruction {
 		// Do we include the starting point in the collection?
 		inclusive: bool,
 	},
+	Prune {
+		// Should we include the starting point when pruning?
+		inclusive: bool,
+		// Expression evaluated for each candidate step
+		predicate: Expr,
+	},
 	Shortest {
 		// What ending node are we looking for?
 		expects: Expr,
@@ -262,6 +268,18 @@ impl fmt::Display for RecurseInstruction {
 				inclusive,
 			} => {
 				write!(f, "collect")?;
+
+				if *inclusive {
+					write!(f, "+inclusive")?;
+				}
+
+				Ok(())
+			}
+			Self::Prune {
+				inclusive,
+				predicate,
+			} => {
+				write!(f, "prune={predicate}")?;
 
 				if *inclusive {
 					write!(f, "+inclusive")?;
@@ -298,6 +316,13 @@ impl From<RecurseInstruction> for crate::expr::part::RecurseInstruction {
 			} => Self::Collect {
 				inclusive,
 			},
+			RecurseInstruction::Prune {
+				inclusive,
+				predicate,
+			} => Self::Prune {
+				inclusive,
+				predicate: predicate.into(),
+			},
 			RecurseInstruction::Shortest {
 				expects,
 				inclusive,
@@ -321,6 +346,13 @@ impl From<crate::expr::part::RecurseInstruction> for RecurseInstruction {
 				inclusive,
 			} => Self::Collect {
 				inclusive,
+			},
+			crate::expr::part::RecurseInstruction::Prune {
+				inclusive,
+				predicate,
+			} => Self::Prune {
+				inclusive,
+				predicate: predicate.into(),
 			},
 			crate::expr::part::RecurseInstruction::Shortest {
 				expects,

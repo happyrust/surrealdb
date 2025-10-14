@@ -1,11 +1,12 @@
 use std::fmt;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use anyhow::Result;
 use reblessive::tree::Stk;
 
 use crate::cnf::IDIOM_RECURSION_LIMIT;
-use crate::ctx::Context;
+use crate::ctx::{Context, MutableContext};
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
@@ -535,6 +536,12 @@ pub(crate) enum RecurseInstruction {
 		// Do we include the starting point in the collection?
 		inclusive: bool,
 	},
+	Prune {
+		// Do we include the starting point when evaluating prune?
+		inclusive: bool,
+		// Expression used to decide if we should prune the branch
+		predicate: Expr,
+	},
 	Shortest {
 		// What ending node are we looking for?
 		expects: Expr,
@@ -548,12 +555,16 @@ impl VisitExpression for RecurseInstruction {
 	where
 		F: FnMut(&Expr),
 	{
-		if let RecurseInstruction::Shortest {
-			expects,
-			..
-		} = self
-		{
-			expects.visit(visitor);
+		match self {
+			RecurseInstruction::Shortest {
+				expects,
+				..
+			} => expects.visit(visitor),
+			RecurseInstruction::Prune {
+				predicate,
+				..
+			} => predicate.visit(visitor),
+			_ => {}
 		}
 	}
 }
@@ -568,6 +579,7 @@ async fn walk_paths(
 	finished: &mut Vec<Value>,
 	inclusive: bool,
 	expects: Option<&Value>,
+	prune: Option<&Expr>,
 ) -> Result<Value> {
 	let mut open: Vec<Value> = vec![];
 	let paths = match recursion.current {
@@ -587,6 +599,53 @@ async fn walk_paths(
 			stk.run(|stk| last.get(stk, ctx, opt, doc, recursion.path)).await.catch_return()?;
 
 		if recursion::is_final(&res) || &res == last {
+			if let Some(predicate) = prune {
+				let mut path_with_step = path.to_owned();
+				path_with_step.push(res.clone());
+				let path_value = Value::from(path_with_step);
+				let predicate_value = match predicate {
+					Expr::Literal(literal) => {
+						let base_ctx: Context = Arc::new(MutableContext::new(ctx));
+						match stk
+							.run(|stk| literal.compute(stk, &base_ctx, opt, doc))
+							.await
+							.catch_return()
+						{
+							Ok(value) => value,
+							Err(_) => {
+								let mut mutable_ctx = MutableContext::new(ctx);
+								mutable_ctx.add_value("value", Arc::new(res.clone()));
+								mutable_ctx.add_value("path", Arc::new(path_value.clone()));
+								let prune_ctx: Context = Arc::new(mutable_ctx);
+								stk.run(|stk| predicate.compute(stk, &prune_ctx, opt, doc))
+									.await
+									.catch_return()?
+							}
+						}
+					}
+					_ => {
+						let mut mutable_ctx = MutableContext::new(ctx);
+						mutable_ctx.add_value("value", Arc::new(res.clone()));
+						mutable_ctx.add_value("path", Arc::new(path_value.clone()));
+						let prune_ctx: Context = Arc::new(mutable_ctx);
+						stk.run(|stk| predicate.compute(stk, &prune_ctx, opt, doc))
+							.await
+							.catch_return()?
+					}
+				};
+				if prune_matches(&res, &predicate_value) {
+					if expects.is_none()
+						&& (recursion.iterated > 1 || inclusive)
+						&& recursion.iterated >= recursion.min
+					{
+						let truncated = Value::from(path.to_owned());
+						if !finished.contains(&truncated) {
+							finished.push(truncated);
+						}
+					}
+					continue;
+				}
+			}
 			if expects.is_none()
 				&& (recursion.iterated > 1 || inclusive)
 				&& recursion.iterated >= recursion.min
@@ -622,6 +681,50 @@ async fn walk_paths(
 					return Ok(Value::None);
 				}
 			}
+			if let Some(predicate) = prune {
+				let predicate_value = match predicate {
+					Expr::Literal(literal) => {
+						let base_ctx: Context = Arc::new(MutableContext::new(ctx));
+						match stk
+							.run(|stk| literal.compute(stk, &base_ctx, opt, doc))
+							.await
+							.catch_return()
+						{
+							Ok(value) => value,
+							Err(_) => {
+								let mut mutable_ctx = MutableContext::new(ctx);
+								mutable_ctx.add_value("value", Arc::new(step.to_owned()));
+								mutable_ctx.add_value("path", Arc::new(val.clone()));
+								let prune_ctx: Context = Arc::new(mutable_ctx);
+								stk.run(|stk| predicate.compute(stk, &prune_ctx, opt, doc))
+									.await
+									.catch_return()?
+							}
+						}
+					}
+					_ => {
+						let mut mutable_ctx = MutableContext::new(ctx);
+						mutable_ctx.add_value("value", Arc::new(step.to_owned()));
+						mutable_ctx.add_value("path", Arc::new(val.clone()));
+						let prune_ctx: Context = Arc::new(mutable_ctx);
+						stk.run(|stk| predicate.compute(stk, &prune_ctx, opt, doc))
+							.await
+							.catch_return()?
+					}
+				};
+				if prune_matches(step, &predicate_value) {
+					if expects.is_none()
+						&& recursion.iterated >= recursion.min
+						&& (recursion.iterated > 1 || inclusive)
+					{
+						let truncated = Value::from(path.to_owned());
+						if !finished.contains(&truncated) {
+							finished.push(truncated);
+						}
+					}
+					continue;
+				}
+			}
 			if reached_max {
 				if (Option::<&Value>::None).is_none() {
 					finished.push(val);
@@ -633,6 +736,16 @@ async fn walk_paths(
 	}
 
 	Ok(Value::Array(Array(open)))
+}
+
+fn prune_matches(step: &Value, predicate: &Value) -> bool {
+	match predicate {
+		Value::Bool(b) => *b,
+		Value::Array(arr) => arr.iter().any(|candidate| prune_matches(step, candidate)),
+		Value::None => step.is_none(),
+		Value::Null => step.is_null(),
+		other => other == step,
+	}
 }
 
 impl RecurseInstruction {
@@ -648,7 +761,7 @@ impl RecurseInstruction {
 		match self {
 			Self::Path {
 				inclusive,
-			} => walk_paths(stk, ctx, opt, doc, rec, finished, *inclusive, None).await,
+			} => walk_paths(stk, ctx, opt, doc, rec, finished, *inclusive, None, None).await,
 			Self::Shortest {
 				expects,
 				inclusive,
@@ -659,7 +772,15 @@ impl RecurseInstruction {
 					.catch_return()?
 					.coerce_to::<RecordId>()?
 					.into();
-				walk_paths(stk, ctx, opt, doc, rec, finished, *inclusive, Some(&expects)).await
+				walk_paths(stk, ctx, opt, doc, rec, finished, *inclusive, Some(&expects), None)
+					.await
+			}
+			Self::Prune {
+				inclusive,
+				predicate,
+			} => {
+				walk_paths(stk, ctx, opt, doc, rec, finished, *inclusive, None, Some(predicate))
+					.await
 			}
 			Self::Collect {
 				inclusive,
@@ -731,6 +852,18 @@ impl fmt::Display for RecurseInstruction {
 				inclusive,
 			} => {
 				write!(f, "collect")?;
+
+				if *inclusive {
+					write!(f, "+inclusive")?;
+				}
+
+				Ok(())
+			}
+			Self::Prune {
+				inclusive,
+				predicate,
+			} => {
+				write!(f, "prune={predicate}")?;
 
 				if *inclusive {
 					write!(f, "+inclusive")?;

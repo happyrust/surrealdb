@@ -151,18 +151,24 @@ pub fn min((array,): (Vec<Number>,)) -> Result<Value> {
 }
 
 pub fn max_value((array,): (Array,)) -> Result<Value> {
-	let max = array.into_iter().filter_map(|value| match value {
-		Value::Number(n) => Some(n),
-		_ => None,
-	}).max();
+	let max = array
+		.into_iter()
+		.filter_map(|value| match value {
+			Value::Number(n) => Some(n),
+			_ => None,
+		})
+		.max();
 	Ok(max.map(Value::from).unwrap_or(Value::None))
 }
 
 pub fn min_value((array,): (Array,)) -> Result<Value> {
-	let min = array.into_iter().filter_map(|value| match value {
-		Value::Number(n) => Some(n),
-		_ => None,
-	}).min();
+	let min = array
+		.into_iter()
+		.filter_map(|value| match value {
+			Value::Number(n) => Some(n),
+			_ => None,
+		})
+		.min();
 	Ok(min.map(Value::from).unwrap_or(Value::None))
 }
 

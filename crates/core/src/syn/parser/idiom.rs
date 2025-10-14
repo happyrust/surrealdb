@@ -4,11 +4,22 @@ use super::basic::NumberToken;
 use super::mac::{expected, unexpected};
 use super::{ParseResult, Parser};
 use crate::sql::lookup::LookupKind;
+use crate::sql::operator::BinaryOperator;
 use crate::sql::part::{DestructurePart, Recurse, RecurseInstruction};
 use crate::sql::{Dir, Expr, Field, Fields, Idiom, Literal, Lookup, Param, Part};
 use crate::syn::error::bail;
 use crate::syn::lexer::compound::{self, Numeric};
 use crate::syn::token::{Glued, Span, TokenKind, t};
+
+fn matches_inclusive_idiom(expr: &Expr) -> bool {
+	match expr {
+		Expr::Idiom(idiom) => {
+			idiom.0.len() == 1
+				&& matches!(&idiom.0[0], Part::Field(name) if name.eq_ignore_ascii_case("inclusive"))
+		}
+		_ => false,
+	}
+}
 
 impl Parser<'_> {
 	pub(super) fn peek_continues_idiom(&mut self) -> bool {
@@ -419,6 +430,39 @@ impl Parser<'_> {
 				Some(RecurseInstruction::Collect {
 					inclusive,
 				})
+			} else if kind.eq_ignore_ascii_case("prune") {
+				expected!(self, t!("="));
+				let mut predicate = stk.run(|ctx| self.parse_expr_inherit(ctx)).await?;
+				let mut inclusive = false;
+
+				predicate = match predicate {
+					Expr::Binary {
+						op: BinaryOperator::Add,
+						left,
+						right,
+					} if matches_inclusive_idiom(&right) => {
+						inclusive = true;
+						*left
+					}
+					other => other,
+				};
+
+				loop {
+					if self.eat(t!("+")) {
+						let kind = self.parse_ident()?;
+						if kind.eq_ignore_ascii_case("inclusive") {
+							inclusive = true
+						} else {
+							bail!("Unexpected option `{}` expected `inclusive`",kind, @self.last_span());
+						}
+					} else {
+						break;
+					};
+				}
+				Some(RecurseInstruction::Prune {
+					predicate,
+					inclusive,
+				})
 			} else if kind.eq_ignore_ascii_case("shortest") {
 				expected!(self, t!("="));
 				let token = self.peek();
@@ -449,7 +493,7 @@ impl Parser<'_> {
 					inclusive,
 				})
 			} else {
-				bail!("Unexpected instruction `{}` expected `path`, `collect`, or `shortest`",kind, @self.last_span());
+				bail!("Unexpected instruction `{}` expected `path`, `collect`, `prune`, or `shortest`",kind, @self.last_span());
 			}
 		} else {
 			None
