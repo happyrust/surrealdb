@@ -410,16 +410,12 @@ async fn idiom_recursion_record_links() -> Result<()> {
 			[ planet:earth, country:canada, province:bc ],
 		]")?
 		.expect_val("[
-			country:us,
-			country:canada,
 			state:california,
 			state:texas,
 			province:ontario,
 			province:bc,
 		]")?
 		.expect_val("[
-			'United States',
-			'Canada',
 			'California',
 			'Texas',
 			'Ontario',
