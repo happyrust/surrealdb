@@ -1,13 +1,9 @@
 pub mod http;
 pub mod ws;
 
-use opentelemetry::metrics::MetricsError;
-use opentelemetry_otlp::MetricsExporterBuilder;
-use opentelemetry_sdk::metrics::reader::{DefaultAggregationSelector, DefaultTemporalitySelector};
-use opentelemetry_sdk::metrics::{
-	Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream,
-};
-use opentelemetry_sdk::runtime;
+use anyhow::{Context, Result};
+use opentelemetry_otlp::MetricExporter;
+use opentelemetry_sdk::metrics::{Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream};
 
 pub use self::http::tower_layer::HttpMetricsLayer;
 use super::OTEL_DEFAULT_RESOURCE;
@@ -40,36 +36,30 @@ const HISTOGRAM_BUCKETS_BYTES: &[f64] = &[
 
 // Returns a metrics configuration based on the SURREAL_TELEMETRY_PROVIDER
 // environment variable
-pub fn init() -> Result<Option<SdkMeterProvider>, MetricsError> {
+pub fn init() -> Result<Option<SdkMeterProvider>> {
 	match TELEMETRY_PROVIDER.trim() {
 		// The OTLP telemetry provider has been specified
 		s if s.eq_ignore_ascii_case("otlp") && !*TELEMETRY_DISABLE_METRICS => {
 			// Create a new metrics exporter using tonic
-			let exporter = MetricsExporterBuilder::from(opentelemetry_otlp::new_exporter().tonic())
-				.build_metrics_exporter(
-					Box::new(DefaultTemporalitySelector::new()),
-					Box::new(DefaultAggregationSelector::new()),
-				)
-				.unwrap();
-			// Create the reader to run with Tokio
-			let reader = PeriodicReader::builder(exporter, runtime::Tokio).build();
+			let exporter = MetricExporter::builder()
+				.with_tonic()
+				.build()
+				.context("failed to build OTLP metrics exporter")?;
+			// Create the reader which manages its own background thread
+			let reader = PeriodicReader::builder(exporter).build();
 			// Add a view for metering durations
-			let histogram_duration_view = {
-				let criteria = Instrument::new().name("*.duration");
-				let mask = Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-					boundaries: HISTOGRAM_BUCKETS_MS.to_vec(),
-					record_min_max: true,
-				});
-				opentelemetry_sdk::metrics::new_view(criteria, mask)?
+			let histogram_duration_view = |instrument: &Instrument| -> Option<Stream> {
+				instrument
+					.name()
+					.ends_with(".duration")
+					.then(|| histogram_stream(HISTOGRAM_BUCKETS_MS))
 			};
 			// Add a view for metering sizes
-			let histogram_size_view = {
-				let criteria = Instrument::new().name("*.size");
-				let mask = Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-					boundaries: HISTOGRAM_BUCKETS_BYTES.to_vec(),
-					record_min_max: true,
-				});
-				opentelemetry_sdk::metrics::new_view(criteria, mask)?
+			let histogram_size_view = |instrument: &Instrument| -> Option<Stream> {
+				instrument
+					.name()
+					.ends_with(".size")
+					.then(|| histogram_stream(HISTOGRAM_BUCKETS_BYTES))
 			};
 			// Create the new metrics provider
 			Ok(Some(
@@ -84,4 +74,14 @@ pub fn init() -> Result<Option<SdkMeterProvider>, MetricsError> {
 		// No matching telemetry provider was found
 		_ => Ok(None),
 	}
+}
+
+fn histogram_stream(boundaries: &[f64]) -> Stream {
+	Stream::builder()
+		.with_aggregation(Aggregation::ExplicitBucketHistogram {
+			boundaries: boundaries.to_vec(),
+			record_min_max: true,
+		})
+		.build()
+		.expect("invalid histogram configuration")
 }
