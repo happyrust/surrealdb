@@ -30,7 +30,7 @@ default = ["proto", "flatbuffers", "rpc"]
 
 proto = ["dep:prost", "dep:prost-types"]
 flatbuffers = ["dep:flatbuffers"]
-rpc = ["proto", "dep:tonic", "dep:futures"]
+rpc = ["proto", "dep:tonic", "dep:tonic-prost", "dep:futures"]
 
 [dependencies]
 anyhow = { version = "1" }
@@ -38,14 +38,16 @@ async-trait = { version = "0.1" }
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0" }
 geo = { version = "0" }
+http-body-util = { version = "0.1" }
 flatbuffers = { version = "25.2.10", features = ["serde"], optional = true }
 futures = { version = "0.3", optional = true }
-prost = { version = "0.13", optional = true }
-prost-types = { version = "0.13", optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
 rust_decimal = { version = "1.30.0" }
 serde = { version = "1" }
 serde_json = { version = "1" }
-tonic = { version = "0.12", optional = true }
+tonic = { version = "0.14", optional = true }
+tonic-prost = { version = "0.14", optional = true }
 uuid = { version = "1" }
 semver = { version = "1" }
 
