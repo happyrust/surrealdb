@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85.0"
 name = "surrealdb-protocol"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
 build = false
 include = [
