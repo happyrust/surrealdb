@@ -1,5 +1,16 @@
 [workspace]
-members = [".", "crates/core", "crates/sdk", "crates/types", "crates/types-derive"]
+members = [
+    ".",
+    "crates/core",
+    "crates/sdk",
+    "crates/types",
+    "crates/types-derive",
+    "crates/surrealism/surrealism",
+    "crates/surrealism/surrealism-cli",
+    "crates/surrealism/surrealism-macros",
+    "crates/surrealism/surrealism-runtime",
+    "crates/surrealism/surrealism-types",
+]
 
 [workspace.package]
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
@@ -27,13 +38,18 @@ surrealdb-core = { version = "=3.0.0-alpha.11", path = "crates/core", default-fe
 surrealdb-macros = { version = "=3.0.0-alpha.11", path = "crates/macros" }
 surrealdb-types = { version = "=3.0.0-alpha.11", path = "crates/types" }
 surrealdb-types-derive = { version = "=3.0.0-alpha.11", path = "crates/types-derive" }
+surrealism = { version = "=0.1.1", path = "crates/surrealism/surrealism" }
+surrealism-cli = { version = "=0.1.1", path = "crates/surrealism/surrealism-cli" }
+surrealism-macros = { version = "=0.1.1", path = "crates/surrealism/surrealism-macros", default-features = false }
+surrealism-runtime = { version = "=0.1.1", path = "crates/surrealism/surrealism-runtime" }
+surrealism-types = { version = "=0.1.1", path = "crates/surrealism/surrealism-types", default-features = false }
 
 # External surreal crates
 affinitypool = "0.3.1"
 dmp = "0.2.3"
 indxdb = "0.6.0"
 lexicmp = "0.2.0"
-revision = { version = "0.13.0", features = [
+revision = { version = "0.14.0", features = [
     "chrono",
     "geo",
     "roaring",
@@ -41,7 +57,7 @@ revision = { version = "0.13.0", features = [
     "rust_decimal",
     "uuid",
 ] }
-storekey = { version = "0.8.0", features = ["uuid"] }
+storekey = { version = "0.9.0", features = ["uuid"] }
 surrealkv = { version = "0.9.1" }
 surrealml = { version = "0.1.9", package = "surrealml-core", features = [
     "dynamic",
@@ -82,6 +98,7 @@ bcrypt = "0.15.0"
 bincode = "1.3.3"
 blake3 = "1.5.3"
 bytes = "1.5.0"
+candle-core = "0.9.1"
 castaway = "0.2.3"
 chrono = "0.4.38"
 ciborium = "0.2.1"
@@ -151,6 +168,7 @@ tokio = { version = "1.44.2", default-features = false }
 tokio-stream = "0.1"
 tokio-tungstenite = "0.28.0"
 tokio-util = "0.7.11"
+toml = "0.8.10"
 tracing = "0.1.40"
 ulid = "1.1.0"
 unicase = "2.7.0"
@@ -159,6 +177,10 @@ uuid = "1.17.0"
 wasm-bindgen-futures = "0.4.39"
 wasmtimer = { version = "0.2.0", default-features = false }
 ws_stream_wasm = "0.7.4"
+tar = "0.4.40"
+wasmtime = { version = "34.0.1", default-features = false, features = ["cranelift", "winch"] }
+wasmtime-wasi = "34.0.1"
+zstd = "0.13.0"
 
 # used only in dev-dependencies
 criterion = "0.5.1"
