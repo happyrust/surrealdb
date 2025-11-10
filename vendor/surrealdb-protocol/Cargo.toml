@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85.0"
 name = "surrealdb-protocol"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
 build = false
 include = [
@@ -63,7 +63,6 @@ proto = [
 rpc = [
     "proto",
     "dep:tonic",
-    "dep:tonic-prost",
     "dep:futures",
 ]
 
@@ -97,11 +96,11 @@ optional = true
 version = "0"
 
 [dependencies.prost]
-version = "0.14"
+version = "0.13"
 optional = true
 
 [dependencies.prost-types]
-version = "0.14"
+version = "0.13"
 optional = true
 
 [dependencies.rust_decimal]
@@ -117,11 +116,7 @@ version = "1"
 version = "1"
 
 [dependencies.tonic]
-version = "0.14"
-optional = true
-
-[dependencies.tonic-prost]
-version = "0.14"
+version = "0.12"
 optional = true
 
 [dependencies.uuid]
