@@ -182,6 +182,11 @@ wasmtime = { version = "34.0.1", default-features = false, features = ["cranelif
 wasmtime-wasi = "34.0.1"
 zstd = "0.13.0"
 
+# Surrealism specific dependencies
+clap = { version = "4.5.40", features = ["derive"] }
+walrus = "0.20.3"
+wasm-opt = "0.116.0"
+
 # used only in dev-dependencies
 criterion = "0.5.1"
 env_logger = "0.11.7"
