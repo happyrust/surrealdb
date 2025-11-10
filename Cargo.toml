@@ -76,7 +76,7 @@ foundationdb = { version = "0.9.2", default-features = false, features = [
     "embedded-fdb-include",
     "fdb-7_3",
 ] }
-rocksdb = { version = "0.24.0", features = ["lz4", "snappy"] }
+rocksdb = { version = "0.24.0-surreal.1", package = "surrealdb-rocksdb", features = ["lz4", "snappy"] }
 # Managed by surreal but mostly external code
 tikv = { version = "0.3.0-surreal.3", default-features = false, package = "surrealdb-tikv-client" }
 
@@ -90,8 +90,8 @@ argon2 = "0.5.2"
 arrayvec = "0.7.6"
 async-channel = "2.3.1"
 async-executor = "1.13.1"
-async-graphql = { version = "7.0.9", default-features = false }
-async-graphql-axum = "=7.0.13"
+async-graphql = { version = "7.0.17", default-features = false, features = ["custom-error-conversion"] }
+async-graphql-axum = "7.0.17"
 async-trait = "0.1.88"
 base64 = "0.21.5"
 bcrypt = "0.15.0"
@@ -145,7 +145,7 @@ regex = "1.10.6"
 regex-syntax = "0.8.4"
 reqwest = { version = "0.12.7", default-features = false }
 ring = "0.17.13"
-roaring = "0.10.6"
+roaring = "0.11.2"
 rustls = { version = "0.23.12", default-features = false }
 rust_decimal = { version = "1.37.2" }
 rust-s3 = "0.35.1"

@@ -11,7 +11,7 @@ use crate::rpc::RpcError;
 use crate::types::{
 	PublicArray, PublicKind, PublicNotification, PublicObject, PublicValue, SurrealValue,
 };
-use crate::{dbs, map};
+use crate::dbs;
 
 /// Query statistics.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

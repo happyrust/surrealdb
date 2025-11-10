@@ -495,6 +495,12 @@ pub(crate) enum RecurseInstruction {
 		// Do we include the starting point in the collection?
 		inclusive: bool,
 	},
+	Prune {
+		// Should we include the starting point when pruning?
+		inclusive: bool,
+		// Expression evaluated for each candidate step
+		predicate: Expr,
+	},
 	Shortest {
 		// What ending node are we looking for?
 		expects: Expr,
@@ -606,6 +612,65 @@ impl RecurseInstruction {
 					.into();
 				walk_paths(stk, ctx, opt, doc, rec, finished, *inclusive, Some(&expects)).await
 			}
+			Self::Prune {
+				inclusive,
+				predicate,
+			} => {
+				// Evaluate the predicate for the current value
+				let should_prune = stk
+					.run(|stk| predicate.compute(stk, ctx, opt, doc))
+					.await
+					.catch_return()?
+					.is_truthy();
+
+				// If predicate is true, we prune (stop recursion) at this point
+				if should_prune {
+					// If inclusive, include the current value before pruning
+					if *inclusive {
+						match rec.current {
+							Value::Array(v) => {
+								for v in v.iter() {
+									if !finished.contains(v) {
+										finished.push(v.to_owned());
+									}
+								}
+							}
+							v => {
+								if !finished.contains(v) {
+									finished.push(v.to_owned());
+								}
+							}
+						};
+					}
+					// Return None to stop recursion
+					return Ok(Value::None);
+				}
+
+				// If not pruning, continue with normal recursion
+				let res = stk
+					.run(|stk| rec.current.get(stk, ctx, opt, doc, rec.path))
+					.await
+					.catch_return()?;
+				let res = clean_iteration(res);
+
+				// Persist any new values from the result
+				match &res {
+					Value::Array(v) => {
+						for v in v.iter() {
+							if !finished.contains(v) {
+								finished.push(v.to_owned());
+							}
+						}
+					}
+					v => {
+						if !finished.contains(v) {
+							finished.push(v.to_owned());
+						}
+					}
+				};
+
+				Ok(res)
+			}
 			Self::Collect {
 				inclusive,
 			} => {
@@ -676,6 +741,18 @@ impl fmt::Display for RecurseInstruction {
 				inclusive,
 			} => {
 				write!(f, "collect")?;
+
+				if *inclusive {
+					write!(f, "+inclusive")?;
+				}
+
+				Ok(())
+			}
+			Self::Prune {
+				inclusive,
+				predicate,
+			} => {
+				write!(f, "prune={predicate}")?;
 
 				if *inclusive {
 					write!(f, "+inclusive")?;

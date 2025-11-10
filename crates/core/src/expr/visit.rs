@@ -1473,6 +1473,9 @@ implement_visitor! {
 			RecurseInstruction::Shortest { expects, .. } => {
 				this.visit_expr(expects)?;
 			},
+			RecurseInstruction::Prune { predicate, .. } => {
+				this.visit_expr(predicate)?;
+			},
 		}
 		Ok(())
 	}
@@ -2908,6 +2911,9 @@ implement_visitor_mut! {
 				RecurseInstruction::Collect { ..} => {}
 			RecurseInstruction::Shortest { expects, .. } => {
 				this.visit_mut_expr(expects)?;
+			},
+			RecurseInstruction::Prune { predicate, .. } => {
+				this.visit_mut_expr(predicate)?;
 			},
 		}
 		Ok(())
