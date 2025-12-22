@@ -2,10 +2,14 @@
 [test]
 
 [[test.results]]
-value = "'OK'"
+value = "NONE"
+[[test.results]]
+value = "NONE"
+[[test.results]]
+value = "NONE"
 
 [[test.results]]
-value = "[]"
+error = "The table 'test' does not exist"
 
 [[test.results]]
 value = "[{ field: 3, id: target:1 }]"
@@ -15,10 +19,8 @@ value = "[{ after: { mean: 3f }, even: 'CREATE', id: test:triggered_on_view }]"
 
 */
 
-{
 	DEFINE TABLE target;
 	DEFINE TABLE view AS SELECT math::mean(field) as mean FROM target GROUP ALL;
-
 
 	DEFINE EVENT event ON view THEN {
 		CREATE test:triggered_on_view SET
@@ -28,8 +30,6 @@ value = "[{ after: { mean: 3f }, even: 'CREATE', id: test:triggered_on_view }]"
 			before = $before,
 			after = $after;
 	};
-	"OK"
-};
 
 
 SELECT * FROM test;

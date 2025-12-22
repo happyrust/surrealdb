@@ -5,59 +5,43 @@ use hex;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-use crate::sql::ToSql;
-use crate::write_sql;
+use crate::sql::{SqlFormat, ToSql};
 
 /// Represents binary data in SurrealDB
 ///
 /// Bytes stores raw binary data as a vector of unsigned 8-bit integers.
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Bytes(pub(crate) Vec<u8>);
+#[repr(transparent)]
+pub struct Bytes(pub(crate) ::bytes::Bytes);
 
 impl Bytes {
-	/// Create new bytes from Vec<u8>
-	pub fn new(data: Vec<u8>) -> Self {
-		Self(data)
-	}
-
-	/// Get the inner Vec<u8>
-	pub fn inner(&self) -> &Vec<u8> {
-		&self.0
-	}
-
-	/// Convert the bytes to a Vec<u8>
-	pub fn into_inner(self) -> Vec<u8> {
+	/// Convert the bytes to a bytes::Bytes
+	pub fn into_inner(self) -> bytes::Bytes {
 		self.0
 	}
 }
 
 impl From<Vec<u8>> for Bytes {
 	fn from(v: Vec<u8>) -> Self {
-		Self(v)
-	}
-}
-
-impl From<Bytes> for Vec<u8> {
-	fn from(val: Bytes) -> Self {
-		val.0
+		Self(bytes::Bytes::from(v))
 	}
 }
 
 impl From<Bytes> for bytes::Bytes {
 	fn from(bytes: Bytes) -> Self {
-		bytes.0.into()
+		bytes.0
 	}
 }
 
 impl From<bytes::Bytes> for Bytes {
 	fn from(bytes: bytes::Bytes) -> Self {
-		Bytes(bytes.into())
+		Bytes(bytes)
 	}
 }
 
 impl Deref for Bytes {
-	type Target = Vec<u8>;
+	type Target = bytes::Bytes;
 
 	fn deref(&self) -> &Self::Target {
 		&self.0
@@ -71,8 +55,10 @@ impl Display for Bytes {
 }
 
 impl ToSql for crate::Bytes {
-	fn fmt_sql(&self, f: &mut String) {
-		write_sql!(f, "{}", self)
+	fn fmt_sql(&self, f: &mut String, _fmt: SqlFormat) {
+		f.push_str("b\"");
+		f.push_str(&hex::encode_upper(&self.0));
+		f.push('"');
 	}
 }
 
@@ -103,14 +89,14 @@ impl<'de> Deserialize<'de> for Bytes {
 			where
 				E: de::Error,
 			{
-				Ok(Bytes(v))
+				Ok(Bytes(bytes::Bytes::from(v)))
 			}
 
 			fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
 			where
 				E: de::Error,
 			{
-				Ok(Bytes(v.to_owned()))
+				Ok(Bytes(::bytes::Bytes::copy_from_slice(v)))
 			}
 
 			fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -122,10 +108,24 @@ impl<'de> Deserialize<'de> for Bytes {
 				while let Some(byte) = seq.next_element()? {
 					vec.push(byte);
 				}
-				Ok(Bytes(vec))
+				Ok(Bytes(bytes::Bytes::from(vec)))
 			}
 		}
 
 		deserializer.deserialize_byte_buf(RawBytesVisitor)
+	}
+}
+
+#[cfg(feature = "arbitrary")]
+mod arb {
+	use arbitrary::{Arbitrary, Unstructured};
+
+	use super::*;
+
+	impl<'a> Arbitrary<'a> for Bytes {
+		fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+			let b: &'a [u8] = u.arbitrary()?;
+			Ok(Self(::bytes::Bytes::copy_from_slice(b)))
+		}
 	}
 }

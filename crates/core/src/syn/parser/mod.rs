@@ -87,6 +87,8 @@ mod token;
 mod token_buffer;
 mod value;
 
+#[cfg(feature = "arbitrary")]
+pub(crate) use builtin::PATHS;
 pub(crate) use mac::{enter_object_recursion, enter_query_recursion, unexpected};
 
 use super::error::{RenderedError, syntax_error};
@@ -145,8 +147,6 @@ pub struct ParserSettings {
 	/// itself. Examples are subquery and blocks like block statements and if
 	/// statements and such.
 	pub query_recursion_limit: usize,
-	/// Whether record references are enabled.
-	pub references_enabled: bool,
 	/// Whether define api is enabled
 	pub define_api_enabled: bool,
 	/// Whether the files feature is enabled
@@ -162,7 +162,6 @@ impl Default for ParserSettings {
 			flexible_record_id: true,
 			object_recursion_limit: 100,
 			query_recursion_limit: 20,
-			references_enabled: false,
 			define_api_enabled: false,
 			files_enabled: false,
 			surrealism_enabled: false,
@@ -173,7 +172,6 @@ impl Default for ParserSettings {
 impl ParserSettings {
 	pub fn default_with_experimental(enabled: bool) -> Self {
 		ParserSettings {
-			references_enabled: enabled,
 			define_api_enabled: enabled,
 			files_enabled: enabled,
 			surrealism_enabled: enabled,
@@ -434,6 +432,43 @@ impl<'a> Parser<'a> {
 	/// Parse a single expression.
 	pub(crate) async fn parse_expr(&mut self, stk: &mut Stk) -> ParseResult<sql::Expr> {
 		self.parse_expr_start(stk).await
+	}
+
+	/// Speculativily parse a branch.
+	///
+	/// If the callback returns `Ok(Some(_))` then the lexer state advances like it would normally.
+	/// However if any other value is returned from the callback the lexer is rolled back to before
+	/// the function was called.
+	///
+	/// This function can be used for cases where the right branch cannot be determined from the
+	/// n'th next token.
+	///
+	/// # Usage
+	/// This function is very powerfull but also has the drawbacks.
+	/// - First it enables ambigous grammar, when implementing new syntax using this function please
+	///   first see if it is possible to implement the feature using the peek functions an otherwise
+	///   maybe consider redesigning the syntax so it is `LL(n)`.
+	///
+	/// - Second because it doesn't provide feedback on what exactly happened it can result in
+	///   errors being unpredictable
+	///
+	/// - Third, any parsing using speculating and then recovering is doing extra work it ideally
+	///   didn't have to do.
+	///
+	/// Please limit the use of this function to small branches that can't recurse.
+	pub(crate) async fn speculate<T, F>(&mut self, stk: &mut Stk, cb: F) -> ParseResult<Option<T>>
+	where
+		F: AsyncFnOnce(&mut Stk, &mut Parser) -> ParseResult<Option<T>>,
+	{
+		let backup = self.last_span();
+		match cb(stk, self).await {
+			Ok(Some(x)) => Ok(Some(x)),
+			Ok(None) => {
+				self.backup_after(backup);
+				Ok(None)
+			}
+			Err(e) => Err(e),
+		}
 	}
 }
 

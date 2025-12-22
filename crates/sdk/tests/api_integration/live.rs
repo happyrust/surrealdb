@@ -4,7 +4,6 @@
 	feature = "kv-mem",
 	feature = "kv-rocksdb",
 	feature = "kv-tikv",
-	feature = "kv-fdb",
 	feature = "kv-surrealkv",
 ))]
 
@@ -406,9 +405,7 @@ pub async fn live_select_query(new_db: impl CreateDb) {
 
 		// Start listening
 		let mut users = db
-			.query("BEGIN")
-			.query(format!("LIVE SELECT * FROM {table}"))
-			.query("COMMIT")
+			.query(format!("BEGIN; LIVE SELECT * FROM {table}; COMMIT"))
 			.await
 			.unwrap()
 			.stream::<Value>(())
@@ -433,6 +430,8 @@ pub async fn live_query_delete_notifications(new_db: impl CreateDb) {
 	let (permit, db) = new_db.create_db(config).await;
 
 	db.use_ns(Ulid::new().to_string()).use_db(Ulid::new().to_string()).await.unwrap();
+
+	db.query("DEFINE TABLE bar".to_string()).await.unwrap().check().unwrap();
 
 	let mut stream =
 		db.query("LIVE SELECT field FROM bar").await.unwrap().stream::<Value>(0).unwrap();

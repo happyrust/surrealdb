@@ -2,14 +2,16 @@ use std::fmt::Display;
 use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
+use surrealdb_types_derive::write_sql;
 
-use crate::utils::escape::EscapeSqonIdent;
-use crate::{ToSql, write_sql};
+use crate as surrealdb_types;
+use crate::sql::{SqlFormat, ToSql};
 
 /// A value type referencing a specific table.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct Table(String);
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Table(pub(crate) String);
 
 impl Table {
 	/// Create a new table.
@@ -19,6 +21,11 @@ impl Table {
 
 	/// Convert the table to a string.
 	pub fn into_string(self) -> String {
+		self.0
+	}
+
+	/// Convert into the inner String
+	pub fn into_inner(self) -> String {
 		self.0
 	}
 
@@ -42,8 +49,9 @@ impl Display for Table {
 }
 
 impl ToSql for Table {
-	fn fmt_sql(&self, f: &mut String) {
-		write_sql!(f, "{}", EscapeSqonIdent(&self.0))
+	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
+		use crate::utils::escape::EscapeSqonIdent;
+		write_sql!(f, fmt, "{}", EscapeSqonIdent(&self.0));
 	}
 }
 
@@ -56,5 +64,11 @@ impl From<&str> for Table {
 impl From<String> for Table {
 	fn from(s: String) -> Self {
 		Table::new(s)
+	}
+}
+
+impl From<Table> for String {
+	fn from(value: Table) -> Self {
+		value.0
 	}
 }

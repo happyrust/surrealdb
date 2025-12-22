@@ -3,6 +3,7 @@ use reblessive::Stk;
 use super::basic::NumberToken;
 use super::mac::{expected, unexpected};
 use super::{ParseResult, Parser};
+use crate::sql::field::Selector;
 use crate::sql::lookup::LookupKind;
 use crate::sql::operator::BinaryOperator;
 use crate::sql::part::{DestructurePart, Recurse, RecurseInstruction};
@@ -24,7 +25,7 @@ fn matches_inclusive_idiom(expr: &Expr) -> bool {
 impl Parser<'_> {
 	pub(super) fn peek_continues_idiom(&mut self) -> bool {
 		let peek = self.peek().kind;
-		if matches!(peek, t!("->") | t!("[") | t!(".") | t!("...") | t!("?")) {
+		if matches!(peek, t!("->") | t!("[") | t!(".") | t!("...")) {
 			return true;
 		}
 		peek == t!("<") && matches!(self.peek1().kind, t!("-") | t!("~") | t!("->"))
@@ -39,11 +40,11 @@ impl Parser<'_> {
 		if self.eat(t!("VALUE")) {
 			let expr = stk.run(|ctx| self.parse_expr_field(ctx)).await?;
 			let alias = if self.eat(t!("AS")) {
-				Some(self.parse_plain_idiom(stk).await?)
+				Some(self.parse_basic_idiom()?)
 			} else {
 				None
 			};
-			Ok(Fields::Value(Box::new(Field::Single {
+			Ok(Fields::Value(Box::new(Selector {
 				expr,
 				alias,
 			})))
@@ -59,10 +60,10 @@ impl Parser<'_> {
 					} else {
 						None
 					};
-					Field::Single {
+					Field::Single(Selector {
 						expr,
 						alias,
-					}
+					})
 				};
 				fields.push(field);
 				if !self.eat(t!(",")) {
@@ -96,10 +97,6 @@ impl Parser<'_> {
 		let mut res = start;
 		loop {
 			match self.peek_kind() {
-				t!("?") => {
-					self.pop_peek();
-					res.push(Part::Optional);
-				}
 				t!("...") => {
 					self.pop_peek();
 					res.push(Part::Flatten);
@@ -124,15 +121,9 @@ impl Parser<'_> {
 					if peek.kind == t!("~") {
 						self.pop_peek();
 						self.pop_peek();
-						if !self.settings.references_enabled {
-							bail!(
-								"Experimental capability `record_references` is not enabled",
-								@self.last_span() => "Use of `<~` reference lookup is still experimental"
-							)
-						}
-
 						let lookup =
 							stk.run(|stk| self.parse_lookup(stk, LookupKind::Reference)).await?;
+
 						res.push(Part::Graph(lookup))
 					} else if peek.kind == t!("-") {
 						self.pop_peek();
@@ -151,10 +142,6 @@ impl Parser<'_> {
 					} else {
 						break;
 					}
-				}
-				t!("..") => {
-					bail!("Unexpected token `{}` expected and idiom",t!(".."),
-						@self.last_span() => "Did you maybe intent to use the flatten operator `...`");
 				}
 				_ => break,
 			}
@@ -178,10 +165,6 @@ impl Parser<'_> {
 		let mut res = start;
 		loop {
 			match self.peek_kind() {
-				t!("?") => {
-					self.pop_peek();
-					res.push(Part::Optional);
-				}
 				t!("...") => {
 					self.pop_peek();
 					res.push(Part::Flatten);
@@ -205,13 +188,6 @@ impl Parser<'_> {
 					if peek.kind == t!("~") {
 						self.pop_peek();
 						self.pop_peek();
-						if !self.settings.references_enabled {
-							bail!(
-								"Experimental capability `record_references` is not enabled",
-								@self.last_span() => "Use of `<~` reference lookup is still experimental"
-							)
-						}
-
 						let lookup = self.parse_lookup(stk, LookupKind::Reference).await?;
 						res.push(Part::Graph(lookup))
 					} else if peek.kind == t!("-") {
@@ -227,10 +203,6 @@ impl Parser<'_> {
 					} else {
 						break;
 					}
-				}
-				t!("..") => {
-					bail!("Unexpected token `{}` expected and idiom",t!(".."),
-						@self.last_span() => "Did you maybe intent to use the flatten operator `...`");
 				}
 				_ => break,
 			}
@@ -251,13 +223,6 @@ impl Parser<'_> {
 			t!("<") => {
 				let t = self.pop_peek();
 				let lookup = if self.eat_whitespace(t!("~")) {
-					if !self.settings.references_enabled {
-						bail!(
-							"Experimental capability `record_references` is not enabled",
-							@self.last_span() => "Use of `<~` reference lookup is still experimental"
-						)
-					}
-
 					stk.run(|ctx| self.parse_lookup(ctx, LookupKind::Reference)).await?
 				} else if self.eat_whitespace(t!("-")) {
 					stk.run(|ctx| self.parse_lookup(ctx, LookupKind::Graph(Dir::In))).await?
@@ -277,6 +242,10 @@ impl Parser<'_> {
 	/// Parse the part after the `.` in a idiom
 	pub(super) async fn parse_dot_part(&mut self, stk: &mut Stk) -> ParseResult<Part> {
 		let res = match self.peek_kind() {
+			t!("?") => {
+				self.pop_peek();
+				Part::Optional
+			}
 			t!("*") => {
 				self.pop_peek();
 				Part::All
@@ -300,6 +269,22 @@ impl Parser<'_> {
 		};
 		Ok(res)
 	}
+
+	/// Parse the part after the `.` in a idiom
+	pub(super) fn parse_basic_dot_part(&mut self) -> ParseResult<Part> {
+		let res = match self.peek_kind() {
+			t!("*") => {
+				self.pop_peek();
+				Part::All
+			}
+			_ => {
+				let ident = self.parse_ident()?;
+				Part::Field(ident)
+			}
+		};
+		Ok(res)
+	}
+
 	pub(super) async fn parse_function_part(
 		&mut self,
 		stk: &mut Stk,
@@ -555,7 +540,7 @@ impl Parser<'_> {
 	/// Basic idioms differ from normal idioms in that they are more
 	/// restrictive. Flatten, graphs, conditions and indexing by param is not
 	/// allowed.
-	pub(super) async fn parse_basic_idiom(&mut self, stk: &mut Stk) -> ParseResult<Idiom> {
+	pub(super) fn parse_basic_idiom(&mut self) -> ParseResult<Idiom> {
 		let start = self.parse_ident()?;
 		let mut parts = vec![Part::Field(start)];
 		loop {
@@ -563,7 +548,7 @@ impl Parser<'_> {
 			let part = match token.kind {
 				t!(".") => {
 					self.pop_peek();
-					self.parse_dot_part(stk).await?
+					self.parse_basic_dot_part()?
 				}
 				t!("[") => {
 					self.pop_peek();
@@ -581,7 +566,9 @@ impl Parser<'_> {
 							let number = self.next_token_value::<NumberToken>()?;
 							let expr = match number {
 								NumberToken::Float(x) => Expr::Literal(Literal::Float(x)),
-								NumberToken::Integer(x) => Expr::Literal(Literal::Integer(x)),
+								NumberToken::Integer(x) => {
+									Expr::Literal(Literal::Integer(x.into_int(self.recent_span())?))
+								}
 								NumberToken::Decimal(x) => Expr::Literal(Literal::Decimal(x)),
 							};
 							Part::Value(expr)
@@ -590,7 +577,7 @@ impl Parser<'_> {
 							let peek_digit = self.peek_whitespace1();
 							if let TokenKind::Digits = peek_digit.kind {
 								let span = self.recent_span().covers(peek_digit.span);
-								bail!("Unexpected token `-` expected $, *, or a number", @span => "an index can't be negative");
+								bail!("Unexpected token `-` expected $, *, or a number", @span => "an index in a basic idiom can't be negative");
 							}
 							unexpected!(self, peek, "$, * or a number");
 						}
@@ -611,7 +598,7 @@ impl Parser<'_> {
 	/// Basic idioms differ from local idioms in that they are more restrictive.
 	/// Only field, all and number indexing is allowed. Flatten is also allowed
 	/// but only at the end.
-	pub(super) async fn parse_local_idiom(&mut self, stk: &mut Stk) -> ParseResult<Idiom> {
+	pub(super) fn parse_local_idiom(&mut self) -> ParseResult<Idiom> {
 		let start = self.parse_ident()?;
 		let mut parts = vec![Part::Field(start)];
 		loop {
@@ -619,7 +606,7 @@ impl Parser<'_> {
 			let part = match token.kind {
 				t!(".") => {
 					self.pop_peek();
-					self.parse_dot_part(stk).await?
+					self.parse_basic_dot_part()?
 				}
 				t!("[") => {
 					self.pop_peek();
@@ -636,7 +623,9 @@ impl Parser<'_> {
 								Numeric::Duration(_) => {
 									bail!("Unexpected token `duration` expected a number", @number.span );
 								}
-								Numeric::Integer(x) => Expr::Literal(Literal::Integer(x)),
+								Numeric::Integer(x) => {
+									Expr::Literal(Literal::Integer(x.into_int(number.span)?))
+								}
 								Numeric::Float(x) => Expr::Literal(Literal::Float(x)),
 								Numeric::Decimal(x) => Expr::Literal(Literal::Decimal(x)),
 							};
@@ -646,7 +635,9 @@ impl Parser<'_> {
 							let number = self.next_token_value::<NumberToken>()?;
 							let number = match number {
 								NumberToken::Float(f) => Expr::Literal(Literal::Float(f)),
-								NumberToken::Integer(i) => Expr::Literal(Literal::Integer(i)),
+								NumberToken::Integer(i) => {
+									Expr::Literal(Literal::Integer(i.into_int(self.recent_span())?))
+								}
 								NumberToken::Decimal(decimal) => {
 									Expr::Literal(Literal::Decimal(decimal))
 								}
@@ -657,7 +648,7 @@ impl Parser<'_> {
 							let peek_digit = self.peek_whitespace1();
 							if let TokenKind::Digits = peek_digit.kind {
 								let span = self.recent_span().covers(peek_digit.span);
-								bail!("Unexpected token `-` expected $, *, or a number", @span => "an index can't be negative");
+								bail!("Unexpected token `-` expected $, *, or a number", @span => "index in a local idiom can't be negative");
 							}
 							unexpected!(self, token, "$, * or a number");
 						}
@@ -704,14 +695,14 @@ impl Parser<'_> {
 	pub(super) async fn parse_lookup(
 		&mut self,
 		stk: &mut Stk,
-		kind: LookupKind,
+		lookup_kind: LookupKind,
 	) -> ParseResult<Lookup> {
 		let token = self.peek();
 		match token.kind {
 			t!("?") => {
 				self.pop_peek();
 				Ok(Lookup {
-					kind,
+					kind: lookup_kind,
 					..Default::default()
 				})
 			}
@@ -734,10 +725,10 @@ impl Parser<'_> {
 						Vec::new()
 					}
 					x if Self::kind_is_identifier(x) => {
-						let subject = self.parse_lookup_subject(stk).await?;
+						let subject = self.parse_lookup_subject(stk, true).await?;
 						let mut subjects = vec![subject];
 						while self.eat(t!(",")) {
-							subjects.push(self.parse_lookup_subject(stk).await?);
+							subjects.push(self.parse_lookup_subject(stk, true).await?);
 						}
 						subjects
 					}
@@ -746,9 +737,9 @@ impl Parser<'_> {
 
 				let cond = self.try_parse_condition(stk).await?;
 				let (split, group, order) = if let Some((ref expr, fields_span)) = expr {
-					let split = self.try_parse_split(stk, expr, fields_span).await?;
-					let group = self.try_parse_group(stk, expr, fields_span).await?;
-					let order = self.try_parse_orders(stk, expr, fields_span).await?;
+					let split = self.try_parse_split(expr, fields_span)?;
+					let group = self.try_parse_group(expr, fields_span)?;
+					let order = self.try_parse_orders(expr, fields_span)?;
 					(split, group, order)
 				} else {
 					(None, None, None)
@@ -773,7 +764,7 @@ impl Parser<'_> {
 				self.expect_closing_delimiter(t!(")"), span)?;
 
 				Ok(Lookup {
-					kind,
+					kind: lookup_kind,
 					what,
 					cond,
 					alias,
@@ -788,9 +779,9 @@ impl Parser<'_> {
 			x if Self::kind_is_identifier(x) => {
 				// The following function should always succeed here,
 				// returning an error here would be a bug, so unwrap.
-				let subject = self.parse_lookup_subject(stk).await?;
+				let subject = self.parse_lookup_subject(stk, false).await?;
 				Ok(Lookup {
-					kind,
+					kind: lookup_kind,
 					what: vec![subject],
 					..Default::default()
 				})
@@ -802,6 +793,8 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+	use surrealdb_types::ToSql;
+
 	use super::*;
 	use crate::sql::lookup::LookupSubject;
 	use crate::sql::{self, BinaryOperator, RecordIdKeyLit, RecordIdLit};
@@ -811,73 +804,70 @@ mod tests {
 	fn graph_in() {
 		let sql = "<-likes";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("<-likes", format!("{}", out));
+		assert_eq!("<-likes", out.to_sql());
 	}
 
 	#[test]
 	fn graph_out() {
 		let sql = "->likes";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->likes", format!("{}", out));
+		assert_eq!("->likes", out.to_sql());
 	}
 
 	#[test]
 	fn graph_both() {
 		let sql = "<->likes";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("<->likes", format!("{}", out));
+		assert_eq!("<->likes", out.to_sql());
 	}
 
 	#[test]
 	fn graph_multiple() {
 		let sql = "->(likes, follows)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(likes, follows)", format!("{}", out));
+		assert_eq!("->(likes, follows)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_aliases() {
 		let sql = "->(likes, follows AS connections)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(likes, follows AS connections)", format!("{}", out));
+		assert_eq!("->(likes, follows AS connections)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_conditions() {
 		let sql = "->(likes, follows WHERE influencer = true)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(likes, follows WHERE influencer = true)", format!("{}", out));
+		assert_eq!("->(likes, follows WHERE influencer = true)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_conditions_aliases() {
 		let sql = "->(likes, follows WHERE influencer = true AS connections)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(likes, follows WHERE influencer = true AS connections)", format!("{}", out));
+		assert_eq!("->(likes, follows WHERE influencer = true AS connections)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_select() {
 		let sql = "->(SELECT amount FROM likes WHERE amount > 10)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(SELECT amount FROM likes WHERE amount > 10)", format!("{}", out));
+		assert_eq!("->(SELECT amount FROM likes WHERE amount > 10)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_select_wildcard() {
 		let sql = "->(SELECT * FROM likes WHERE amount > 10)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(SELECT * FROM likes WHERE amount > 10)", format!("{}", out));
+		assert_eq!("->(SELECT * FROM likes WHERE amount > 10)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_select_where_order() {
 		let sql = "->(SELECT amount FROM likes WHERE amount > 10 ORDER BY amount)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!(
-			"->(SELECT amount FROM likes WHERE amount > 10 ORDER BY amount\n)",
-			format!("{}", out)
-		);
+		assert_eq!("->(SELECT amount FROM likes WHERE amount > 10 ORDER BY amount)", out.to_sql());
 	}
 
 	#[test]
@@ -885,8 +875,8 @@ mod tests {
 		let sql = "->(SELECT amount FROM likes WHERE amount > 10 ORDER BY amount LIMIT 1)";
 		let out = syn::expr(sql).unwrap();
 		assert_eq!(
-			"->(SELECT amount FROM likes WHERE amount > 10 ORDER BY amount\n LIMIT 1)",
-			format!("{}", out)
+			"->(SELECT amount FROM likes WHERE amount > 10 ORDER BY amount LIMIT 1)",
+			out.to_sql()
 		);
 	}
 
@@ -894,21 +884,21 @@ mod tests {
 	fn graph_select_limit() {
 		let sql = "->(SELECT amount FROM likes LIMIT 1)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(SELECT amount FROM likes LIMIT 1)", format!("{}", out));
+		assert_eq!("->(SELECT amount FROM likes LIMIT 1)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_select_order() {
 		let sql = "->(SELECT amount FROM likes ORDER BY amount)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(SELECT amount FROM likes ORDER BY amount\n)", format!("{}", out));
+		assert_eq!("->(SELECT amount FROM likes ORDER BY amount)", out.to_sql());
 	}
 
 	#[test]
 	fn graph_select_order_limit() {
 		let sql = "->(SELECT amount FROM likes ORDER BY amount LIMIT 1)";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("->(SELECT amount FROM likes ORDER BY amount\n LIMIT 1)", format!("{}", out));
+		assert_eq!("->(SELECT amount FROM likes ORDER BY amount LIMIT 1)", out.to_sql());
 	}
 
 	/// creates a field part
@@ -925,7 +915,7 @@ mod tests {
 	fn idiom_normal() {
 		let sql = "test";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test", format!("{}", out));
+		assert_eq!("test", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test")])));
 	}
 
@@ -933,7 +923,7 @@ mod tests {
 	fn idiom_quoted_backtick() {
 		let sql = "`test`";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test", format!("{}", out));
+		assert_eq!("test", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test")])));
 	}
 
@@ -941,7 +931,7 @@ mod tests {
 	fn idiom_quoted_brackets() {
 		let sql = "⟨test⟩";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test", format!("{}", out));
+		assert_eq!("test", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test")])));
 	}
 
@@ -949,7 +939,7 @@ mod tests {
 	fn idiom_nested() {
 		let sql = "test.temp";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.temp", format!("{}", out));
+		assert_eq!("test.temp", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test"), f("temp")])));
 	}
 
@@ -957,7 +947,7 @@ mod tests {
 	fn idiom_nested_quoted() {
 		let sql = "test.`some key`";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.`some key`", format!("{}", out));
+		assert_eq!("test.`some key`", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test"), f("some key")])));
 	}
 
@@ -965,7 +955,7 @@ mod tests {
 	fn idiom_nested_array_all() {
 		let sql = "test.temp[*]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.temp.*", format!("{}", out));
+		assert_eq!("test.temp.*", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test"), f("temp"), Part::All])));
 	}
 
@@ -973,7 +963,7 @@ mod tests {
 	fn idiom_nested_array_last() {
 		let sql = "test.temp[$]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.temp[$]", format!("{}", out));
+		assert_eq!("test.temp[$]", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test"), f("temp"), Part::Last])));
 	}
 
@@ -981,7 +971,7 @@ mod tests {
 	fn idiom_nested_array_value() {
 		let sql = "test.temp[*].text";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.temp.*.text", format!("{}", out));
+		assert_eq!("test.temp.*.text", out.to_sql());
 		assert_eq!(out, sql::Expr::Idiom(Idiom(vec![f("test"), f("temp"), Part::All, f("text")])));
 	}
 
@@ -989,7 +979,7 @@ mod tests {
 	fn idiom_nested_array_question() {
 		let sql = "test.temp[? test = true].text";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.temp[WHERE test = true].text", format!("{}", out));
+		assert_eq!("test.temp[WHERE test = true].text", out.to_sql());
 		assert_eq!(
 			out,
 			sql::Expr::Idiom(Idiom(vec![
@@ -1009,7 +999,7 @@ mod tests {
 	fn idiom_nested_array_condition() {
 		let sql = "test.temp[WHERE test = true].text";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("test.temp[WHERE test = true].text", format!("{}", out));
+		assert_eq!("test.temp[WHERE test = true].text", out.to_sql());
 		assert_eq!(
 			out,
 			sql::Expr::Idiom(Idiom(vec![
@@ -1029,7 +1019,7 @@ mod tests {
 	fn idiom_start_param_local_field() {
 		let sql = "$test.temporary[0].embedded…";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("$test.temporary[0].embedded…", format!("{}", out));
+		assert_eq!("$test.temporary[0].embedded…", out.to_sql());
 		assert_eq!(
 			out,
 			sql::Expr::Idiom(Idiom(vec![
@@ -1046,7 +1036,7 @@ mod tests {
 	fn idiom_start_thing_remote_traversal() {
 		let sql = "person:test.friend->like->person";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("person:test.friend->like->person", format!("{}", out));
+		assert_eq!("(person:test).friend->like->person", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1057,12 +1047,18 @@ mod tests {
 				f("friend"),
 				Part::Graph(Lookup {
 					kind: LookupKind::Graph(Dir::Out),
-					what: vec![LookupSubject::Table("like".to_owned())],
+					what: vec![LookupSubject::Table {
+						table: "like".to_owned(),
+						referencing_field: None
+					}],
 					..Default::default()
 				}),
 				Part::Graph(Lookup {
 					kind: LookupKind::Graph(Dir::Out),
-					what: vec![LookupSubject::Table("person".to_owned())],
+					what: vec![LookupSubject::Table {
+						table: "person".to_owned(),
+						referencing_field: None
+					}],
 					..Default::default()
 				}),
 			]))
@@ -1073,7 +1069,7 @@ mod tests {
 	fn part_all() {
 		let sql = "{}[*]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }.*", format!("{}", out));
+		assert_eq!("{  }.*", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1087,7 +1083,7 @@ mod tests {
 	fn part_last() {
 		let sql = "{}[$]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }[$]", format!("{}", out));
+		assert_eq!("{  }[$]", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1101,7 +1097,7 @@ mod tests {
 	fn part_param() {
 		let sql = "{}[$param]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }[$param]", format!("{}", out));
+		assert_eq!("{  }[$param]", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1115,7 +1111,7 @@ mod tests {
 	fn part_flatten() {
 		let sql = "{}...";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }…", format!("{}", out));
+		assert_eq!("{  }…", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1129,7 +1125,7 @@ mod tests {
 	fn part_flatten_ellipsis() {
 		let sql = "{}…";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }…", format!("{}", out));
+		assert_eq!("{  }…", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1143,7 +1139,7 @@ mod tests {
 	fn part_number() {
 		let sql = "{}[0]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }[0]", format!("{}", out));
+		assert_eq!("{  }[0]", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1157,7 +1153,7 @@ mod tests {
 	fn part_expression_question() {
 		let sql = "{}[?test = true]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }[WHERE test = true]", format!("{}", out));
+		assert_eq!("{  }[WHERE test = true]", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![
@@ -1175,7 +1171,7 @@ mod tests {
 	fn part_expression_condition() {
 		let sql = "{}[WHERE test = true]";
 		let out = syn::expr(sql).unwrap();
-		assert_eq!("{  }[WHERE test = true]", format!("{}", out));
+		assert_eq!("{  }[WHERE test = true]", out.to_sql());
 		assert_eq!(
 			out,
 			Expr::Idiom(Idiom(vec![

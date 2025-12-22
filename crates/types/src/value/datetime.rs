@@ -5,10 +5,10 @@ use std::str::FromStr;
 use chrono::offset::LocalResult;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use surrealdb_types_derive::write_sql;
 
-use crate::sql::ToSql;
+use crate::sql::{SqlFormat, ToSql};
 use crate::utils::escape::QuoteStr;
-use crate::write_sql;
 
 /// Represents a datetime value in SurrealDB
 ///
@@ -35,13 +35,8 @@ impl Datetime {
 		Self(Utc::now())
 	}
 
-	/// Create a new datetime from chrono DateTime<Utc>
-	pub fn new(dt: DateTime<Utc>) -> Self {
-		Self(dt)
-	}
-
-	/// Get the inner DateTime<Utc>
-	pub fn inner(&self) -> DateTime<Utc> {
+	/// Convert into the inner DateTime<Utc>
+	pub fn into_inner(self) -> DateTime<Utc> {
 		self.0
 	}
 
@@ -81,8 +76,9 @@ impl Display for Datetime {
 }
 
 impl ToSql for Datetime {
-	fn fmt_sql(&self, f: &mut String) {
-		write_sql!(f, "d{}", QuoteStr(&self.to_string()))
+	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
+		use crate as surrealdb_types;
+		write_sql!(f, fmt, "d{}", QuoteStr(&self.to_string()));
 	}
 }
 
@@ -107,5 +103,47 @@ impl Deref for Datetime {
 	type Target = DateTime<Utc>;
 	fn deref(&self) -> &Self::Target {
 		&self.0
+	}
+}
+
+#[cfg(feature = "arbitrary")]
+mod arb {
+	use arbitrary::Arbitrary;
+	use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
+
+	use super::*;
+
+	impl<'a> Arbitrary<'a> for Datetime {
+		fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+			let date = u.arbitrary::<NaiveDate>()?;
+			let time = u.arbitrary::<NaiveTime>()?;
+			// Arbitrary was able to create times with 60 seconds instead of the 59 second limit.
+			let time = time.with_second(time.second() % 60).expect("0 to 59 is a valid second");
+			let time = time
+				.with_nanosecond(time.nanosecond() % 1_000_000_000)
+				.expect("0 to 999_999_999 is a valid nanosecond");
+
+			let offset = if u.arbitrary()? {
+				Utc.fix()
+			} else {
+				let hour = u.int_in_range(0..=23)?;
+				let minute = u.int_in_range(0..=59)?;
+				if u.arbitrary()? {
+					FixedOffset::west_opt(hour * 3600 + minute * 60)
+						.expect("valid because range was ensured")
+				} else {
+					FixedOffset::east_opt(hour * 3600 + minute * 60)
+						.expect("valid because range was ensured")
+				}
+			};
+
+			let datetime = NaiveDateTime::new(date, time);
+
+			let Some(x) = offset.from_local_datetime(&datetime).earliest() else {
+				return Err(arbitrary::Error::IncorrectFormat);
+			};
+
+			Ok(Datetime(x.with_timezone(&Utc)))
+		}
 	}
 }

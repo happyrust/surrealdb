@@ -9,7 +9,7 @@ use crate::catalog::providers::{DatabaseProvider, TableProvider};
 use crate::catalog::{
 	DatabaseId, HnswParams, Index, IndexDefinition, NamespaceId, TableDefinition, TableId,
 };
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::idx::IndexKeyBase;
 use crate::idx::trees::hnsw::cache::VectorCache;
 use crate::idx::trees::store::hnsw::{HnswIndexes, SharedHnswIndex};
@@ -41,12 +41,12 @@ impl IndexStores {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		tb: TableId,
 		ix: &IndexDefinition,
 		p: &HnswParams,
 	) -> Result<SharedHnswIndex> {
-		let ikb = IndexKeyBase::new(ns, db, &ix.table_name, ix.index_id);
+		let ikb = IndexKeyBase::new(ns, db, ix.table_name.clone(), ix.index_id);
 		self.0.hnsw_indexes.get(ctx, tb, &ikb, p).await
 	}
 
@@ -114,7 +114,7 @@ impl IndexStores {
 		ix: &IndexDefinition,
 	) -> Result<()> {
 		if matches!(ix.index, Index::Hnsw(_)) {
-			let ikb = IndexKeyBase::new(ns, db, &ix.table_name, ix.index_id);
+			let ikb = IndexKeyBase::new(ns, db, ix.table_name.clone(), ix.index_id);
 			self.remove_hnsw_index(tb, ikb).await?;
 		}
 		Ok(())

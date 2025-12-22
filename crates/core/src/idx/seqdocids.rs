@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::idx::IndexKeyBase;
 use crate::kvs::Transaction;
 use crate::val::RecordIdKey;
@@ -94,7 +94,7 @@ impl SeqDocIds {
 	/// * `Ok(Resolved::New(DocId))` - If a new document ID was created
 	pub(in crate::idx) async fn resolve_doc_id(
 		&self,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		id: RecordIdKey,
 	) -> Result<Resolved> {
 		let id_key = self.ikb.new_id_key(id.clone());
@@ -164,33 +164,33 @@ impl SeqDocIds {
 #[cfg(test)]
 mod tests {
 	use crate::catalog::{DatabaseId, IndexId, NamespaceId};
-	use crate::ctx::Context;
+	use crate::ctx::FrozenContext;
 	use crate::idx::IndexKeyBase;
 	use crate::idx::seqdocids::{DocId, Resolved, SeqDocIds};
 	use crate::kvs::LockType::Optimistic;
 	use crate::kvs::TransactionType::{Read, Write};
 	use crate::kvs::{Datastore, TransactionType};
-	use crate::val::RecordIdKey;
+	use crate::val::{RecordIdKey, TableName};
 
 	const TEST_NS_ID: NamespaceId = NamespaceId(1);
 	const TEST_DB_ID: DatabaseId = DatabaseId(1);
 	const TEST_TB: &str = "test_tb";
 	const TEST_IX_ID: IndexId = IndexId(1);
 
-	async fn new_operation(ds: &Datastore, tt: TransactionType) -> (Context, SeqDocIds) {
+	async fn new_operation(ds: &Datastore, tt: TransactionType) -> (FrozenContext, SeqDocIds) {
 		let mut ctx = ds.setup_ctx().unwrap();
 		let tx = ds.transaction(tt, Optimistic).await.unwrap();
-		let ikb = IndexKeyBase::new(TEST_NS_ID, TEST_DB_ID, TEST_TB, TEST_IX_ID);
+		let ikb = IndexKeyBase::new(TEST_NS_ID, TEST_DB_ID, TEST_TB.into(), TEST_IX_ID);
 		ctx.set_transaction(tx.into());
 		let d = SeqDocIds::new(ikb);
 		(ctx.freeze(), d)
 	}
 
-	async fn finish(ctx: Context) {
+	async fn finish(ctx: FrozenContext) {
 		ctx.tx().commit().await.unwrap();
 	}
 
-	async fn check_get_doc_key_id(ctx: &Context, d: &SeqDocIds, doc_id: DocId, key: &str) {
+	async fn check_get_doc_key_id(ctx: &FrozenContext, d: &SeqDocIds, doc_id: DocId, key: &str) {
 		let tx = ctx.tx();
 		let id = RecordIdKey::String(key.into());
 		assert_eq!(SeqDocIds::get_id(&d.ikb, &tx, doc_id).await.unwrap(), Some(id.clone()));
@@ -385,17 +385,18 @@ mod tests {
 		{
 			let (ctx, _) = new_operation(&ds, Read).await;
 			let tx = ctx.tx();
+			let tb = TableName::from(TEST_TB);
 			for id in ["Foo", "Bar", "Hello", "World"] {
 				let id = crate::key::index::id::Id::new(
 					TEST_NS_ID,
 					TEST_DB_ID,
-					TEST_TB,
+					&tb,
 					TEST_IX_ID,
 					RecordIdKey::String(id.into()),
 				);
 				assert!(!tx.exists(&id, None).await.unwrap());
 			}
-			let ikb = IndexKeyBase::new(TEST_NS_ID, TEST_DB_ID, TEST_TB, TEST_IX_ID);
+			let ikb = IndexKeyBase::new(TEST_NS_ID, TEST_DB_ID, TEST_TB.into(), TEST_IX_ID);
 			for doc_id in 0..=3 {
 				assert_eq!(SeqDocIds::get_id(&ikb, &tx, doc_id).await.unwrap(), None);
 			}

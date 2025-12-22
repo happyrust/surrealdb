@@ -1,14 +1,11 @@
-use std::fmt;
-
 use anyhow::Result;
 use reblessive::tree::Stk;
 
 use crate::catalog::{ApiConfigDefinition, MiddlewareDefinition, Permission};
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::expr::{Expr, FlowResultExt};
-use crate::fmt::Fmt;
 
 /// The api configuration as it is received from ast.
 
@@ -27,10 +24,11 @@ pub(crate) struct Middleware {
 }
 
 impl ApiConfig {
+	#[instrument(level = "trace", name = "ApiConfig::compute", skip_all)]
 	pub(crate) async fn compute(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
 	) -> Result<ApiConfigDefinition> {
@@ -50,25 +48,5 @@ impl ApiConfig {
 			middleware,
 			permissions: self.permissions.clone(),
 		})
-	}
-}
-
-impl fmt::Display for ApiConfig {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		if !self.middleware.is_empty() {
-			write!(f, " MIDDLEWARE ")?;
-			write!(
-				f,
-				"{}",
-				Fmt::pretty_comma_separated(self.middleware.iter().map(|m| format!(
-					"{}({})",
-					m.name,
-					Fmt::pretty_comma_separated(m.args.iter())
-				)))
-			)?
-		}
-
-		write!(f, " PERMISSIONS {}", self.permissions)?;
-		Ok(())
 	}
 }

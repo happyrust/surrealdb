@@ -1,4 +1,3 @@
-use std::fmt::{self, Display};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -7,17 +6,16 @@ use surrealdb_types::ToSql;
 use uuid::Uuid;
 
 use super::DefineKind;
-use crate::catalog::providers::{CatalogProvider, TableProvider};
+use crate::catalog::providers::TableProvider;
 use crate::catalog::{Index, IndexDefinition, TableDefinition, TableId};
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::expr::parameterize::{expr_to_ident, exprs_to_fields};
-use crate::expr::{Base, Expr, Literal, Part};
-use crate::fmt::Fmt;
+use crate::expr::{Base, Expr, FlowResultExt, Literal, Part};
 use crate::iam::{Action, ResourceKind};
-use crate::val::Value;
+use crate::val::{TableName, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DefineIndexStatement {
@@ -26,7 +24,7 @@ pub(crate) struct DefineIndexStatement {
 	pub what: Expr,
 	pub cols: Vec<Expr>,
 	pub index: Index,
-	pub comment: Option<Expr>,
+	pub comment: Expr,
 	pub concurrently: bool,
 }
 
@@ -38,7 +36,7 @@ impl Default for DefineIndexStatement {
 			what: Expr::Literal(Literal::None),
 			cols: Vec::new(),
 			index: Index::Idx,
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 			concurrently: false,
 		}
 	}
@@ -46,10 +44,11 @@ impl Default for DefineIndexStatement {
 
 impl DefineIndexStatement {
 	/// Process this type returning a computed simple Value
+	#[instrument(level = "trace", name = "DefineIndexStatement::compute", skip_all)]
 	pub(crate) async fn compute(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
@@ -60,11 +59,12 @@ impl DefineIndexStatement {
 
 		// Compute name and what
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "index name").await?;
-		let what = expr_to_ident(stk, ctx, opt, doc, &self.what, "index table").await?;
+		let table_name =
+			TableName::new(expr_to_ident(stk, ctx, opt, doc, &self.what, "index table").await?);
 
 		// Ensure the table exists
 		let (ns, db) = opt.ns_db()?;
-		let tb = txn.ensure_ns_db_tb(Some(ctx), ns, db, &what, opt.strict).await?;
+		let tb = txn.get_or_add_tb(Some(ctx), ns, db, &table_name).await?;
 
 		// Check if the definition exists
 		let index_id = if let Some(ix) =
@@ -74,7 +74,7 @@ impl DefineIndexStatement {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::IxAlreadyExists {
-							name: self.name.to_string(),
+							name: self.name.to_sql(),
 						});
 					}
 				}
@@ -117,19 +117,25 @@ impl DefineIndexStatement {
 			}
 		}
 
+		let comment = stk
+			.run(|stk| self.comment.compute(stk, ctx, opt, doc))
+			.await
+			.catch_return()?
+			.cast_to()?;
+
 		// Process the statement
 		let index_def = IndexDefinition {
 			index_id,
 			name,
-			table_name: what,
+			table_name,
 			cols: cols.clone(),
 			index: self.index.clone(),
-			comment: map_opt!(x as &self.comment => compute_to!(stk, ctx, opt, doc, x => String)),
+			comment,
+			prepare_remove: false,
 		};
 		txn.put_tb_index(tb.namespace_id, tb.database_id, &tb.name, &index_def).await?;
 
 		// Refresh the table cache
-
 		txn.put_tb(
 			ns,
 			db,
@@ -153,34 +159,8 @@ impl DefineIndexStatement {
 		Ok(Value::None)
 	}
 }
-
-impl Display for DefineIndexStatement {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "DEFINE INDEX")?;
-		match self.kind {
-			DefineKind::Default => {}
-			DefineKind::Overwrite => write!(f, " OVERWRITE")?,
-			DefineKind::IfNotExists => write!(f, " IF NOT EXISTS")?,
-		}
-		write!(f, " {} ON {}", self.name, self.what)?;
-		if !self.cols.is_empty() {
-			write!(f, " FIELDS {}", Fmt::comma_separated(self.cols.iter()))?;
-		}
-		if Index::Idx != self.index {
-			write!(f, " {}", self.index.to_sql())?;
-		}
-		if let Some(ref v) = self.comment {
-			write!(f, " COMMENT {v}")?
-		}
-		if self.concurrently {
-			write!(f, " CONCURRENTLY")?
-		}
-		Ok(())
-	}
-}
-
 pub(in crate::expr::statements) async fn run_indexing(
-	ctx: &Context,
+	ctx: &FrozenContext,
 	opt: &Options,
 	tb: TableId,
 	ix: Arc<IndexDefinition>,
@@ -192,7 +172,9 @@ pub(in crate::expr::statements) async fn run_indexing(
 		.build(ctx, opt.clone(), tb, ix, blocking)
 		.await?;
 	if let Some(rcv) = rcv {
-		rcv.await.map_err(|_| Error::IndexingBuildingCancelled)?
+		rcv.await.map_err(|_| Error::IndexingBuildingCancelled {
+			reason: "Channel shutdown".to_string(),
+		})?
 	} else {
 		Ok(())
 	}

@@ -8,6 +8,7 @@ use async_graphql::{Name, Value as GqlValue};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use serde_json::Number;
+use surrealdb_types::ToSql;
 
 use super::error::{GqlError, resolver_error};
 #[cfg(debug_assertions)]
@@ -23,7 +24,7 @@ use crate::gql::tables::process_tbs;
 use crate::kvs::{Datastore, LockType, TransactionType};
 use crate::val::{
 	Array as SurArray, Number as SurNumber, Object as SurObject, RecordId as SurRecordId,
-	RecordIdKey as SurRecordIdKey, Set as SurSet, Table, Value as SurValue,
+	RecordIdKey as SurRecordIdKey, Set as SurSet, TableName, Value as SurValue,
 };
 
 pub async fn generate_schema(
@@ -207,7 +208,7 @@ pub(crate) fn sql_value_to_gql_value(v: SurValue) -> Result<GqlValue, GqlError> 
 			num @ SurNumber::Decimal(_) => GqlValue::String(num.to_string()),
 		},
 		SurValue::String(s) => GqlValue::String(s),
-		d @ SurValue::Duration(_) => GqlValue::String(d.to_string()),
+		d @ SurValue::Duration(_) => GqlValue::String(d.to_sql()),
 		SurValue::Datetime(d) => GqlValue::String(d.to_rfc3339()),
 		SurValue::Uuid(uuid) => GqlValue::String(uuid.to_string()),
 		SurValue::Array(a) => GqlValue::List(
@@ -226,8 +227,8 @@ pub(crate) fn sql_value_to_gql_value(v: SurValue) -> Result<GqlValue, GqlError> 
 				.collect(),
 		),
 		SurValue::Geometry(_) => return Err(resolver_error("unimplemented: Geometry types")),
-		SurValue::Bytes(b) => GqlValue::Binary(b.into_inner().into()),
-		SurValue::RecordId(t) => GqlValue::String(t.to_string()),
+		SurValue::Bytes(b) => GqlValue::Binary(b.into_inner()),
+		SurValue::RecordId(t) => GqlValue::String(t.to_sql()),
 		v => return Err(internal_error(format!("found unsupported value variant: {v:?}"))),
 	};
 	Ok(out)
@@ -251,17 +252,17 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 		Kind::Regex => return Err(schema_error("Kind::Regex is not yet supported")),
 		Kind::String => TypeRef::named(TypeRef::STRING),
 		Kind::Uuid => TypeRef::named("uuid"),
-		Kind::Table(ref _t) => TypeRef::named(kind.to_string()),
+		Kind::Table(ref _t) => TypeRef::named(kind.to_sql()),
 		Kind::Record(mut tables) => match tables.len() {
 			0 => TypeRef::named("record"),
-			1 => TypeRef::named(tables.pop().expect("single table in record kind")),
+			1 => TypeRef::named(tables.pop().expect("single table in record kind").into_string()),
 			_ => {
 				let ty_name = tables.join("_or_");
 
 				let mut tmp_union = Union::new(ty_name.clone())
 					.description(format!("A record which is one of: {}", tables.join(", ")));
 				for n in tables {
-					tmp_union = tmp_union.possible_type(n);
+					tmp_union = tmp_union.possible_type(n.into_string());
 				}
 
 				types.push(Type::Union(tmp_union));
@@ -427,7 +428,7 @@ fn convert_static_record_id_key(
 fn convert_static_expr(expr: Expr) -> Result<SurValue, GqlError> {
 	match expr {
 		Expr::Literal(lit) => convert_static_literal(lit),
-		Expr::Table(t) => Ok(SurValue::Table(Table::new(t))),
+		Expr::Table(t) => Ok(SurValue::Table(t)),
 		_ => Err(resolver_error("Only literal values are supported in GraphQL inputs")),
 	}
 }
@@ -511,7 +512,7 @@ pub(crate) fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SurValue, Gq
 			_ => Err(type_error(kind, val)),
 		},
 		Kind::Bytes => match val {
-			GqlValue::Binary(b) => Ok(SurValue::Bytes(b.to_owned().to_vec().into())),
+			GqlValue::Binary(b) => Ok(SurValue::Bytes(bytes::Bytes::copy_from_slice(b).into())),
 			_ => Err(type_error(kind, val)),
 		},
 		Kind::Datetime => match val {
@@ -657,7 +658,7 @@ pub(crate) fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SurValue, Gq
 		},
 		Kind::Table(ref ts) => match val {
 			GqlValue::String(s) => match ts.contains(&s.as_str().into()) {
-				true => Ok(SurValue::Table(Table::new(s.clone()))),
+				true => Ok(SurValue::Table(TableName::new(s.clone()))),
 				false => Err(type_error(kind, val)),
 			},
 			_ => Err(type_error(kind, val)),
@@ -705,9 +706,9 @@ pub(crate) fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SurValue, Gq
 				}
 				string @ GqlValue::String(_) => {
 					either_try_kinds!(
-						ks, string, Datetime, Duration, AllNumbers, Object, Uuid, Array, Any,
-						String
+						ks, string, Datetime, Duration, AllNumbers, Uuid, Array, Any, String
 					);
+					either_try_kind!(ks, string, Kind::Object);
 					Err(type_error(kind, val))
 				}
 				bool @ GqlValue::Boolean(_) => {
@@ -727,7 +728,7 @@ pub(crate) fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SurValue, Gq
 				}
 				// TODO: consider geometry and other types that can come from objects
 				obj @ GqlValue::Object(_) => {
-					either_try_kind!(ks, obj, Object);
+					either_try_kind!(ks, obj, Kind::Object);
 					Err(type_error(kind, val))
 				}
 			}

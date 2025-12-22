@@ -46,6 +46,7 @@ mod backup_version;
 mod basic;
 mod live;
 mod serialisation;
+mod session_isolation;
 mod version;
 
 const ROOT_USER: &str = "root";
@@ -229,7 +230,7 @@ mod ws {
 		}
 
 		// Set a 256 MiB limit for testing large message handling
-		let max_size = 256 << 20;
+		let max_size = 128 << 20;
 
 		let permit = PERMITS.acquire().await.unwrap();
 		// Configure WebSocket with custom size limits for testing
@@ -275,7 +276,7 @@ mod ws {
 		}
 	}
 
-	include_tests!(new_db => basic, serialisation, live);
+	include_tests!(new_db => basic, serialisation, live, session_isolation);
 }
 
 #[cfg(feature = "protocol-http")]
@@ -310,7 +311,7 @@ mod http {
 		drop(permit);
 	}
 
-	include_tests!(new_db => basic, serialisation, backup);
+	include_tests!(new_db => basic, serialisation, backup, session_isolation);
 }
 
 #[cfg(feature = "kv-mem")]
@@ -416,20 +417,20 @@ mod mem {
 	async fn experimental_features() {
 		let surql = "
 		    USE NAMESPACE namespace DATABASE database;
-			DEFINE FIELD using ON house TYPE record<utility> REFERENCE ON DELETE CASCADE;
+			DEFINE API \"/\" FOR any THEN {};
 		";
 		// Experimental features are rejected by default
 		let db = Surreal::new::<Mem>(()).await.unwrap();
 		db.query(surql).await.unwrap_err();
 		// Experimental features can be allowed
-		let capabilities = Capabilities::new()
-			.with_experimental_feature_allowed(ExperimentalFeature::RecordReferences);
+		let capabilities =
+			Capabilities::new().with_experimental_feature_allowed(ExperimentalFeature::DefineApi);
 		let config = Config::new().capabilities(capabilities);
 		let db = Surreal::new::<Mem>(config).await.unwrap();
 		db.query(surql).await.unwrap().check().unwrap();
 	}
 
-	include_tests!(new_db => basic, serialisation, live, backup);
+	include_tests!(new_db => basic, serialisation, live, backup, session_isolation);
 }
 
 #[cfg(feature = "kv-rocksdb")]
@@ -475,7 +476,7 @@ mod rocksdb {
 		}
 	}
 
-	include_tests!(new_db => basic, serialisation, live, backup);
+	include_tests!(new_db => basic, serialisation, live, backup, session_isolation);
 }
 
 #[cfg(feature = "kv-tikv")]
@@ -509,36 +510,7 @@ mod tikv {
 		drop(permit);
 	}
 
-	include_tests!(new_db => basic, serialisation, live, backup);
-}
-
-#[cfg(feature = "kv-fdb")]
-mod fdb {
-	use surrealdb::Surreal;
-	use surrealdb::engine::local::{Db, FDb};
-	use surrealdb::opt::Config;
-	use surrealdb::opt::auth::Root;
-	use tokio::sync::{Semaphore, SemaphorePermit};
-
-	use super::{ROOT_PASS, ROOT_USER};
-
-	static PERMITS: Semaphore = Semaphore::const_new(1);
-
-	async fn new_db(config: Config) -> (SemaphorePermit<'static>, Surreal<Db>) {
-		let permit = PERMITS.acquire().await.unwrap();
-		let root = Root {
-			username: ROOT_USER.to_string(),
-			password: ROOT_PASS.to_string(),
-		};
-		let config = config.user(root.clone());
-		let path = "/etc/foundationdb/fdb.cluster";
-		surrealdb::engine::any::connect((format!("fdb://{path}"), config.clone())).await.unwrap();
-		let db = Surreal::new::<FDb>((path, config)).await.unwrap();
-		db.signin(root).await.unwrap();
-		(permit, db)
-	}
-
-	include_tests!(new_db => basic, serialisation, live, backup);
+	include_tests!(new_db => basic, serialisation, live, backup, session_isolation);
 }
 
 #[cfg(feature = "kv-surrealkv")]
@@ -586,7 +558,7 @@ mod surrealkv {
 		}
 	}
 
-	include_tests!(new_db => basic, serialisation, live, backup);
+	include_tests!(new_db => basic, serialisation, live, backup, session_isolation);
 }
 
 #[cfg(feature = "kv-surrealkv")]
@@ -634,7 +606,7 @@ mod surrealkv_versioned {
 		}
 	}
 
-	include_tests!(new_db => basic, serialisation, version, live, backup, backup_version);
+	include_tests!(new_db => basic, serialisation, version, live, backup, backup_version, session_isolation);
 }
 
 #[cfg(feature = "protocol-http")]
@@ -661,5 +633,5 @@ mod any {
 		(permit, db)
 	}
 
-	include_tests!(new_db => basic, serialisation, backup);
+	include_tests!(new_db => basic, serialisation, backup, session_isolation);
 }

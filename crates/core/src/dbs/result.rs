@@ -2,7 +2,7 @@ use anyhow::Result;
 use reblessive::tree::Stk;
 
 use crate::cnf::MAX_ORDER_LIMIT_PRIORITY_QUEUE_SIZE;
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 #[cfg(storage)]
 use crate::dbs::file::FileCollector;
 use crate::dbs::group::GroupCollector;
@@ -13,7 +13,9 @@ use crate::expr::order::Ordering;
 use crate::idx::planner::RecordStrategy;
 use crate::val::Value;
 
+#[derive(Default)]
 pub(super) enum Results {
+	#[default]
 	None,
 	Memory(MemoryCollector),
 	MemoryRandom(MemoryRandom),
@@ -27,7 +29,7 @@ pub(super) enum Results {
 impl Results {
 	pub(super) fn prepare(
 		&mut self,
-		#[cfg(storage)] ctx: &Context,
+		#[cfg(storage)] ctx: &FrozenContext,
 		stm: &Statement<'_>,
 		start: Option<u32>,
 		limit: Option<u32>,
@@ -36,10 +38,10 @@ impl Results {
 			return Ok(Self::Groups(GroupCollector::new(stm)?));
 		}
 		#[cfg(storage)]
-		if stm.tempfiles() {
-			if let Some(temp_dir) = ctx.temporary_directory() {
-				return Ok(Self::File(Box::new(FileCollector::new(temp_dir)?)));
-			}
+		if stm.tempfiles()
+			&& let Some(temp_dir) = ctx.temporary_directory()
+		{
+			return Ok(Self::File(Box::new(FileCollector::new(temp_dir)?)));
 		}
 		if let Some(ordering) = stm.order() {
 			return match ordering {
@@ -70,7 +72,7 @@ impl Results {
 	pub(super) async fn push(
 		&mut self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		rs: RecordStrategy,
 		val: Value,
@@ -196,12 +198,6 @@ impl Results {
 				g.explain(exp);
 			}
 		}
-	}
-}
-
-impl Default for Results {
-	fn default() -> Self {
-		Self::None
 	}
 }
 

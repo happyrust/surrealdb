@@ -372,21 +372,21 @@ where
 		vec_docs: &VecDocs,
 		chk: &mut HnswConditionChecker<'_>,
 	) -> Result<Vec<(f64, ElementId)>> {
-		if let Some((ep_dist, ep_id)) = self.search_ep(tx, &search.pt).await? {
-			if let Some(ep_pt) = self.elements.get_vector(tx, &ep_id).await? {
-				let search_ctx = HnswCheckedSearchContext::new(
-					&self.elements,
-					hnsw_docs,
-					vec_docs,
-					&search.pt,
-					search.ef,
-				);
-				let w = self
-					.layer0
-					.search_single_checked(db, tx, stk, &search_ctx, &ep_pt, ep_dist, ep_id, chk)
-					.await?;
-				return Ok(w.to_vec_limit(search.k));
-			}
+		if let Some((ep_dist, ep_id)) = self.search_ep(tx, &search.pt).await?
+			&& let Some(ep_pt) = self.elements.get_vector(tx, &ep_id).await?
+		{
+			let search_ctx = HnswCheckedSearchContext::new(
+				&self.elements,
+				hnsw_docs,
+				vec_docs,
+				&search.pt,
+				search.ef,
+			);
+			let w = self
+				.layer0
+				.search_single_checked(db, tx, stk, &search_ctx, &ep_pt, ep_dist, ep_id, chk)
+				.await?;
+			return Ok(w.to_vec_limit(search.k));
 		}
 		Ok(vec![])
 	}
@@ -458,7 +458,7 @@ mod tests {
 		DatabaseDefinition, DatabaseId, Distance, HnswParams, IndexId, NamespaceId,
 		TableDefinition, TableId, VectorType,
 	};
-	use crate::ctx::{Context, MutableContext};
+	use crate::ctx::{Context, FrozenContext};
 	use crate::idx::IndexKeyBase;
 	use crate::idx::planner::checker::HnswConditionChecker;
 	use crate::idx::seqdocids::DocId;
@@ -496,11 +496,11 @@ mod tests {
 				if collection.is_unique() {
 					let mut found = false;
 					for (_, e_id) in &res {
-						if let Some(v) = h.get_vector(tx, e_id).await.unwrap() {
-							if v.eq(obj) {
-								found = true;
-								break;
-							}
+						if let Some(v) = h.get_vector(tx, e_id).await.unwrap()
+							&& v.eq(obj)
+						{
+							found = true;
+							break;
 						}
 					}
 					assert!(
@@ -547,10 +547,10 @@ mod tests {
 		let ns = NamespaceId(1);
 		let db = DatabaseId(2);
 		let tb = TableId(3);
-		let tb = TableDefinition::new(ns, db, tb, "tb".to_string());
+		let tb = TableDefinition::new(ns, db, tb, "tb".into());
 		let mut h = HnswFlavor::new(
 			tb.table_id,
-			IndexKeyBase::new(NamespaceId(1), DatabaseId(2), &tb.name, IndexId(4)),
+			IndexKeyBase::new(NamespaceId(1), DatabaseId(2), tb.name.clone(), IndexId(4)),
 			p,
 			ds.index_store().vector_cache().clone(),
 		)
@@ -728,9 +728,9 @@ mod tests {
 		Ok(())
 	}
 
-	async fn new_ctx(ds: &Datastore, tt: TransactionType) -> Context {
+	async fn new_ctx(ds: &Datastore, tt: TransactionType) -> FrozenContext {
 		let tx = Arc::new(ds.transaction(tt, Optimistic).await.unwrap());
-		let mut ctx = MutableContext::default();
+		let mut ctx = Context::default();
 		ctx.set_transaction(tx);
 		ctx.freeze()
 	}
@@ -759,7 +759,7 @@ mod tests {
 			let mut h = HnswIndex::new(
 				ctx.get_index_stores().vector_cache().clone(),
 				&tx,
-				IndexKeyBase::new(ns, db, "tb", ix),
+				IndexKeyBase::new(ns, db, "tb".into(), ix),
 				tb,
 				&p,
 			)
@@ -777,7 +777,7 @@ mod tests {
 			let ctx = new_ctx(&ds, TransactionType::Write).await;
 			let tx = ctx.tx();
 
-			let db = tx.ensure_ns_db(None, "myns", "mydb", false).await.unwrap();
+			let db = tx.ensure_ns_db(None, "myns", "mydb").await.unwrap();
 
 			stack
 				.enter(|stk| async {
@@ -848,7 +848,7 @@ mod tests {
 			(9, new_i16_vec(-4, -2)),
 			(10, new_i16_vec(0, 3)),
 		]);
-		let ikb = IndexKeyBase::new(NamespaceId(1), DatabaseId(2), "tb", IndexId(4));
+		let ikb = IndexKeyBase::new(NamespaceId(1), DatabaseId(2), "tb".into(), IndexId(4));
 		let p = new_params(2, VectorType::I16, Distance::Euclidean, 3, 500, true, true);
 		let ds = Arc::new(Datastore::new("memory").await.unwrap());
 		let mut h =
@@ -878,7 +878,7 @@ mod tests {
 
 		let ds = Arc::new(Datastore::new("memory").await?);
 		let tx = ds.transaction(TransactionType::Write, Optimistic).await.unwrap();
-		let db = tx.ensure_ns_db(None, "myns", "mydb", false).await.unwrap();
+		let db = tx.ensure_ns_db(None, "myns", "mydb").await.unwrap();
 		tx.commit().await.unwrap();
 
 		let collection: Arc<TestCollection> =
@@ -895,7 +895,7 @@ mod tests {
 		let mut h = HnswIndex::new(
 			ctx.get_index_stores().vector_cache().clone(),
 			&tx,
-			IndexKeyBase::new(db.namespace_id, db.database_id, "tb", ix),
+			IndexKeyBase::new(db.namespace_id, db.database_id, "tb".into(), ix),
 			tb,
 			&p,
 		)

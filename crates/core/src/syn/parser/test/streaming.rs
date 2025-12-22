@@ -8,6 +8,7 @@ use crate::sql::access_type::{
 };
 use crate::sql::changefeed::ChangeFeed;
 use crate::sql::data::Assignment;
+use crate::sql::field::Selector;
 use crate::sql::filter::Filter;
 use crate::sql::index::FullTextParams;
 use crate::sql::language::Language;
@@ -33,7 +34,7 @@ use crate::sql::{
 	Algorithm, AssignOperator, Base, BinaryOperator, Block, Cond, Data, Dir, Explain, Expr, Fetch,
 	Fetchs, Field, Fields, Function, FunctionCall, Group, Groups, Idiom, Index, Kind, Limit,
 	Literal, Lookup, Mock, Order, Output, Param, Part, Permission, Permissions, RecordIdKeyLit,
-	RecordIdLit, Scoring, Script, Split, Splits, Start, TableType, Timeout, TopLevelExpr, With,
+	RecordIdLit, Scoring, Script, Split, Splits, Start, TableType, TopLevelExpr, With,
 };
 use crate::syn::parser::StatementStream;
 use crate::types::{PublicDatetime, PublicDuration, PublicUuid};
@@ -64,7 +65,7 @@ static SOURCE: &str = r#"
 	DEFINE PARAM $a VALUE { a: 1, "b": 3 } PERMISSIONS WHERE null;
 	DEFINE TABLE name DROP SCHEMAFUL CHANGEFEED 1s PERMISSIONS FOR SELECT WHERE a = 1 AS SELECT foo FROM bar GROUP BY foo;
 	DEFINE EVENT event ON TABLE table WHEN null THEN null,none;
-	DEFINE FIELD foo.*[*]... ON TABLE bar FLEX TYPE option<number | array<record<foo>,10>> VALUE null ASSERT true DEFAULT false PERMISSIONS FOR UPDATE NONE, FOR CREATE WHERE true;
+	DEFINE FIELD foo.*[*]... ON TABLE bar TYPE option<number | array<record<foo>,10>> VALUE null ASSERT true DEFAULT false PERMISSIONS FOR UPDATE NONE, FOR CREATE WHERE true;
 	DEFINE INDEX index ON TABLE table FIELDS a FULLTEXT ANALYZER ana BM25 (0.1,0.2) HIGHLIGHTS;
 	DEFINE INDEX index ON TABLE table FIELDS a UNIQUE;
 	DEFINE ANALYZER ana FILTERS ASCII, EDGENGRAM(1,2), NGRAM(3,4), LOWERCASE, SNOWBALL(NLD), UPPERCASE TOKENIZERS BLANK, CAMEL, CLASS, PUNCT FUNCTION fn::foo::bar;
@@ -147,20 +148,20 @@ fn statements() -> Vec<TopLevelExpr> {
 					value: Expr::Literal(Literal::Integer(4)),
 				},
 			])),
-			output: Some(Output::Fields(Fields::Value(Box::new(Field::Single {
+			output: Some(Output::Fields(Fields::Value(Box::new(Selector {
 				expr: ident_field("foo"),
 				alias: Some(Idiom(vec![Part::Field("bar".to_owned())])),
 			})))),
-			timeout: Some(Timeout(Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))))),
+			timeout: Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))),
 			parallel: true,
-			version: None,
+			version: Expr::Literal(Literal::None),
 		}))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Namespace(
 			DefineNamespaceStatement {
 				kind: DefineKind::Default,
 				id: None,
 				name: Expr::Idiom(Idiom::field("a".to_owned())),
-				comment: Some(Expr::Literal(Literal::String("test".to_owned()))),
+				comment: Expr::Literal(Literal::String("test".to_owned())),
 			},
 		)))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Namespace(
@@ -168,7 +169,7 @@ fn statements() -> Vec<TopLevelExpr> {
 				kind: DefineKind::Default,
 				id: None,
 				name: Expr::Idiom(Idiom::field("a".to_owned())),
-				comment: None,
+				comment: Expr::Literal(Literal::None),
 			},
 		)))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Database(
@@ -176,7 +177,8 @@ fn statements() -> Vec<TopLevelExpr> {
 				kind: DefineKind::Default,
 				id: None,
 				name: Expr::Idiom(Idiom::field("a".to_string())),
-				comment: Some(Expr::Literal(Literal::String("test".to_string()))),
+				strict: false,
+				comment: Expr::Literal(Literal::String("test".to_string())),
 				changefeed: Some(ChangeFeed {
 					expiry: PublicDuration::from_secs(60 * 10),
 					store_diff: false,
@@ -188,7 +190,8 @@ fn statements() -> Vec<TopLevelExpr> {
 				kind: DefineKind::Default,
 				id: None,
 				name: Expr::Idiom(Idiom::field("a".to_string())),
-				comment: None,
+				strict: false,
+				comment: Expr::Literal(Literal::None),
 				changefeed: None,
 			},
 		)))),
@@ -204,7 +207,7 @@ fn statements() -> Vec<TopLevelExpr> {
 					what: ident_field("a"),
 					fetch: None,
 				}))]),
-				comment: Some(Expr::Literal(Literal::String("test".to_string()))),
+				comment: Expr::Literal(Literal::String("test".to_string())),
 				permissions: Permission::Full,
 				returns: None,
 			},
@@ -229,15 +232,11 @@ fn statements() -> Vec<TopLevelExpr> {
 				authenticate: None,
 				// Default durations.
 				duration: AccessDuration {
-					grant: Some(Expr::Literal(Literal::Duration(
-						PublicDuration::from_days(30).unwrap(),
-					))),
-					token: Some(Expr::Literal(Literal::Duration(
-						PublicDuration::from_hours(1).unwrap(),
-					))),
-					session: None,
+					grant: Expr::Literal(Literal::Duration(PublicDuration::from_days(30).unwrap())),
+					token: Expr::Literal(Literal::Duration(PublicDuration::from_hours(1).unwrap())),
+					session: Expr::Literal(Literal::None),
 				},
-				comment: Some(Expr::Literal(Literal::String("bar".to_string()))),
+				comment: Expr::Literal(Literal::String("bar".to_string())),
 			},
 		)))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Param(DefineParamStatement {
@@ -253,7 +252,7 @@ fn statements() -> Vec<TopLevelExpr> {
 					value: Expr::Literal(Literal::Integer(3)),
 				},
 			])),
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 			permissions: Permission::Specific(Expr::Literal(Literal::Null)),
 		})))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Table(DefineTableStatement {
@@ -263,10 +262,10 @@ fn statements() -> Vec<TopLevelExpr> {
 			drop: true,
 			full: true,
 			view: Some(crate::sql::View {
-				expr: Fields::Select(vec![Field::Single {
+				expr: Fields::Select(vec![Field::Single(Selector {
 					expr: ident_field("foo"),
 					alias: None,
-				}]),
+				})]),
 				what: vec!["bar".to_owned()],
 				cond: None,
 				group: Some(Groups(vec![Group(Idiom(vec![Part::Field("foo".to_owned())]))])),
@@ -285,7 +284,7 @@ fn statements() -> Vec<TopLevelExpr> {
 				expiry: PublicDuration::from_secs(1),
 				store_diff: false,
 			}),
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 
 			table_type: TableType::Normal,
 		})))),
@@ -295,7 +294,7 @@ fn statements() -> Vec<TopLevelExpr> {
 			target_table: Expr::Idiom(Idiom::field("table".to_string())),
 			when: Expr::Literal(Literal::Null),
 			then: vec![Expr::Literal(Literal::Null), Expr::Literal(Literal::None)],
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 		})))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Field(DefineFieldStatement {
 			kind: DefineKind::Default,
@@ -306,12 +305,12 @@ fn statements() -> Vec<TopLevelExpr> {
 				Part::Flatten,
 			])),
 			what: Expr::Idiom(Idiom::field("bar".to_string())),
-			flex: true,
 			field_kind: Some(Kind::Either(vec![
 				Kind::None,
 				Kind::Number,
 				Kind::Array(Box::new(Kind::Record(vec!["foo".to_owned()])), Some(10)),
 			])),
+			flexible: false,
 			readonly: false,
 			value: Some(Expr::Literal(Literal::Null)),
 			assert: Some(Expr::Literal(Literal::Bool(true))),
@@ -322,7 +321,7 @@ fn statements() -> Vec<TopLevelExpr> {
 				create: Permission::Specific(Expr::Literal(Literal::Bool(true))),
 				select: Permission::Full,
 			},
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 			reference: None,
 			computed: None,
 		})))),
@@ -339,7 +338,7 @@ fn statements() -> Vec<TopLevelExpr> {
 					b: 0.2,
 				},
 			}),
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 			concurrently: false,
 		})))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Index(DefineIndexStatement {
@@ -348,7 +347,7 @@ fn statements() -> Vec<TopLevelExpr> {
 			what: Expr::Idiom(Idiom::field("table".to_string())),
 			cols: vec![Expr::Idiom(Idiom(vec![Part::Field("a".to_string())]))],
 			index: Index::Uniq,
-			comment: None,
+			comment: Expr::Literal(Literal::None),
 			concurrently: false,
 		})))),
 		TopLevelExpr::Expr(Expr::Define(Box::new(DefineStatement::Analyzer(
@@ -369,7 +368,7 @@ fn statements() -> Vec<TopLevelExpr> {
 					Filter::Snowball(Language::Dutch),
 					Filter::Uppercase,
 				]),
-				comment: None,
+				comment: Expr::Literal(Literal::None),
 				function: Some("foo::bar".to_owned()),
 			},
 		)))),
@@ -379,7 +378,7 @@ fn statements() -> Vec<TopLevelExpr> {
 			with: Some(With::Index(vec!["index".to_owned(), "index_2".to_owned()])),
 			cond: Some(Cond(Expr::Literal(Literal::Integer(2)))),
 			output: Some(Output::After),
-			timeout: Some(Timeout(Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))))),
+			timeout: Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))),
 			parallel: true,
 			explain: Some(Explain(true)),
 		}))),
@@ -400,9 +399,7 @@ fn statements() -> Vec<TopLevelExpr> {
 			with: Some(With::Index(vec!["index".to_owned(), "index_2".to_owned()])),
 			cond: Some(Cond(Expr::Literal(Literal::Null))),
 			output: Some(Output::Null),
-			timeout: Some(Timeout(Expr::Literal(Literal::Duration(PublicDuration::from_secs(
-				60 * 60,
-			))))),
+			timeout: Expr::Literal(Literal::Duration(PublicDuration::from_secs(60 * 60))),
 			parallel: true,
 			explain: Some(Explain(true)),
 		}))),
@@ -410,10 +407,10 @@ fn statements() -> Vec<TopLevelExpr> {
 			param: Param::new("foo".to_owned()),
 			range: Expr::Binary {
 				left: Box::new(Expr::Select(Box::new(SelectStatement {
-					expr: Fields::Select(vec![Field::Single {
+					expr: Fields::Select(vec![Field::Single(Selector {
 						expr: ident_field("foo"),
 						alias: None,
-					}]),
+					})]),
 					what: vec![Expr::Table("bar".to_string())],
 					omit: vec![],
 					only: false,
@@ -425,8 +422,8 @@ fn statements() -> Vec<TopLevelExpr> {
 					limit: None,
 					start: None,
 					fetch: None,
-					version: None,
-					timeout: None,
+					version: Expr::Literal(Literal::None),
+					timeout: Expr::Literal(Literal::None),
 					parallel: false,
 					explain: None,
 					tempfiles: false,
@@ -436,14 +433,14 @@ fn statements() -> Vec<TopLevelExpr> {
 			},
 			block: Block(vec![Expr::Break]),
 		}))),
-		TopLevelExpr::Expr(Expr::If(Box::new(IfelseStatement {
+		TopLevelExpr::Expr(Expr::IfElse(Box::new(IfelseStatement {
 			exprs: vec![
 				(ident_field("foo"), ident_field("bar")),
 				(ident_field("faz"), ident_field("baz")),
 			],
 			close: Some(ident_field("baq")),
 		}))),
-		TopLevelExpr::Expr(Expr::If(Box::new(IfelseStatement {
+		TopLevelExpr::Expr(Expr::IfElse(Box::new(IfelseStatement {
 			exprs: vec![
 				(ident_field("foo"), Expr::Block(Box::new(Block(vec![ident_field("bar")])))),
 				(ident_field("faz"), Expr::Block(Box::new(Block(vec![ident_field("baz")])))),
@@ -459,21 +456,21 @@ fn statements() -> Vec<TopLevelExpr> {
 		)))),
 		TopLevelExpr::Expr(Expr::Select(Box::new(SelectStatement {
 			expr: Fields::Select(vec![
-				Field::Single {
+				Field::Single(Selector {
 					expr: ident_field("bar"),
 					alias: Some(Idiom(vec![Part::Field("foo".to_owned())])),
-				},
-				Field::Single {
+				}),
+				Field::Single(Selector {
 					expr: Expr::Literal(Literal::Array(vec![
 						Expr::Literal(Literal::Integer(1)),
 						Expr::Literal(Literal::Integer(2)),
 					])),
 					alias: None,
-				},
-				Field::Single {
+				}),
+				Field::Single(Selector {
 					expr: ident_field("bar"),
 					alias: None,
-				},
+				}),
 			]),
 			omit: vec![Expr::Idiom(Idiom(vec![Part::Field("bar".to_string())]))],
 			only: true,
@@ -503,10 +500,8 @@ fn statements() -> Vec<TopLevelExpr> {
 				value: Expr::Literal(Literal::Bool(true)),
 			}])))),
 			fetch: Some(Fetchs(vec![Fetch(ident_field("foo"))])),
-			version: Some(Expr::Literal(Literal::Datetime(PublicDatetime::from(
-				expected_datetime,
-			)))),
-			timeout: None,
+			version: Expr::Literal(Literal::Datetime(PublicDatetime::from(expected_datetime))),
+			timeout: Expr::Literal(Literal::None),
 			parallel: false,
 			tempfiles: false,
 			explain: Some(Explain(true)),
@@ -560,8 +555,8 @@ fn statements() -> Vec<TopLevelExpr> {
 				},
 			])),
 			output: Some(Output::After),
-			version: None,
-			timeout: None,
+			version: Expr::Literal(Literal::None),
+			timeout: Expr::Literal(Literal::None),
 			parallel: false,
 			relation: false,
 		}))),
@@ -589,9 +584,9 @@ fn statements() -> Vec<TopLevelExpr> {
 				what: vec![Expr::Table("foo".to_owned())],
 				data: None,
 				output: None,
-				timeout: None,
+				timeout: Expr::Literal(Literal::None),
 				parallel: false,
-				version: None,
+				version: Expr::Literal(Literal::None),
 			})),
 			uniq: true,
 			data: Some(Data::SetExpression(vec![Assignment {
@@ -600,7 +595,7 @@ fn statements() -> Vec<TopLevelExpr> {
 				value: Expr::Literal(Literal::Integer(1)),
 			}])),
 			output: Some(Output::None),
-			timeout: None,
+			timeout: Expr::Literal(Literal::None),
 			parallel: true,
 		}))),
 		TopLevelExpr::Expr(Expr::Remove(Box::new(RemoveStatement::Function(
@@ -624,7 +619,10 @@ fn statements() -> Vec<TopLevelExpr> {
 				Part::Field("a".to_owned()),
 				Part::Graph(Lookup {
 					kind: LookupKind::Graph(Dir::Out),
-					what: vec![LookupSubject::Table("b".to_owned())],
+					what: vec![LookupSubject::Table {
+						table: "b".to_owned(),
+						referencing_field: None,
+					}],
 					..Default::default()
 				}),
 			]))],
@@ -636,14 +634,17 @@ fn statements() -> Vec<TopLevelExpr> {
 					Part::Field("a".to_owned()),
 					Part::Graph(Lookup {
 						kind: LookupKind::Graph(Dir::Out),
-						what: vec![LookupSubject::Table("b".to_owned())],
+						what: vec![LookupSubject::Table {
+							table: "b".to_owned(),
+							referencing_field: None,
+						}],
 						..Default::default()
 					}),
 				]),
 				Idiom(vec![Part::Field("c".to_owned()), Part::All]),
 			])),
 			output: Some(Output::Diff),
-			timeout: Some(Timeout(Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))))),
+			timeout: Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))),
 			parallel: true,
 			explain: Some(Explain(true)),
 		}))),
@@ -653,7 +654,10 @@ fn statements() -> Vec<TopLevelExpr> {
 				Part::Field("a".to_owned()),
 				Part::Graph(Lookup {
 					kind: LookupKind::Graph(Dir::Out),
-					what: vec![LookupSubject::Table("b".to_owned())],
+					what: vec![LookupSubject::Table {
+						table: "b".to_owned(),
+						referencing_field: None,
+					}],
 					..Default::default()
 				}),
 			]))],
@@ -665,14 +669,17 @@ fn statements() -> Vec<TopLevelExpr> {
 					Part::Field("a".to_owned()),
 					Part::Graph(Lookup {
 						kind: LookupKind::Graph(Dir::Out),
-						what: vec![LookupSubject::Table("b".to_owned())],
+						what: vec![LookupSubject::Table {
+							table: "b".to_owned(),
+							referencing_field: None,
+						}],
 						..Default::default()
 					}),
 				]),
 				Idiom(vec![Part::Field("c".to_owned()), Part::All]),
 			])),
 			output: Some(Output::Diff),
-			timeout: Some(Timeout(Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))))),
+			timeout: Expr::Literal(Literal::Duration(PublicDuration::from_secs(1))),
 			parallel: true,
 			explain: Some(Explain(true)),
 		}))),

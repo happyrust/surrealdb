@@ -83,7 +83,7 @@ impl HnswIndex {
 			dim: p.dimension as usize,
 			vector_type: p.vector_type,
 			hnsw: HnswFlavor::new(tb, ikb.clone(), p, vector_cache)?,
-			docs: HnswDocs::new(tx, ikb.table().to_string(), ikb.clone()).await?,
+			docs: HnswDocs::new(tx, ikb.table().to_string().into(), ikb.clone()).await?,
 			vec_docs: VecDocs::new(ikb),
 		})
 	}
@@ -186,13 +186,12 @@ impl HnswIndex {
 	) -> Result<KnnResult> {
 		let mut builder = KnnResultBuilder::new(n);
 		for (e_dist, e_id) in neighbors {
-			if builder.check_add(e_dist) {
-				if let Some(v) = self.hnsw.get_vector(tx, &e_id).await? {
-					if let Some(docs) = self.vec_docs.get_docs(tx, &v).await? {
-						let evicted_docs = builder.add(e_dist, docs);
-						chk.expires(evicted_docs);
-					}
-				}
+			if builder.check_add(e_dist)
+				&& let Some(v) = self.hnsw.get_vector(tx, &e_id).await?
+				&& let Some(docs) = self.vec_docs.get_docs(tx, &v).await?
+			{
+				let evicted_docs = builder.add(e_dist, docs);
+				chk.expires(evicted_docs);
 			}
 		}
 		Ok(builder.build())

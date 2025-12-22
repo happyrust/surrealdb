@@ -15,11 +15,12 @@
 
 use anyhow::{Result, bail};
 use reblessive::tree::Stk;
+use surrealdb_types::ToSql;
 
 use crate::catalog::{
 	DatabaseId, FullTextParams, HnswParams, Index, IndexDefinition, NamespaceId, TableId,
 };
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::err::Error;
 use crate::expr::{Cond, Part};
@@ -33,7 +34,7 @@ use crate::kvs::Transaction;
 use crate::val::{Array, RecordId, Value};
 
 pub(crate) struct IndexOperation<'a> {
-	ctx: &'a Context,
+	ctx: &'a FrozenContext,
 	opt: &'a Options,
 	ns: NamespaceId,
 	db: DatabaseId,
@@ -50,7 +51,7 @@ pub(crate) struct IndexOperation<'a> {
 impl<'a> IndexOperation<'a> {
 	#[expect(clippy::too_many_arguments)]
 	pub(crate) fn new(
-		ctx: &'a Context,
+		ctx: &'a FrozenContext,
 		opt: &'a Options,
 		ns: NamespaceId,
 		db: DatabaseId,
@@ -67,7 +68,7 @@ impl<'a> IndexOperation<'a> {
 			db,
 			tb,
 			ix,
-			ikb: IndexKeyBase::new(ns, db, &ix.table_name, ix.index_id),
+			ikb: IndexKeyBase::new(ns, db, ix.table_name.clone(), ix.index_id),
 			o,
 			n,
 			rid,
@@ -112,9 +113,8 @@ impl<'a> IndexOperation<'a> {
 	}
 
 	async fn index_unique(&mut self) -> Result<()> {
-		// Lock the transaction
-		let tx = self.ctx.tx();
-		let mut txn = tx.lock().await;
+		// Get the transaction
+		let txn = self.ctx.tx();
 		// Delete the old index data
 		if let Some(o) = self.o.take() {
 			let i = Indexable::new(o, self.ix);
@@ -122,7 +122,10 @@ impl<'a> IndexOperation<'a> {
 				let key = self.get_unique_index_key(&o)?;
 				match txn.delc(&key, Some(self.rid)).await {
 					Err(e) => {
-						if matches!(e.downcast_ref::<Error>(), Some(Error::TxConditionNotMet)) {
+						if matches!(
+							e.downcast_ref::<Error>(),
+							Some(Error::Kvs(crate::kvs::Error::TransactionConditionNotMet))
+						) {
 							Ok(())
 						} else {
 							Err(e)
@@ -152,8 +155,7 @@ impl<'a> IndexOperation<'a> {
 
 	async fn index_non_unique(&mut self) -> Result<()> {
 		// Lock the transaction
-		let tx = self.ctx.tx();
-		let mut txn = tx.lock().await;
+		let txn = self.ctx.tx();
 		// Delete the old index data
 		if let Some(o) = self.o.take() {
 			let i = Indexable::new(o, self.ix);
@@ -161,7 +163,10 @@ impl<'a> IndexOperation<'a> {
 				let key = self.get_non_unique_index_key(&o)?;
 				match txn.delc(&key, Some(self.rid)).await {
 					Err(e) => {
-						if matches!(e.downcast_ref::<Error>(), Some(Error::TxConditionNotMet)) {
+						if matches!(
+							e.downcast_ref::<Error>(),
+							Some(Error::Kvs(crate::kvs::Error::TransactionConditionNotMet))
+						) {
 							Ok(())
 						} else {
 							Err(e)
@@ -221,11 +226,11 @@ impl<'a> IndexOperation<'a> {
 			self.db,
 			&self.ix.table_name,
 			self.ix.index_id,
-			Some((self.opt.id()?, uuid::Uuid::now_v7())),
+			Some((self.opt.id(), uuid::Uuid::now_v7())),
 			relative_count > 0,
 			relative_count.unsigned_abs() as u64,
 		);
-		self.ctx.tx().lock().await.put(&key, &(), None).await?;
+		self.ctx.tx().put(&key, &(), None).await?;
 		*require_compaction = true;
 		Ok(())
 	}
@@ -243,10 +248,10 @@ impl<'a> IndexOperation<'a> {
 	fn err_index_exists(&self, rid: RecordId, mut n: Array) -> Result<()> {
 		bail!(Error::IndexExists {
 			record: rid,
-			index: self.ix.name.to_string(),
+			index: self.ix.name.clone(),
 			value: match n.0.len() {
-				1 => n.0.remove(0).to_string(),
-				_ => n.to_string(),
+				1 => n.0.remove(0).to_sql(),
+				_ => n.to_sql(),
 			},
 		})
 	}
@@ -285,7 +290,7 @@ impl<'a> IndexOperation<'a> {
 	}
 
 	pub(crate) async fn trigger_compaction(&self) -> Result<()> {
-		FullTextIndex::trigger_compaction(&self.ikb, &self.ctx.tx(), self.opt.id()?).await
+		FullTextIndex::trigger_compaction(&self.ikb, &self.ctx.tx(), self.opt.id()).await
 	}
 
 	async fn index_hnsw(&mut self, p: &HnswParams) -> Result<()> {

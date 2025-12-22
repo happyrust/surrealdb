@@ -3,9 +3,10 @@ use std::ops::Deref;
 
 use futures::future::try_join_all;
 use reblessive::tree::Stk;
+use surrealdb_types::ToSql;
 
 use crate::cnf::MAX_COMPUTATION_DEPTH;
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
@@ -37,7 +38,7 @@ impl Value {
 	pub(crate) async fn get(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
 		path: &[Part],
@@ -200,7 +201,7 @@ impl Value {
 						.await
 						.catch_return()?
 					{
-						Value::Number(n) => match v.get(&n.to_string()) {
+						Value::Number(n) => match v.get(&n.to_sql()) {
 							Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
 							None => {
 								stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next()))
@@ -211,7 +212,7 @@ impl Value {
 							Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
 							None => Ok(Value::None),
 						},
-						Value::RecordId(t) => match v.get(&t.to_string()) {
+						Value::RecordId(t) => match v.get(&t.to_sql()) {
 							Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
 							None => Ok(Value::None),
 						},
@@ -625,7 +626,7 @@ mod tests {
 		assert_eq!(
 			res,
 			Value::from(RecordId {
-				table: String::from("test"),
+				table: "test".into(),
 				key: RecordIdKey::String("tobie".to_owned())
 			})
 		);
@@ -651,7 +652,7 @@ mod tests {
 		assert_eq!(
 			res,
 			Value::from(RecordId {
-				table: String::from("test"),
+				table: "test".into(),
 				key: RecordIdKey::String("jaime".to_owned())
 			})
 		);

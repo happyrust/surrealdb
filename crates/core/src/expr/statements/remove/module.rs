@@ -1,11 +1,9 @@
-use std::fmt::{self, Display};
-
 use anyhow::Result;
 
 use crate::catalog::providers::DatabaseProvider;
 #[cfg_attr(not(feature = "surrealism"), allow(unused_imports))]
 use crate::catalog::{ModuleExecutable, ModuleName};
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::err::Error;
 use crate::expr::{Base, Value};
@@ -21,7 +19,7 @@ pub(crate) struct RemoveModuleStatement {
 
 impl RemoveModuleStatement {
 	/// Process this type returning a computed simple Value
-	pub(crate) async fn compute(&self, ctx: &Context, opt: &Options) -> Result<Value> {
+	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
 		// Allowed to run?
 		opt.is_allowed(Action::Edit, ResourceKind::Module, &Base::Db)?;
 		// Get the transaction
@@ -65,17 +63,5 @@ impl RemoveModuleStatement {
 		}
 		// Ok all good
 		Ok(Value::None)
-	}
-}
-
-impl Display for RemoveModuleStatement {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		// Bypass ident display since we don't want backticks arround the ident.
-		write!(f, "REMOVE MODULE")?;
-		if self.if_exists {
-			write!(f, " IF EXISTS")?
-		}
-		write!(f, " {}", self.name)?;
-		Ok(())
 	}
 }

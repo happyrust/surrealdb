@@ -1,8 +1,9 @@
 use anyhow::{Result, ensure};
+use surrealdb_types::ToSql;
 
 use crate::catalog::providers::TableProvider;
 use crate::catalog::{RecordType, Relation, TableType};
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::{Options, Statement, Workable};
 use crate::doc::Document;
 use crate::err::Error;
@@ -12,12 +13,12 @@ use crate::expr::paths::{IN, OUT};
 impl Document {
 	pub(super) async fn store_edges_data(
 		&mut self,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		_stm: &Statement<'_>,
 	) -> Result<()> {
 		// Get the table
-		let tb = self.tb(ctx, opt).await?;
+		let tb = self.tb().await?;
 		// Check if the table is a view
 		if tb.drop {
 			return Ok(());
@@ -42,19 +43,17 @@ impl Document {
 				ensure!(
 					txn.record_exists(ns, db, &l.table, &l.key).await?,
 					Error::IdNotFound {
-						rid: l.to_string(),
+						rid: l.to_sql(),
 					}
 				);
 				// Check that the `out` record exists
 				ensure!(
 					txn.record_exists(ns, db, &r.table, &r.key).await?,
 					Error::IdNotFound {
-						rid: r.to_string(),
+						rid: r.to_sql(),
 					}
 				);
 			}
-			// Lock the transaction
-			let mut txn = txn.lock().await;
 			// Get temporary edge references
 			let (ref o, ref i) = (Dir::Out, Dir::In);
 			// Store the left pointer edge

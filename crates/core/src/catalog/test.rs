@@ -8,6 +8,7 @@ use uuid::Uuid;
 use super::*;
 use crate::catalog::record::{Data, Record};
 use crate::catalog::schema::base::Base;
+use crate::expr::field::Selector;
 use crate::expr::{
 	Block, ChangeFeed, Expr, Fetch, Fetchs, Field, Fields, Filter, Groups, Idiom, Kind, Literal,
 	Tokenizer,
@@ -15,8 +16,7 @@ use crate::expr::{
 use crate::iam::Auth;
 use crate::kvs::KVValue;
 use crate::kvs::version::MajorVersion;
-use crate::val::{Datetime, Value};
-use crate::vs::VersionStamp;
+use crate::val::{Datetime, TableName, Value};
 
 /// This test is used to ensure that
 #[rstest]
@@ -29,25 +29,26 @@ use crate::vs::VersionStamp;
 	namespace_id: NamespaceId(123),
 	database_id: DatabaseId(456),
 	name: "test".to_string(),
+	strict: false,
 	comment: Some("comment".to_string()),
 	changefeed: Some(ChangeFeed {
 		expiry: Duration::from_secs(123),
 		store_diff: false,
 	}),
-}, 24)]
+}, 25)]
 #[case::table(TableDefinition {
 	namespace_id: NamespaceId(123),
 	database_id: DatabaseId(456),
 	table_id: TableId(789),
-	name: "test".to_string(),
+	name: TableName::from("test"),
 	drop: false,
 	schemafull: false,
 	view: Some(ViewDefinition::Select {
-		fields: Fields::Select(vec![Field::All, Field::Single {
+		fields: Fields::Select(vec![Field::All, Field::Single (crate::expr::field::Selector{
 			expr: Expr::Literal(Literal::String("expr".to_string())),
 			alias: Some(Idiom::from_str("field[0]").unwrap()),
-		}]),
-		tables: vec!["what".to_string()],
+		})]),
+		tables: vec![TableName::from("what")],
 		condition: Some(Expr::Literal(Literal::String("cond".to_string()))),
 		groups: Some(Groups::default()),
 	}),
@@ -62,22 +63,21 @@ use crate::vs::VersionStamp;
 	cache_events_ts: Uuid::default(),
 	cache_tables_ts: Uuid::default(),
 	cache_indexes_ts: Uuid::default(),
-}, 148)]
+}, 149)]
 #[case::subscription(SubscriptionDefinition {
 	id: Uuid::default(),
 	node: Uuid::default(),
-	fields: Fields::Select(vec![Field::All, Field::Single {
+	fields: SubscriptionFields::Select(Fields::Select(vec![Field::All, Field::Single(Selector{
 		expr: Expr::Literal(Literal::String("expr".to_string())),
 		alias: Some(Idiom::from_str("field[0]").unwrap()),
-	}]),
-	diff: false,
+	})])),
 	what: Expr::Literal(Literal::String("what".to_string())),
 	cond: Some(Expr::Literal(Literal::String("cond".to_string()))),
 	fetch: Some(Fetchs(vec![Fetch(Expr::Literal(Literal::String("fetch".to_string())))])),
 	auth: Some(Auth::default()),
 	session: Some(Value::default()),
 	vars: BTreeMap::new(),
-}, 99)]
+}, 101)]
 #[case::access(AccessDefinition {
 	name: "access".to_string(),
 	access_type: AccessType::Bearer(BearerAccess {
@@ -155,17 +155,17 @@ use crate::vs::VersionStamp;
 }), 7)]
 #[case::event(EventDefinition {
 	name: "test".to_string(),
-	target_table: "test".to_string(),
+	target_table: TableName::from("test"),
 	when: Expr::Literal(Literal::String("when".to_string())),
 	then: vec![Expr::Literal(Literal::String("then".to_string()))],
 	comment: Some("comment".to_string()),
 }, 35)]
 #[case::field(FieldDefinition {
 	name: Idiom::from_str("field[0]").unwrap(),
-	what: "what".to_string(),
-	flexible: false,
+	table: TableName::from("what"),
 	field_kind: None,
 	readonly: false,
+	flexible: false,
 	value: None,
 	assert: None,
 	computed: None,
@@ -189,11 +189,12 @@ use crate::vs::VersionStamp;
 #[case::index(IndexDefinition {
 	index_id: IndexId(123),
 	name: "test".to_string(),
-	table_name: "what".to_string(),
+	table_name: TableName::from("what"),
 	cols: vec![Idiom::from_str("field[0]").unwrap()],
 	index: Index::Idx,
 	comment: Some("comment".to_string()),
-}, 33)]
+	prepare_remove: false,
+}, 34)]
 #[case::model(MlModelDefinition {
 	name: "model".to_string(),
 	hash: "hash".to_string(),
@@ -214,7 +215,6 @@ use crate::vs::VersionStamp;
 	timeout: Some(Duration::from_secs(123)),
 }, 15)]
 #[case::version(MajorVersion::from(1), 2)]
-#[case::versionstamp(VersionStamp::ZERO, 10)]
 #[case::user(UserDefinition {
 	name: "tobie".to_string(),
 	hash: "hash".to_string(),

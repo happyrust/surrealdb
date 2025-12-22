@@ -19,8 +19,8 @@ use anyhow::Result;
 use reblessive::tree::Stk;
 
 use crate::catalog::{DatabaseDefinition, IndexDefinition, TableDefinition};
-use crate::ctx::Context;
-use crate::dbs::{Force, Options, Statement};
+use crate::ctx::FrozenContext;
+use crate::dbs::{Force, Options};
 use crate::doc::{CursorDoc, Document};
 use crate::expr::FlowResultExt as _;
 use crate::idx::index::IndexOperation;
@@ -31,9 +31,8 @@ impl Document {
 	pub(super) async fn store_index_data(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
-		_stm: &Statement<'_>,
 	) -> Result<()> {
 		// Collect indexes or skip
 		let ixs = match &opt.force {
@@ -42,7 +41,7 @@ impl Document {
 			_ => return Ok(()),
 		};
 		// Check if the table is a view
-		let tb = self.tb(ctx, opt).await?;
+		let tb = self.tb().await?;
 		if tb.drop {
 			return Ok(());
 		}
@@ -53,6 +52,10 @@ impl Document {
 		let rid = self.id()?;
 		// Loop through all index statements
 		for ix in ixs.iter() {
+			// Decommissioned indexes are ignored
+			if ix.prepare_remove {
+				continue;
+			}
 			// Calculate old values
 			let o = Self::build_opt_values(stk, ctx, opt, ix, &self.initial).await?;
 
@@ -61,7 +64,7 @@ impl Document {
 
 			// Update the index entries
 			if o != n {
-				Self::one_index(&db, &tb, stk, ctx, opt, ix, o, n, &rid).await?;
+				Self::one_index(&db, tb, stk, ctx, opt, ix, o, n, &rid).await?;
 			}
 		}
 		// Carry on
@@ -73,7 +76,7 @@ impl Document {
 		db: &DatabaseDefinition,
 		tb: &TableDefinition,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		ix: &IndexDefinition,
 		o: Option<Vec<Value>>,
@@ -122,7 +125,7 @@ impl Document {
 	/// It will return: ["Tobie", "piano"]
 	pub(crate) async fn build_opt_values(
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		ix: &IndexDefinition,
 		doc: &CursorDoc,

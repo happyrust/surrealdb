@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::catalog::providers::DatabaseProvider;
 use crate::catalog::{DatabaseId, IndexId, NamespaceId, TableId};
-use crate::ctx::MutableContext;
+use crate::ctx::Context;
 use crate::err::Error;
 use crate::idx::IndexKeyBase;
 use crate::idx::seqdocids::DocId;
@@ -51,6 +51,7 @@ use crate::key::table::ih::IndexIdGeneratorBatchKey;
 use crate::key::table::is::IndexIdGeneratorStateKey;
 use crate::kvs::ds::TransactionFactory;
 use crate::kvs::{KVKey, LockType, Transaction, TransactionType, impl_kv_value_revisioned};
+use crate::val::TableName;
 
 type SequencesMap = Arc<RwLock<HashMap<Arc<SequenceDomain>, Arc<Mutex<Sequence>>>>>;
 
@@ -83,7 +84,7 @@ enum SequenceDomain {
 	/// A sequence generating IDs for tables
 	TablesIds(NamespaceId, DatabaseId),
 	/// A sequence generating IDs for indexes
-	IndexIds(NamespaceId, DatabaseId, String),
+	IndexIds(NamespaceId, DatabaseId, TableName),
 }
 
 impl SequenceDomain {
@@ -107,7 +108,7 @@ impl SequenceDomain {
 		Self::TablesIds(ns, db)
 	}
 
-	pub(crate) fn new_index_ids(ns: NamespaceId, db: DatabaseId, tb: String) -> Self {
+	pub(crate) fn new_index_ids(ns: NamespaceId, db: DatabaseId, tb: TableName) -> Self {
 		Self::IndexIds(ns, db, tb)
 	}
 
@@ -236,7 +237,7 @@ impl Sequences {
 	/// The next sequential value
 	async fn next_val(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		seq: Arc<SequenceDomain>,
 		start: i64,
 		batch: u32,
@@ -265,10 +266,7 @@ impl Sequences {
 	///
 	/// # Returns
 	/// A new unique namespace ID
-	pub(crate) async fn next_namespace_id(
-		&self,
-		ctx: Option<&MutableContext>,
-	) -> Result<NamespaceId> {
+	pub(crate) async fn next_namespace_id(&self, ctx: Option<&Context>) -> Result<NamespaceId> {
 		let domain = Arc::new(SequenceDomain::new_namespace_ids());
 		let id = self.next_val(ctx, domain, 0, 100, None).await?;
 		Ok(NamespaceId(id as u32))
@@ -284,7 +282,7 @@ impl Sequences {
 	/// A new unique database ID for the given namespace
 	pub(crate) async fn next_database_id(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: NamespaceId,
 	) -> Result<DatabaseId> {
 		let domain = Arc::new(SequenceDomain::new_database_ids(ns));
@@ -303,7 +301,7 @@ impl Sequences {
 	/// A new unique table ID for the given database
 	pub(crate) async fn next_table_id(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: NamespaceId,
 		db: DatabaseId,
 	) -> Result<TableId> {
@@ -324,10 +322,10 @@ impl Sequences {
 	/// A new unique index ID for the given table
 	pub(crate) async fn next_index_id(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: String,
+		tb: TableName,
 	) -> Result<IndexId> {
 		let domain = Arc::new(SequenceDomain::new_index_ids(ns, db, tb));
 		let id = self.next_val(ctx, domain, 0, 100, None).await?;
@@ -347,7 +345,7 @@ impl Sequences {
 	/// The next value in the user-defined sequence
 	pub(crate) async fn next_user_sequence_id(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		tx: &Transaction,
 		ns: NamespaceId,
 		db: DatabaseId,
@@ -369,7 +367,7 @@ impl Sequences {
 	/// A new unique document ID for the full-text search index
 	pub(crate) async fn next_fts_doc_id(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ikb: IndexKeyBase,
 		batch: u32,
 	) -> Result<DocId> {
@@ -412,7 +410,7 @@ impl Sequence {
 	/// * `batch` - The batch size for ID allocations
 	/// * `timeout` - Optional timeout for batch allocation operations
 	async fn load(
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		sqs: &Sequences,
 		seq: &SequenceDomain,
 		start: i64,
@@ -458,7 +456,7 @@ impl Sequence {
 	async fn next(
 		&mut self,
 		sqs: &Sequences,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		seq: &SequenceDomain,
 		batch: u32,
 	) -> Result<i64> {
@@ -504,7 +502,7 @@ impl Sequence {
 	/// A tuple of (start, end) representing the allocated batch range [start, end)
 	async fn find_batch_allocation(
 		sqs: &Sequences,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		seq: &SequenceDomain,
 		next: i64,
 		batch: u32,
@@ -522,16 +520,15 @@ impl Sequence {
 		// We check the timeout inherited from the context
 		loop {
 			if let Some(ctx) = ctx {
-				if ctx.is_timedout().await? {
-					break;
-				}
+				ctx.expect_not_timedout().await?;
 			} else {
 				yield_now!();
 			}
 			if let (Some(ref start), Some(ref to)) = (start, to) {
 				// We check the time associated with the sequence
 				if start.elapsed().ge(to) {
-					break;
+					let timeout = (*to).into();
+					return Err(anyhow::Error::new(Error::QueryTimedout(timeout)));
 				}
 			}
 			if let Ok(r) = Self::check_batch_allocation(sqs, seq, next, batch).await {
@@ -544,7 +541,6 @@ impl Sequence {
 				tempo *= 2;
 			}
 		}
-		Err(anyhow::Error::new(Error::QueryTimedout))
 	}
 
 	/// Attempts to allocate a batch of IDs in a single transaction.

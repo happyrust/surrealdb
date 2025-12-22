@@ -6,10 +6,11 @@ pub mod range;
 pub use key::*;
 pub use range::*;
 use serde::{Deserialize, Serialize};
+use surrealdb_types_derive::write_sql;
 
-use crate::sql::ToSql;
-use crate::utils::escape::EscapeSqonIdent;
-use crate::{Table, write_sql};
+use crate as surrealdb_types;
+use crate::Table;
+use crate::sql::{SqlFormat, ToSql};
 
 /// Represents a record identifier in SurrealDB
 ///
@@ -17,6 +18,7 @@ use crate::{Table, write_sql};
 /// a record within that table. This is the primary way to reference specific records.
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct RecordId {
 	/// The name of the table containing the record
 	pub table: Table,
@@ -34,7 +36,7 @@ impl RecordId {
 	}
 
 	/// Checks if the record id is of the specified type.
-	pub fn is_table_type(&self, tables: &[String]) -> bool {
+	pub fn is_table_type(&self, tables: &[Table]) -> bool {
 		tables.is_empty() || tables.contains(&self.table)
 	}
 
@@ -47,8 +49,8 @@ impl RecordId {
 }
 
 impl ToSql for RecordId {
-	fn fmt_sql(&self, f: &mut String) {
-		write_sql!(f, "{}:", EscapeSqonIdent(self.table.as_str()));
-		self.key.fmt_sql(f);
+	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
+		use crate::utils::escape::EscapeSqonIdent;
+		write_sql!(f, fmt, "{}:{}", EscapeSqonIdent(self.table.as_str()), self.key);
 	}
 }

@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::fmt;
 
 use anyhow::Result;
+use surrealdb_types::{SqlFormat, ToSql};
 
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::ParameterCapturePass;
 use crate::expr::{Expr, Kind, Param};
 use crate::val::{Closure, Value};
@@ -27,7 +27,8 @@ impl Ord for ClosureExpr {
 }
 
 impl ClosureExpr {
-	pub(crate) async fn compute(&self, ctx: &Context) -> Result<Value> {
+	#[instrument(level = "trace", name = "ClosureExpr::compute", skip_all)]
+	pub(crate) async fn compute(&self, ctx: &FrozenContext) -> Result<Value> {
 		let captures = ParameterCapturePass::capture(ctx, &self.body);
 
 		Ok(Value::Closure(Box::new(Closure {
@@ -39,23 +40,9 @@ impl ClosureExpr {
 	}
 }
 
-impl fmt::Display for ClosureExpr {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.write_str("|")?;
-		for (i, (name, kind)) in self.args.iter().enumerate() {
-			if i > 0 {
-				f.write_str(", ")?;
-			}
-			write!(f, "{name}: ")?;
-			match kind {
-				k @ Kind::Either(_) => write!(f, "<{k}>")?,
-				k => write!(f, "{k}")?,
-			}
-		}
-		f.write_str("|")?;
-		if let Some(returns) = &self.returns {
-			write!(f, " -> {returns}")?;
-		}
-		write!(f, " {}", self.body)
+impl ToSql for ClosureExpr {
+	fn fmt_sql(&self, f: &mut String, sql_fmt: SqlFormat) {
+		let closure: crate::sql::Closure = self.clone().into();
+		closure.fmt_sql(f, sql_fmt);
 	}
 }

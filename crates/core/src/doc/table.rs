@@ -2,23 +2,23 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use reblessive::tree::Stk;
+use surrealdb_types::ToSql;
 
 use crate::catalog::aggregation::{self, AggregateFields, AggregationAnalysis, AggregationStat};
 use crate::catalog::providers::TableProvider;
 use crate::catalog::{Data, Metadata, Record, RecordType, ViewDefinition};
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::{Options, Statement, Workable};
-use crate::doc::{Action, CursorDoc, Document};
+use crate::doc::{Action, CursorDoc, Document, DocumentContext, NsDbTbCtx};
 use crate::err::Error;
+use crate::expr::field::Selector;
 use crate::expr::statements::SelectStatement;
 use crate::expr::{
-	BinaryOperator, Cond, Expr, Field, Fields, FlowResultExt as _, Function, FunctionCall, Groups,
-	Literal,
+	BinaryOperator, Cond, Expr, Fields, FlowResultExt as _, Function, FunctionCall, Groups, Literal,
 };
 use crate::idx::planner::RecordStrategy;
 use crate::key;
-use crate::val::{Array, Number, RecordId, RecordIdKey, TryAdd, TryMul, TryPow, Value};
-
+use crate::val::{Array, Number, RecordId, RecordIdKey, TableName, TryAdd, TryMul, TryPow, Value};
 struct Recalculation {
 	function: String,
 	stat: usize,
@@ -34,7 +34,7 @@ impl Document {
 	pub(super) async fn process_table_views(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		stm: &Statement<'_>,
 	) -> Result<()> {
@@ -62,7 +62,7 @@ impl Document {
 	async fn process_views(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		act: Action,
 	) -> Result<()> {
@@ -87,9 +87,9 @@ impl Document {
 	async fn process_view(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
-		table_name: &str,
+		table_name: &TableName,
 		view: &ViewDefinition,
 		action: Action,
 	) -> Result<()> {
@@ -107,8 +107,6 @@ impl Document {
 				..
 			} => {
 				// Id of the document on the view
-
-				let (ns, db) = ctx.get_ns_db_ids(opt).await?;
 				let id = &self.id()?.key;
 
 				let set = if let Some(cond) = condition {
@@ -120,13 +118,17 @@ impl Document {
 					action != Action::Delete
 				};
 
+				let db = self.doc_ctx.db();
+
 				if set {
-					let data = fields.compute(stk, ctx, opt, Some(&self.current), false).await?;
+					let data = fields.compute(stk, ctx, opt, Some(&self.current)).await?;
 					let record = Arc::new(Record::new(data.into()));
 
-					ctx.tx().set_record(ns, db, table_name, id, record, None).await?;
+					ctx.tx()
+						.set_record(db.namespace_id, db.database_id, table_name, id, record, None)
+						.await?;
 				} else {
-					ctx.tx().del_record(ns, db, table_name, id).await?;
+					ctx.tx().del_record(db.namespace_id, db.database_id, table_name, id).await?;
 				}
 				Ok(())
 			}
@@ -146,25 +148,24 @@ impl Document {
 	async fn process_aggregate_view(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
-		view_table_name: &str,
+		view_table_name: &TableName,
 		aggr: &AggregationAnalysis,
 		condition: &Option<Expr>,
 		action: Action,
 	) -> Result<()> {
 		match action {
 			Action::Create => {
-				if let Some(cond) = condition {
-					if !cond
+				if let Some(cond) = condition
+					&& !cond
 						.compute(stk, ctx, opt, Some(&self.current))
 						.await
 						.catch_return()?
 						.is_truthy()
-					{
-						// Nothing to do.
-						return Ok(());
-					}
+				{
+					// Nothing to do.
+					return Ok(());
 				}
 
 				let mut group = Vec::with_capacity(aggr.group_expressions.len());
@@ -280,16 +281,15 @@ impl Document {
 				}
 			}
 			Action::Delete => {
-				if let Some(cond) = condition {
-					if !cond
+				if let Some(cond) = condition
+					&& !cond
 						.compute(stk, ctx, opt, Some(&self.initial))
 						.await
 						.catch_return()?
 						.is_truthy()
-					{
-						// Nothing to do.
-						return Ok(());
-					}
+				{
+					// Nothing to do.
+					return Ok(());
 				}
 
 				let mut group = Vec::with_capacity(aggr.group_expressions.len());
@@ -310,18 +310,18 @@ impl Document {
 	async fn process_view_record_create(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		group: Vec<Value>,
-		view_table_name: &str,
+		view_table_name: &TableName,
 		aggr: &AggregationAnalysis,
 	) -> Result<()> {
-		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
+		let db = self.doc_ctx.db();
 
 		let key = RecordIdKey::Array(Array(group.clone()));
 		let tx = ctx.tx();
 
-		let k = key::record::new(ns, db, view_table_name, &key);
+		let k = key::record::new(db.namespace_id, db.database_id, view_table_name, &key);
 		let mut action = Action::Update;
 		let mut record = if let Some(record) = tx.get(&k, None).await? {
 			record
@@ -373,15 +373,40 @@ impl Document {
 		record.data = data.into();
 		let record = Arc::new(record);
 
-		tx.set_record(ns, db, view_table_name, &key, record.clone(), None).await?;
+		tx.set_record(db.namespace_id, db.database_id, view_table_name, &key, record.clone(), None)
+			.await?;
 
 		let id = Arc::new(RecordId {
-			table: view_table_name.to_string(),
+			table: view_table_name.to_string().into(),
 			key,
 		});
 
-		Self::run_triggers(stk, ctx, opt, id, action, Some(record_before.into()), Some(record))
+		let ns = self.doc_ctx.ns();
+		let db = self.doc_ctx.db();
+
+		let tb = ctx.tx().get_or_add_tb(Some(ctx), &ns.name, &db.name, view_table_name).await?;
+		let fields = ctx
+			.tx()
+			.all_tb_fields(ns.namespace_id, db.database_id, view_table_name, opt.version)
 			.await?;
+		let doc_ctx = DocumentContext::NsDbTbCtx(NsDbTbCtx {
+			ns: Arc::clone(ns),
+			db: Arc::clone(db),
+			tb,
+			fields,
+		});
+
+		Self::run_triggers(
+			stk,
+			ctx,
+			opt,
+			doc_ctx,
+			id,
+			action,
+			Some(record_before.into()),
+			Some(record),
+		)
+		.await?;
 
 		Ok(())
 	}
@@ -391,18 +416,18 @@ impl Document {
 	async fn process_view_record_delete(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		group: Vec<Value>,
-		view_table_name: &str,
+		view_table_name: &TableName,
 		aggr: &AggregationAnalysis,
 	) -> Result<()> {
-		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
+		let db = self.doc_ctx.db();
 
 		let key = RecordIdKey::Array(Array(group.clone()));
 		let tx = ctx.tx();
 
-		let k = key::record::new(ns, db, view_table_name, &key);
+		let k = key::record::new(db.namespace_id, db.database_id, view_table_name, &key);
 		let mut record = if let Some(record) = tx.get(&k, None).await? {
 			record
 		} else {
@@ -423,12 +448,37 @@ impl Document {
 			// Only one record, we can just delete the record.
 			tx.del(&k).await?;
 
+			let ns = self.doc_ctx.ns();
+			let db = self.doc_ctx.db();
+
+			let tb = ctx.tx().get_or_add_tb(Some(ctx), &ns.name, &db.name, view_table_name).await?;
+			let fields = ctx
+				.tx()
+				.all_tb_fields(ns.namespace_id, db.database_id, view_table_name, opt.version)
+				.await?;
+			let doc_ctx = DocumentContext::NsDbTbCtx(NsDbTbCtx {
+				ns: Arc::clone(ns),
+				db: Arc::clone(db),
+				tb,
+				fields,
+			});
+
 			let id = RecordId {
-				table: view_table_name.to_string(),
+				table: view_table_name.to_string().into(),
 				key,
 			};
-			Self::run_triggers(stk, ctx, opt, id.into(), Action::Delete, Some(record.into()), None)
-				.await?;
+
+			Self::run_triggers(
+				stk,
+				ctx,
+				opt,
+				doc_ctx,
+				id.into(),
+				Action::Delete,
+				Some(record.into()),
+				None,
+			)
+			.await?;
 			return Ok(());
 		}
 
@@ -602,13 +652,13 @@ impl Document {
 
 			let recalc_stmt = SelectStatement {
 				// SELECT VALUE [recalc1, recalc2,..]
-				expr: Fields::Value(Box::new(Field::Single {
+				expr: Fields::Value(Box::new(Selector {
 					expr: Expr::Literal(Literal::Array(exprs)),
 					alias: None,
 				})),
 				// FROM ONLY table
 				only: true,
-				what: vec![Expr::Table(table_name.to_string())],
+				what: vec![Expr::Table(table_name.clone())],
 				// WHERE group_expr1 = group_value1 && group_expr2 = group_value2 && ..
 				cond: condition.map(Cond),
 				// GROUP ALL
@@ -684,16 +734,34 @@ impl Document {
 		record.data = data.into();
 		let record = Arc::new(record);
 
-		tx.set_record(ns, db, view_table_name, &key, record.clone(), None).await?;
+		tx.set_record(db.namespace_id, db.database_id, view_table_name, &key, record.clone(), None)
+			.await?;
 
 		let id = RecordId {
-			table: view_table_name.to_string(),
+			table: view_table_name.to_string().into(),
 			key,
 		};
+
+		let ns = self.doc_ctx.ns();
+		let db = self.doc_ctx.db();
+
+		let tb = ctx.tx().get_or_add_tb(Some(ctx), &ns.name, &db.name, view_table_name).await?;
+		let fields = ctx
+			.tx()
+			.all_tb_fields(ns.namespace_id, db.database_id, view_table_name, opt.version)
+			.await?;
+		let doc_ctx = DocumentContext::NsDbTbCtx(NsDbTbCtx {
+			ns: Arc::clone(ns),
+			db: Arc::clone(db),
+			tb,
+			fields,
+		});
+
 		Self::run_triggers(
 			stk,
 			ctx,
 			opt,
+			doc_ctx,
 			id.into(),
 			Action::Update,
 			Some(record_before.into()),
@@ -708,18 +776,18 @@ impl Document {
 	async fn process_view_record_update(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		group: Vec<Value>,
-		view_table_name: &str,
+		view_table_name: &TableName,
 		aggr: &AggregationAnalysis,
 	) -> Result<()> {
-		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
+		let db = self.doc_ctx.db();
 
 		let key = RecordIdKey::Array(Array(group.clone()));
 		let tx = ctx.tx();
 
-		let k = key::record::new(ns, db, view_table_name, &key);
+		let k = key::record::new(db.namespace_id, db.database_id, view_table_name, &key);
 		let mut record = if let Some(record) = tx.get(&k, None).await? {
 			record
 		} else {
@@ -767,7 +835,7 @@ impl Document {
 							name: "math::max".to_string(),
 							message: format!(
 								"Argument 1 was the wrong type. Expected `number` but found `{}`",
-								after_args[*arg]
+								after_args[*arg].to_sql()
 							),
 						})
 					};
@@ -797,7 +865,7 @@ impl Document {
 							name: "math::min".to_string(),
 							message: format!(
 								"Argument 1 was the wrong type. Expected `number` but found `{}`",
-								after_args[*arg]
+								after_args[*arg].to_sql()
 							),
 						})
 					};
@@ -824,7 +892,7 @@ impl Document {
 							name: "math::sum".to_string(),
 							message: format!(
 								"Argument 1 was the wrong type. Expected `number` but found `{}`",
-								after_args[*arg]
+								after_args[*arg].to_sql()
 							),
 						})
 					};
@@ -847,7 +915,7 @@ impl Document {
 							name: "math::mean".to_string(),
 							message: format!(
 								"Argument 1 was the wrong type. Expected `number` but found `{}`",
-								after_args[*arg]
+								after_args[*arg].to_sql()
 							),
 						})
 					};
@@ -868,7 +936,7 @@ impl Document {
 							name: "time::max".to_string(),
 							message: format!(
 								"Argument 1 was the wrong type. Expected `datetime` but found `{}`",
-								after_args[*arg]
+								after_args[*arg].to_sql()
 							),
 						})
 					};
@@ -896,7 +964,7 @@ impl Document {
 							name: "time::min".to_string(),
 							message: format!(
 								"Argument 1 was the wrong type. Expected `datetime` but found `{}`",
-								after_args[*arg]
+								after_args[*arg].to_sql()
 							),
 						})
 					};
@@ -981,13 +1049,13 @@ impl Document {
 
 			let recalc_stmt = SelectStatement {
 				// SELECT VALUE [recalc1, recalc2,..]
-				expr: Fields::Value(Box::new(Field::Single {
+				expr: Fields::Value(Box::new(Selector {
 					expr: Expr::Literal(Literal::Array(exprs)),
 					alias: None,
 				})),
 				// FROM ONLY table
 				only: true,
-				what: vec![Expr::Table(table_name.to_string())],
+				what: vec![Expr::Table(table_name.clone())],
 				// WHERE group_expr1 = group_value1 && group_expr2 = group_value2 && ..
 				cond: condition.map(Cond),
 				// GROUP ALL
@@ -1063,16 +1131,34 @@ impl Document {
 		record.data = data.into();
 		let record = Arc::new(record);
 
-		tx.set_record(ns, db, view_table_name, &key, record.clone(), None).await?;
+		tx.set_record(db.namespace_id, db.database_id, view_table_name, &key, record.clone(), None)
+			.await?;
 
 		let id = RecordId {
 			table: view_table_name.to_owned(),
 			key,
 		};
+
+		let ns = self.doc_ctx.ns();
+		let db = self.doc_ctx.db();
+
+		let tb = ctx.tx().get_or_add_tb(Some(ctx), &ns.name, &db.name, view_table_name).await?;
+		let fields = ctx
+			.tx()
+			.all_tb_fields(ns.namespace_id, db.database_id, view_table_name, opt.version)
+			.await?;
+		let doc_ctx = DocumentContext::NsDbTbCtx(NsDbTbCtx {
+			ns: Arc::clone(ns),
+			db: Arc::clone(db),
+			tb,
+			fields,
+		});
+
 		Self::run_triggers(
 			stk,
 			ctx,
 			opt,
+			doc_ctx,
 			Arc::new(id),
 			Action::Update,
 			Some(record_before.into()),
@@ -1083,10 +1169,12 @@ impl Document {
 	}
 
 	/// Run triggers which are defined on the view, like events and second order views.
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn run_triggers(
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
+		doc_ctx: DocumentContext,
 		id: Arc<RecordId>,
 		action: Action,
 		initial: Option<Arc<Record>>,
@@ -1099,7 +1187,9 @@ impl Document {
 		// probelm.
 		//
 		// Generate a document so that we can run the events.
+
 		let mut document = Document {
+			doc_ctx,
 			r#gen: None,
 			retry: false,
 			extras: Workable::Normal,
@@ -1117,6 +1207,7 @@ impl Document {
 			id: Some(id),
 		};
 
+		stk.run(|stk| document.store_index_data(stk, ctx, opt)).await?;
 		stk.run(|stk| document.process_views(stk, ctx, opt, action)).await?;
 		stk.run(|stk| document.process_events(stk, ctx, opt, action, None)).await?;
 

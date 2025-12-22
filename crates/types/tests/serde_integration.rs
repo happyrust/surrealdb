@@ -11,12 +11,6 @@ struct PersonWithSerde {
 }
 
 #[derive(SurrealValue, Serialize, Deserialize, Debug, PartialEq, Clone)]
-struct AddressWithSerde {
-	street: String,
-	city: String,
-}
-
-#[derive(SurrealValue, Serialize, Deserialize, Debug, PartialEq, Clone)]
 struct ComplexPerson {
 	#[surreal(rename = "full_name")]
 	#[serde(rename = "full_name")]
@@ -103,7 +97,7 @@ fn test_interoperability_json_to_surreal() {
 	let surreal_value = person.clone().into_value();
 
 	// Convert back from SurrealValue
-	let from_surreal = ComplexPerson::from_value(surreal_value.clone()).unwrap();
+	let from_surreal = ComplexPerson::from_value(surreal_value).unwrap();
 	assert_eq!(from_surreal, person);
 
 	// Serialize back to JSON

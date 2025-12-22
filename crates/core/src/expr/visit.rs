@@ -3,6 +3,7 @@ use std::ops::Bound;
 use crate::catalog::{GraphQLConfig, Permission, Permissions, Relation, TableType};
 use crate::expr::access_type::{BearerAccess, JwtAccessVerify};
 use crate::expr::data::Assignment;
+use crate::expr::field::Selector;
 use crate::expr::lookup::LookupSubject;
 use crate::expr::order::Ordering;
 use crate::expr::part::{DestructurePart, Recurse, RecurseInstruction};
@@ -11,10 +12,12 @@ use crate::expr::statements::access::{
 	AccessStatementGrant, AccessStatementPurge, AccessStatementRevoke, AccessStatementShow, Subject,
 };
 use crate::expr::statements::alter::{
-	AlterDefault, AlterFieldStatement, AlterKind, AlterSequenceStatement, AlterTableStatement,
+	AlterDatabaseStatement, AlterDefault, AlterFieldStatement, AlterIndexStatement, AlterKind,
+	AlterNamespaceStatement, AlterSequenceStatement, AlterSystemStatement, AlterTableStatement,
 };
 use crate::expr::statements::define::config::ConfigInner;
 use crate::expr::statements::define::config::api::ApiConfig;
+use crate::expr::statements::define::config::defaults::DefaultConfig;
 use crate::expr::statements::define::{
 	ApiAction, DefineBucketStatement, DefineConfigStatement, DefineDefault, DefineSequenceStatement,
 };
@@ -28,12 +31,13 @@ use crate::expr::statements::{
 	DefineFieldStatement, DefineFunctionStatement, DefineIndexStatement, DefineModelStatement,
 	DefineModuleStatement, DefineNamespaceStatement, DefineParamStatement, DefineStatement,
 	DefineTableStatement, DefineUserStatement, DeleteStatement, ForeachStatement, IfelseStatement,
-	InfoStatement, InsertStatement, KillStatement, LiveStatement, OptionStatement, OutputStatement,
-	RelateStatement, RemoveAccessStatement, RemoveAnalyzerStatement, RemoveDatabaseStatement,
-	RemoveEventStatement, RemoveFieldStatement, RemoveFunctionStatement, RemoveIndexStatement,
-	RemoveModelStatement, RemoveModuleStatement, RemoveNamespaceStatement, RemoveParamStatement,
-	RemoveStatement, RemoveTableStatement, RemoveUserStatement, SelectStatement, SetStatement,
-	ShowStatement, SleepStatement, UpdateStatement, UpsertStatement, UseStatement,
+	InfoStatement, InsertStatement, KillStatement, LiveFields, LiveStatement, OptionStatement,
+	OutputStatement, RelateStatement, RemoveAccessStatement, RemoveAnalyzerStatement,
+	RemoveDatabaseStatement, RemoveEventStatement, RemoveFieldStatement, RemoveFunctionStatement,
+	RemoveIndexStatement, RemoveModelStatement, RemoveModuleStatement, RemoveNamespaceStatement,
+	RemoveParamStatement, RemoveStatement, RemoveTableStatement, RemoveUserStatement,
+	SelectStatement, SetStatement, ShowStatement, SleepStatement, UpdateStatement, UpsertStatement,
+	UseStatement,
 };
 use crate::expr::{
 	AccessType, Block, ClosureExpr, Data, Expr, Field, Fields, Function, FunctionCall, Idiom,
@@ -194,7 +198,12 @@ implement_visitor! {
 	}
 
 	fn visit_live(this, l: &LiveStatement){
-		this.visit_fields(&l.fields)?;
+		match &l.fields{
+			LiveFields::Diff => {},
+			LiveFields::Select(x) => {
+				this.visit_fields(x)?;
+			}
+		}
 		this.visit_expr(&l.what)?;
 		if let Some(c) = l.cond.as_ref(){
 			this.visit_expr(&c.0)?;
@@ -334,10 +343,26 @@ implement_visitor! {
 
 	fn visit_alter(this, a: &AlterStatement){
 		match a {
-			AlterStatement::Table(a)=>{ this.visit_alter_table(a)?;},
+			AlterStatement::System(a)=>{ this.visit_alter_system(a)?; },
+			AlterStatement::Namespace(a)=>{ this.visit_alter_namespace(a)?; },
+			AlterStatement::Database(a)=>{ this.visit_alter_database(a)?; },
+			AlterStatement::Table(a)=>{ this.visit_alter_table(a)?; },
+			AlterStatement::Index(a) => { this.visit_alter_index(a)?; },
 			AlterStatement::Sequence(a) => { this.visit_alter_sequence(a)?; },
 			AlterStatement::Field(a) => { this.visit_alter_field(a)?; },
 		}
+		Ok(())
+	}
+
+	fn visit_alter_system(this, a: &AlterSystemStatement){
+		Ok(())
+	}
+
+	fn visit_alter_namespace(this, a: &AlterNamespaceStatement){
+		Ok(())
+	}
+
+	fn visit_alter_database(this, a: &AlterDatabaseStatement){
 		Ok(())
 	}
 
@@ -345,6 +370,10 @@ implement_visitor! {
 		if let Some(p) = a.permissions.as_ref(){
 			this.visit_permissions(p)?;
 		}
+		Ok(())
+	}
+
+	fn visit_alter_index(this, a: &AlterIndexStatement){
 		Ok(())
 	}
 
@@ -473,9 +502,7 @@ implement_visitor! {
 				this.visit_expr(&f.0)?;
 			}
 		}
-		if let Some(v) = s.version.as_ref(){
-			this.visit_expr(v)?;
-		}
+		this.visit_expr(&s.version)?;
 
 		Ok(())
 	}
@@ -622,9 +649,7 @@ implement_visitor! {
 		if let Some(o) = o.output.as_ref(){
 			this.visit_output(o)?;
 		}
-		if let Some(o) = o.timeout.as_ref(){
-			this.visit_expr(&o.0)?;
-		}
+		this.visit_expr(&o.timeout)?;
 		Ok(())
 	}
 
@@ -639,8 +664,8 @@ implement_visitor! {
 	}
 
 	fn visit_insert(this, i: &InsertStatement){
-		if let Some(v) = i.into.as_ref(){
-			this.visit_expr(v)?;
+		if let Some(into) = &i.into {
+			this.visit_expr(into)?;
 		}
 		this.visit_data(&i.data)?;
 		if let Some(update) = i.update.as_ref(){
@@ -649,12 +674,8 @@ implement_visitor! {
 		if let Some(o) = i.output.as_ref(){
 			this.visit_output(o)?;
 		}
-		if let Some(o) = i.timeout.as_ref(){
-			this.visit_expr(&o.0)?;
-		}
-		if let Some(o) = i.version.as_ref(){
-			this.visit_expr(o)?;
-		}
+		this.visit_expr(&i.timeout)?;
+		this.visit_expr(&i.version)?;
 		Ok(())
 	}
 
@@ -712,9 +733,7 @@ implement_visitor! {
 		if let Some(o) = d.output.as_ref(){
 			this.visit_output(o)?;
 		}
-		if let Some(o) = d.timeout.as_ref(){
-			this.visit_expr(&o.0)?;
-		}
+		this.visit_expr(&d.timeout)?;
 		Ok(())
 	}
 
@@ -779,10 +798,7 @@ implement_visitor! {
 		this.visit_expr(&d.name)?;
 		this.visit_expr(&d.batch)?;
 		this.visit_expr(&d.start)?;
-
-		if let Some(o) = d.timeout.as_ref(){
-			this.visit_expr(&o.0)?;
-		}
+		this.visit_expr(&d.timeout)?;
 		Ok(())
 	}
 
@@ -792,9 +808,7 @@ implement_visitor! {
 			this.visit_expr(expr)?;
 		}
 		this.visit_permission(&d.permissions)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -807,9 +821,7 @@ implement_visitor! {
 			this.visit_expr(f)?;
 		}
 		this.visit_api_config(&d.config)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 
 		Ok(())
 	}
@@ -833,6 +845,9 @@ implement_visitor! {
 			ConfigInner::Api(api_config) => {
 				this.visit_api_config(api_config)?;
 			},
+			ConfigInner::Default(default_config) => {
+				this.visit_default_config(default_config)?;
+			},
 		}
 		Ok(())
 	}
@@ -852,24 +867,23 @@ implement_visitor! {
 		Ok(())
 	}
 
+	fn visit_default_config(this, d: &DefaultConfig) {
+		this.visit_expr(&d.namespace)?;
+		this.visit_expr(&d.database)?;
+		Ok(())
+	}
+
 	fn visit_define_access(this, d: &DefineAccessStatement) {
 		this.visit_expr(&d.name)?;
 		this.visit_access_type(&d.access_type)?;
 		if let Some(v) = d.authenticate.as_ref(){
 			this.visit_expr(v)?;
 		}
-		if let Some(e) = d.duration.grant.as_ref(){
-			this.visit_expr(e)?;
-		}
-		if let Some(e) = d.duration.token.as_ref(){
-			this.visit_expr(e)?;
-		}
-		if let Some(e) = d.duration.session.as_ref(){
-			this.visit_expr(e)?;
-		}
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+
+		this.visit_expr(&d.duration.grant)?;
+		this.visit_expr(&d.duration.token)?;
+		this.visit_expr(&d.duration.session)?;
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -922,31 +936,21 @@ implement_visitor! {
 
 	fn visit_define_model(this, d: &DefineModelStatement) {
 		this.visit_permission(&d.permissions)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
 	fn visit_define_module(this, d: &DefineModuleStatement) {
 		this.visit_permission(&d.permissions)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
 	fn visit_define_user(this, d: &DefineUserStatement) {
 		this.visit_expr(&d.name)?;
-		if let Some(expr) = d.duration.token.as_ref() {
-			this.visit_expr(expr)?;
-		}
-		if let Some(expr) = d.duration.session.as_ref() {
-			this.visit_expr(expr)?;
-		}
-		if let Some(expr) = d.comment.as_ref() {
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.duration.token)?;
+		this.visit_expr(&d.duration.session)?;
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -956,9 +960,7 @@ implement_visitor! {
 		for c in d.cols.iter(){
 			this.visit_expr(c)?;
 		}
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -986,9 +988,7 @@ implement_visitor! {
 		if let Some(r) = d.reference.as_ref(){
 			this.visit_reference(r)?;
 		}
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -1019,9 +1019,7 @@ implement_visitor! {
 		for v in d.then.iter(){
 			this.visit_expr(v)?;
 		}
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -1031,10 +1029,7 @@ implement_visitor! {
 			this.visit_view(v)?;
 		}
 		this.visit_permissions(&d.permissions)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
-
+		this.visit_expr(&d.comment)?;
 		this.visit_table_type(&d.table_type)?;
 
 		Ok(())
@@ -1087,18 +1082,14 @@ implement_visitor! {
 
 	fn visit_define_param(this, d: &DefineParamStatement){
 		this.visit_expr(&d.value)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		this.visit_permission(&d.permissions)?;
 		Ok(())
 	}
 
 	fn visit_define_analyzer(this, d: &DefineAnalyzerStatement){
 		this.visit_expr(&d.name)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -1108,9 +1099,7 @@ implement_visitor! {
 		}
 		this.visit_block(&d.block)?;
 		this.visit_permission(&d.permissions)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		if let Some(k) = d.returns.as_ref(){
 			this.visit_kind(k)?;
 		}
@@ -1130,17 +1119,13 @@ implement_visitor! {
 
 	fn visit_define_database(this,  d: &DefineDatabaseStatement){
 		this.visit_expr(&d.name)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
 	fn visit_define_namespace(this,  d: &DefineNamespaceStatement){
 		this.visit_expr(&d.name)?;
-		if let Some(expr) = d.comment.as_ref(){
-			this.visit_expr(expr)?;
-		}
+		this.visit_expr(&d.comment)?;
 		Ok(())
 	}
 
@@ -1157,13 +1142,9 @@ implement_visitor! {
 			this.visit_output(output)?;
 		}
 
-		if let Some(t) = c.timeout.as_ref(){
-			this.visit_expr(&t.0)?
-		}
+		this.visit_expr(&c.timeout)?;
 
-		if let Some(v) = c.version.as_ref(){
-			this.visit_expr(v)?
-		}
+		this.visit_expr(&c.version)?;
 
 		Ok(())
 	}
@@ -1516,7 +1497,7 @@ implement_visitor! {
 	fn visit_fields(this, fields: &Fields) {
 		match fields {
 			Fields::Value(field) => {
-				this.visit_field(field)?;
+				this.visit_selector(field)?;
 			},
 			Fields::Select(fields) => {
 				for f in fields.iter(){
@@ -1531,20 +1512,25 @@ implement_visitor! {
 	fn visit_field(this, field: &Field){
 		match field {
 			Field::All => {},
-			Field::Single { expr, alias } => {
-				this.visit_expr(expr)?;
-				if let Some(alias) = alias.as_ref(){
-					this.visit_idiom(alias)?;
-				}
+			Field::Single(s) => {
+				this.visit_selector(s)?;
 			},
+		}
+		Ok(())
+	}
+
+	fn visit_selector(this, selector: &Selector){
+		this.visit_expr(&selector.expr)?;
+		if let Some(alias) = &selector.alias {
+			this.visit_idiom(alias)?;
 		}
 		Ok(())
 	}
 
 	fn visit_lookup_subject(this, subject: &LookupSubject){
 		match subject{
-			LookupSubject::Table(_) => {},
-			LookupSubject::Range{range,..} => {
+			LookupSubject::Table { .. } => {},
+			LookupSubject::Range { range, .. } => {
 				this.visit_record_id_key_range(range)?;
 			},
 
@@ -1626,7 +1612,12 @@ implement_visitor_mut! {
 	}
 
 	fn visit_mut_live(this, l: &mut LiveStatement){
-		this.visit_mut_fields(&mut l.fields)?;
+		match &mut l.fields{
+			LiveFields::Diff => {},
+			LiveFields::Select(x) => {
+				this.visit_mut_fields(x)?;
+			}
+		}
 		this.visit_mut_expr(&mut l.what)?;
 		if let Some(c) = l.cond.as_mut(){
 			this.visit_mut_expr(&mut c.0)?;
@@ -1766,10 +1757,26 @@ implement_visitor_mut! {
 
 	fn visit_mut_alter(this, a: &mut AlterStatement){
 		match a {
+			AlterStatement::System(a)=>{ this.visit_mut_alter_system(a)?;},
+			AlterStatement::Namespace(a)=>{ this.visit_mut_alter_namespace(a)?;},
+			AlterStatement::Database(a)=>{ this.visit_mut_alter_database(a)?;},
 			AlterStatement::Table(a)=>{ this.visit_mut_alter_table(a)?;},
+			AlterStatement::Index(a)=>{ this.visit_mut_alter_index(a)?;},
 			AlterStatement::Sequence(a) => { this.visit_mut_alter_sequence(a)?; },
 			AlterStatement::Field(a) => { this.visit_mut_alter_field(a)?; },
 		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_system(this, a: &mut AlterSystemStatement){
+		Ok(())
+	}
+
+	fn visit_mut_alter_namespace(this, a: &mut AlterNamespaceStatement){
+		Ok(())
+	}
+
+	fn visit_mut_alter_database(this, a: &mut AlterDatabaseStatement){
 		Ok(())
 	}
 
@@ -1777,6 +1784,10 @@ implement_visitor_mut! {
 		if let Some(p) = a.permissions.as_mut(){
 			this.visit_mut_permissions(p)?;
 		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_index(this, a: &mut AlterIndexStatement){
 		Ok(())
 	}
 
@@ -1905,9 +1916,7 @@ implement_visitor_mut! {
 				this.visit_mut_expr(&mut f.0)?;
 			}
 		}
-		if let Some(v) = s.version.as_mut(){
-			this.visit_mut_expr(v)?;
-		}
+		this.visit_mut_expr(&mut s.version)?;
 
 		Ok(())
 	}
@@ -2054,9 +2063,7 @@ implement_visitor_mut! {
 		if let Some(o) = o.output.as_mut(){
 			this.visit_mut_output(o)?;
 		}
-		if let Some(o) = o.timeout.as_mut(){
-			this.visit_mut_expr(&mut o.0)?;
-		}
+		this.visit_mut_expr(&mut o.timeout)?;
 		Ok(())
 	}
 
@@ -2071,8 +2078,8 @@ implement_visitor_mut! {
 	}
 
 	fn visit_mut_insert(this, i: &mut InsertStatement){
-		if let Some(v) = i.into.as_mut(){
-			this.visit_mut_expr(v)?;
+		if let Some(into) = &mut i.into {
+			this.visit_mut_expr(into)?;
 		}
 		this.visit_mut_data(&mut i.data)?;
 		if let Some(update) = i.update.as_mut(){
@@ -2081,12 +2088,8 @@ implement_visitor_mut! {
 		if let Some(o) = i.output.as_mut(){
 			this.visit_mut_output(o)?;
 		}
-		if let Some(o) = i.timeout.as_mut(){
-			this.visit_mut_expr(&mut o.0)?;
-		}
-		if let Some(o) = i.version.as_mut(){
-			this.visit_mut_expr(o)?;
-		}
+		this.visit_mut_expr(&mut i.timeout)?;
+		this.visit_mut_expr(&mut i.version)?;
 		Ok(())
 	}
 
@@ -2144,9 +2147,7 @@ implement_visitor_mut! {
 		if let Some(o) = d.output.as_mut(){
 			this.visit_mut_output(o)?;
 		}
-		if let Some(o) = d.timeout.as_mut(){
-			this.visit_mut_expr(&mut o.0)?;
-		}
+		this.visit_mut_expr(&mut d.timeout)?;
 		Ok(())
 	}
 
@@ -2212,9 +2213,7 @@ implement_visitor_mut! {
 		this.visit_mut_expr(&mut d.batch)?;
 		this.visit_mut_expr(&mut d.start)?;
 
-		if let Some(o) = d.timeout.as_mut(){
-			this.visit_mut_expr(&mut o.0)?;
-		}
+		this.visit_mut_expr(&mut d.timeout)?;
 		Ok(())
 	}
 
@@ -2224,9 +2223,7 @@ implement_visitor_mut! {
 			this.visit_mut_expr(expr)?;
 		}
 		this.visit_mut_permission(&mut d.permissions)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2239,9 +2236,7 @@ implement_visitor_mut! {
 			this.visit_mut_expr(f)?;
 		}
 		this.visit_mut_api_config(&mut d.config)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 
 		Ok(())
 	}
@@ -2266,6 +2261,9 @@ implement_visitor_mut! {
 			ConfigInner::Api(api_config) => {
 				this.visit_mut_api_config(api_config)?;
 			},
+			ConfigInner::Default(default_config) => {
+				this.visit_mut_default_config(default_config)?;
+			},
 		}
 		Ok(())
 	}
@@ -2280,24 +2278,22 @@ implement_visitor_mut! {
 		Ok(())
 	}
 
+	fn visit_mut_default_config(this, d: &mut DefaultConfig) {
+		this.visit_mut_expr(&mut d.namespace)?;
+		this.visit_mut_expr(&mut d.database)?;
+		Ok(())
+	}
+
 	fn visit_mut_define_access(this, d: &mut DefineAccessStatement) {
 		this.visit_mut_expr(&mut d.name)?;
 		this.visit_mut_access_type(&mut d.access_type)?;
 		if let Some(v) = d.authenticate.as_mut(){
 			this.visit_mut_expr(v)?;
 		}
-		if let Some(e) = d.duration.grant.as_mut(){
-			this.visit_mut_expr(e)?;
-		}
-		if let Some(e) = d.duration.token.as_mut(){
-			this.visit_mut_expr(e)?;
-		}
-		if let Some(e) = d.duration.session.as_mut(){
-			this.visit_mut_expr(e)?;
-		}
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.duration.grant)?;
+		this.visit_mut_expr(&mut d.duration.token)?;
+		this.visit_mut_expr(&mut d.duration.session)?;
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2350,31 +2346,21 @@ implement_visitor_mut! {
 
 	fn visit_mut_define_model(this, d: &mut DefineModelStatement) {
 		this.visit_mut_permission(&mut d.permissions)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
 	fn visit_mut_define_module(this, d: &mut DefineModuleStatement) {
 		this.visit_mut_permission(&mut d.permissions)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
 	fn visit_mut_define_user(this, d: &mut DefineUserStatement) {
 		this.visit_mut_expr(&mut d.name)?;
-		if let Some(expr) = d.duration.token.as_mut() {
-			this.visit_mut_expr(expr)?;
-		}
-		if let Some(expr) = d.duration.session.as_mut() {
-			this.visit_mut_expr(expr)?;
-		}
-		if let Some(expr) = d.comment.as_mut() {
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.duration.token)?;
+		this.visit_mut_expr(&mut d.duration.session)?;
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2384,9 +2370,7 @@ implement_visitor_mut! {
 		for c in d.cols.iter_mut(){
 			this.visit_mut_expr(c)?;
 		}
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2414,9 +2398,7 @@ implement_visitor_mut! {
 		if let Some(r) = d.reference.as_mut(){
 			this.visit_mut_reference(r)?;
 		}
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2447,9 +2429,7 @@ implement_visitor_mut! {
 		for v in d.then.iter_mut(){
 			this.visit_mut_expr(v)?;
 		}
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2459,9 +2439,7 @@ implement_visitor_mut! {
 			this.visit_mut_view(v)?;
 		}
 		this.visit_mut_permissions(&mut d.permissions)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 
 		this.visit_mut_table_type(&mut d.table_type)?;
 
@@ -2515,18 +2493,14 @@ implement_visitor_mut! {
 
 	fn visit_mut_define_param(this, d: &mut DefineParamStatement){
 		this.visit_mut_expr(&mut d.value)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		this.visit_mut_permission(&mut d.permissions)?;
 		Ok(())
 	}
 
 	fn visit_mut_define_analyzer(this, d: &mut DefineAnalyzerStatement){
 		this.visit_mut_expr(&mut d.name)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2536,9 +2510,7 @@ implement_visitor_mut! {
 		}
 		this.visit_mut_block(&mut d.block)?;
 		this.visit_mut_permission(&mut d.permissions)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		if let Some(k) = d.returns.as_mut(){
 			this.visit_mut_kind(k)?;
 		}
@@ -2558,17 +2530,13 @@ implement_visitor_mut! {
 
 	fn visit_mut_define_database(this,  d: &mut DefineDatabaseStatement){
 		this.visit_mut_expr(&mut d.name)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
 	fn visit_mut_define_namespace(this,  d: &mut DefineNamespaceStatement){
 		this.visit_mut_expr(&mut d.name)?;
-		if let Some(expr) = d.comment.as_mut(){
-			this.visit_mut_expr(expr)?;
-		}
+		this.visit_mut_expr(&mut d.comment)?;
 		Ok(())
 	}
 
@@ -2585,13 +2553,9 @@ implement_visitor_mut! {
 			this.visit_mut_output(output)?;
 		}
 
-		if let Some(t) = c.timeout.as_mut(){
-			this.visit_mut_expr(&mut t.0)?
-		}
+		this.visit_mut_expr(&mut c.timeout)?;
 
-		if let Some(v) = c.version.as_mut(){
-			this.visit_mut_expr(v)?
-		}
+		this.visit_mut_expr(&mut c.version)?;
 
 		Ok(())
 	}
@@ -2955,7 +2919,7 @@ implement_visitor_mut! {
 	fn visit_mut_fields(this, fields: &mut Fields) {
 		match fields {
 			Fields::Value(field) => {
-				this.visit_mut_field(field)?;
+				this.visit_mut_selector(field)?;
 			},
 			Fields::Select(fields) => {
 				for f in fields.iter_mut(){
@@ -2970,23 +2934,25 @@ implement_visitor_mut! {
 	fn visit_mut_field(this, field: &mut Field){
 		match field {
 			Field::All => {},
-			Field::Single { expr, alias } => {
-				this.visit_mut_expr(expr)?;
-				if let Some(alias) = alias.as_mut(){
-					this.visit_mut_idiom(alias)?;
-				}
-			},
+			Field::Single(s) => this.visit_mut_selector(s)?,
+		}
+		Ok(())
+	}
+
+	fn visit_mut_selector(this, selector: &mut Selector){
+		this.visit_mut_expr(&mut selector.expr)?;
+		if let Some(alias) = &mut selector.alias{
+			this.visit_mut_idiom(alias)?;
 		}
 		Ok(())
 	}
 
 	fn visit_mut_lookup_subject(this, subject: &mut LookupSubject){
 		match subject{
-			LookupSubject::Table(_) => {},
-			LookupSubject::Range{range,..} => {
+			LookupSubject::Table { .. } => {},
+			LookupSubject::Range { range, .. } => {
 				this.visit_mut_record_id_key_range(range)?;
 			},
-
 		}
 		Ok(())
 	}

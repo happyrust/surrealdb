@@ -1,10 +1,9 @@
-use std::fmt;
-
 use anyhow::Result;
 use reblessive::tree::Stk;
+use surrealdb_types::{SqlFormat, ToSql};
 
 use super::FlowResultExt as _;
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
@@ -18,7 +17,7 @@ impl Limit {
 	pub(crate) async fn process(
 		&self,
 		stk: &mut Stk,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		opt: &Options,
 		doc: Option<&CursorDoc>,
 	) -> Result<u32> {
@@ -43,8 +42,9 @@ impl Limit {
 	}
 }
 
-impl fmt::Display for Limit {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "LIMIT {}", self.0)
+impl ToSql for Limit {
+	fn fmt_sql(&self, f: &mut String, sql_fmt: SqlFormat) {
+		let stmt: crate::sql::limit::Limit = self.clone().into();
+		stmt.fmt_sql(f, sql_fmt);
 	}
 }

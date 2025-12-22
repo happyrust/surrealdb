@@ -3,7 +3,7 @@ use std::ops::{Bound, RangeBounds};
 
 use serde::{Deserialize, Serialize};
 
-use crate::sql::ToSql;
+use crate::sql::{SqlFormat, ToSql};
 use crate::{SurrealValue, Value};
 
 /// Represents a range of values in SurrealDB
@@ -12,6 +12,7 @@ use crate::{SurrealValue, Value};
 /// This is commonly used for range queries and comparisons.
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Range {
 	/// The lower bound of the range
 	pub start: Bound<Value>,
@@ -33,6 +34,30 @@ impl Range {
 		Range {
 			start: Bound::Unbounded,
 			end: Bound::Unbounded,
+		}
+	}
+
+	/// Returns the start bound of the range.
+	pub fn start(&self) -> Bound<&Value> {
+		self.start.as_ref()
+	}
+
+	/// Returns the upper bound of the range.
+	pub fn end(&self) -> Bound<&Value> {
+		self.end.as_ref()
+	}
+
+	/// Convert into the inner bounds
+	pub fn into_inner(self) -> (Bound<Value>, Bound<Value>) {
+		(self.start, self.end)
+	}
+}
+
+impl From<(Bound<Value>, Bound<Value>)> for Range {
+	fn from((start, end): (Bound<Value>, Bound<Value>)) -> Self {
+		Range {
+			start,
+			end,
 		}
 	}
 }
@@ -142,12 +167,12 @@ impl Ord for Range {
 }
 
 impl ToSql for Range {
-	fn fmt_sql(&self, f: &mut String) {
+	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
 		match self.start {
 			Bound::Unbounded => {}
-			Bound::Included(ref x) => x.fmt_sql(f),
+			Bound::Included(ref x) => x.fmt_sql(f, fmt),
 			Bound::Excluded(ref x) => {
-				x.fmt_sql(f);
+				x.fmt_sql(f, fmt);
 				f.push('>');
 			}
 		}
@@ -156,10 +181,10 @@ impl ToSql for Range {
 			Bound::Unbounded => {}
 			Bound::Included(ref x) => {
 				f.push('=');
-				x.fmt_sql(f);
+				x.fmt_sql(f, fmt);
 			}
 			Bound::Excluded(ref x) => {
-				x.fmt_sql(f);
+				x.fmt_sql(f, fmt);
 			}
 		}
 	}

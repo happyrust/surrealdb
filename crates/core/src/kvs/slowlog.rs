@@ -23,7 +23,7 @@ use surrealdb_types::ToSql;
 use trice::Instant;
 
 use crate::catalog::{Permission, Permissions};
-use crate::ctx::Context;
+use crate::ctx::FrozenContext;
 use crate::expr::visit::{Visit, Visitor};
 
 #[derive(Clone)]
@@ -48,34 +48,36 @@ struct Inner {
 pub(crate) struct ParamVisitor<'a> {
 	params: String,
 	slow_log: &'a SlowLog,
-	ctx: &'a Context,
+	ctx: &'a FrozenContext,
 }
 
 impl Visitor for ParamVisitor<'_> {
 	type Error = ();
 
-	fn visit_param(&mut self, param: &crate::expr::Param) -> Result<(), Self::Error> {
-		if !self.slow_log.is_param_allowed(param) {
-			return Ok(());
-		}
-		if let Some(value) = self.ctx.value(param) {
-			if !value.is_none() && !value.is_null() {
-				let value = value.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
-				if !self.params.is_empty() {
-					self.params.push_str(", ");
-				}
-				write!(&mut self.params, "{}={}", param, value)
-					.expect("Writing into a string cannot fail");
-			}
-		}
-		Ok(())
-	}
-
 	// Empty implementations so that the visitor won't recurse into permissions.
 	fn visit_permissions(&mut self, _: &Permissions) -> Result<(), Self::Error> {
 		Ok(())
 	}
+
 	fn visit_permission(&mut self, _: &Permission) -> Result<(), Self::Error> {
+		Ok(())
+	}
+	fn visit_param(&mut self, param: &crate::expr::Param) -> Result<(), Self::Error> {
+		if !self.slow_log.is_param_allowed(param) {
+			return Ok(());
+		}
+		if let Some(value) = self.ctx.value(param)
+			&& !value.is_none()
+			&& !value.is_null()
+		{
+			if !self.params.is_empty() {
+				self.params.push_str(", ");
+			}
+
+			let value = value.to_sql().split_whitespace().collect::<Vec<_>>().join(" ");
+			write!(&mut self.params, "{}={}", param.to_sql(), value)
+				.expect("Writing into a string cannot fail");
+		}
 		Ok(())
 	}
 }
@@ -133,7 +135,7 @@ impl SlowLog {
 	///   suitable for log processing.
 	pub(crate) fn check_log<S: SlowLogVisit + ToSql>(
 		&self,
-		ctx: &Context,
+		ctx: &FrozenContext,
 		start: &Instant,
 		stm: &S,
 	) {
@@ -149,7 +151,7 @@ impl SlowLog {
 		warn!("Slow query detected - time: {elapsed:#?} - query: {stm} - params: [ {params} ]");
 	}
 
-	fn extract_params<S: SlowLogVisit + ToSql>(&self, ctx: &Context, stm: &S) -> String {
+	fn extract_params<S: SlowLogVisit + ToSql>(&self, ctx: &FrozenContext, stm: &S) -> String {
 		let mut visitor = ParamVisitor {
 			params: String::new(),
 			slow_log: self,

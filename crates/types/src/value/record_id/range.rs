@@ -4,7 +4,7 @@ use std::ops::{Bound, RangeFrom, RangeFull, RangeTo, RangeToInclusive};
 use serde::{Deserialize, Serialize};
 
 use crate as surrealdb_types;
-use crate::sql::ToSql;
+use crate::sql::{SqlFormat, ToSql};
 use crate::{Kind, Range, RecordIdKey, SurrealValue, Value, kind};
 
 /// Represents a range of record identifier keys in SurrealDB
@@ -13,6 +13,7 @@ use crate::{Kind, Range, RecordIdKey, SurrealValue, Value, kind};
 /// allowing queries like "find all records with IDs between X and Y".
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct RecordIdKeyRange {
 	/// The lower bound of the range
 	pub start: Bound<RecordIdKey>,
@@ -85,6 +86,21 @@ impl SurrealValue for RecordIdKeyRange {
 }
 
 impl RecordIdKeyRange {
+	/// Returns the start bound of the range.
+	pub fn start(&self) -> Bound<&RecordIdKey> {
+		self.start.as_ref()
+	}
+
+	/// Returns the upper bound of the range.
+	pub fn end(&self) -> Bound<&RecordIdKey> {
+		self.end.as_ref()
+	}
+
+	/// Converts this range into the inner bounds.
+	pub fn into_inner(self) -> (Bound<RecordIdKey>, Bound<RecordIdKey>) {
+		(self.start, self.end)
+	}
+
 	/// Converts this range into a `Range` value.
 	pub fn into_value_range(self) -> Range {
 		Range {
@@ -185,15 +201,15 @@ impl PartialEq<Range> for RecordIdKeyRange {
 }
 
 impl ToSql for RecordIdKeyRange {
-	fn fmt_sql(&self, f: &mut String) {
+	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
 		match &self.start {
 			Bound::Unbounded => {}
 			Bound::Included(v) => {
-				v.fmt_sql(f);
+				v.fmt_sql(f, fmt);
 			}
 			Bound::Excluded(v) => {
 				f.push('>');
-				v.fmt_sql(f)
+				v.fmt_sql(f, fmt)
 			}
 		};
 
@@ -203,10 +219,10 @@ impl ToSql for RecordIdKeyRange {
 			Bound::Unbounded => {}
 			Bound::Included(v) => {
 				f.push('=');
-				v.fmt_sql(f);
+				v.fmt_sql(f, fmt);
 			}
 			Bound::Excluded(v) => {
-				v.fmt_sql(f);
+				v.fmt_sql(f, fmt);
 			}
 		};
 	}

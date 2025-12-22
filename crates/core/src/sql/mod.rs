@@ -44,7 +44,6 @@ pub(crate) mod start;
 pub(crate) mod table_type;
 #[cfg(test)]
 mod test_to_sql;
-pub(crate) mod timeout;
 pub(crate) mod tokenizer;
 pub(crate) mod user;
 pub(crate) mod view;
@@ -58,7 +57,11 @@ pub(crate) mod arbitrary;
 
 pub(crate) use self::access_type::AccessType;
 pub(crate) use self::algorithm::Algorithm;
-pub(crate) use self::ast::{Ast, TopLevelExpr};
+#[cfg(not(feature = "arbitrary"))]
+pub(crate) use self::ast::Ast;
+#[cfg(feature = "arbitrary")]
+pub use self::ast::Ast;
+pub(crate) use self::ast::TopLevelExpr;
 pub(crate) use self::base::Base;
 pub(crate) use self::block::Block;
 pub(crate) use self::changefeed::ChangeFeed;
@@ -103,6 +106,5 @@ pub(crate) use self::statements::{
 	UpdateStatement, UpsertStatement,
 };
 pub(crate) use self::table_type::TableType;
-pub(crate) use self::timeout::Timeout;
 pub(crate) use self::view::View;
 pub(crate) use self::with::With;

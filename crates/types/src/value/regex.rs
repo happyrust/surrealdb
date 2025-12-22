@@ -1,14 +1,14 @@
 use std::cmp::Ordering;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::str::FromStr;
 
 use regex::RegexBuilder;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::sql::ToSql;
-use crate::write_sql;
+use crate::sql::{SqlFormat, ToSql};
 
 pub(crate) const REGEX_TOKEN: &str = "$surrealdb::public::Regex";
 
@@ -16,9 +16,8 @@ pub(crate) const REGEX_TOKEN: &str = "$surrealdb::public::Regex";
 ///
 /// A regular expression is a pattern used for matching strings.
 /// This type wraps the `regex::Regex` type and provides custom serialization/deserialization.
-
 #[derive(Clone)]
-pub struct Regex(pub regex::Regex);
+pub struct Regex(pub(crate) ::regex::Regex);
 
 impl Regex {
 	/// Returns a reference to the underlying regex
@@ -27,25 +26,30 @@ impl Regex {
 	pub fn regex(&self) -> &regex::Regex {
 		&self.0
 	}
+
+	/// Convert into the inner regex::Regex
+	pub fn into_inner(self) -> regex::Regex {
+		self.0
+	}
+}
+
+impl From<regex::Regex> for Regex {
+	fn from(regex: regex::Regex) -> Self {
+		Regex(regex)
+	}
 }
 
 impl FromStr for Regex {
 	type Err = <regex::Regex as FromStr>::Err;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		if s.contains('\0') {
-			Err(regex::Error::Syntax("regex contained NUL byte".to_owned()))
-		} else {
-			Ok(Regex(RegexBuilder::new(&s.replace("\\/", "/")).build()?))
-		}
+		Ok(Regex(RegexBuilder::new(&s.replace("\\/", "/")).build()?))
 	}
 }
 
 impl PartialEq for Regex {
 	fn eq(&self, other: &Self) -> bool {
-		let str_left = self.0.as_str();
-		let str_right = other.0.as_str();
-		str_left == str_right
+		self.0.as_str() == other.0.as_str()
 	}
 }
 
@@ -69,6 +73,14 @@ impl Hash for Regex {
 	}
 }
 
+impl Deref for Regex {
+	type Target = regex::Regex;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
 impl Debug for Regex {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		let t = self.0.to_string().replace('/', "\\/");
@@ -84,8 +96,10 @@ impl Display for Regex {
 }
 
 impl ToSql for Regex {
-	fn fmt_sql(&self, f: &mut String) {
-		write_sql!(f, "{}", self)
+	fn fmt_sql(&self, f: &mut String, _fmt: SqlFormat) {
+		f.push('/');
+		f.push_str(&self.0.to_string().replace('/', "\\/"));
+		f.push('/');
 	}
 }
 
@@ -140,5 +154,25 @@ impl<'de> Deserialize<'de> for Regex {
 		}
 
 		deserializer.deserialize_newtype_struct(REGEX_TOKEN, RegexNewtypeVisitor)
+	}
+}
+
+#[cfg(feature = "arbitrary")]
+mod arb {
+	use ::arbitrary::Arbitrary;
+
+	use super::*;
+
+	impl<'a> Arbitrary<'a> for Regex {
+		fn arbitrary(u: &mut ::arbitrary::Unstructured<'a>) -> ::arbitrary::Result<Self> {
+			let ast = regex_syntax::ast::Ast::arbitrary(u)?;
+			let src = &ast.to_string();
+			if src.is_empty() {
+				return Err(::arbitrary::Error::IncorrectFormat);
+			}
+			let regex =
+				RegexBuilder::new(src).build().map_err(|_| ::arbitrary::Error::IncorrectFormat)?;
+			Ok(Regex(regex))
+		}
 	}
 }

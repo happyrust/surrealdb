@@ -9,13 +9,13 @@ use uuid::Uuid;
 
 use crate::catalog;
 use crate::catalog::{
-	DatabaseDefinition, DatabaseId, IndexId, NamespaceDefinition, NamespaceId, Record,
-	TableDefinition, TableId, UserDefinition,
+	DatabaseDefinition, DatabaseId, DefaultConfig, IndexId, NamespaceDefinition, NamespaceId,
+	Record, TableDefinition, TableId, UserDefinition,
 };
-use crate::ctx::MutableContext;
+use crate::ctx::Context;
 use crate::dbs::node::Node;
 use crate::err::Error;
-use crate::val::RecordIdKey;
+use crate::val::{RecordIdKey, TableName};
 
 /// SurrealDB Node provider.
 #[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
@@ -26,6 +26,27 @@ pub(crate) trait NodeProvider {
 
 	/// Retrieve a specific node definition.
 	async fn get_node(&self, id: Uuid) -> Result<Arc<Node>>;
+}
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+pub(crate) trait RootProvider {
+	/// Retrieve a specific root definition.
+	async fn get_default_config(&self) -> Result<Option<Arc<DefaultConfig>>>;
+
+	/// Retrieve a specific config definition from the root.
+	async fn get_root_config(&self, cg: &str) -> Result<Option<Arc<catalog::ConfigDefinition>>>;
+
+	/// Retrieve a specific config definition from the root returning an error if it does not exist.
+	async fn expect_root_config(&self, cg: &str) -> Result<Arc<catalog::ConfigDefinition>> {
+		if let Some(val) = self.get_root_config(cg).await? {
+			Ok(val)
+		} else {
+			Err(anyhow::Error::new(Error::CgNotFound {
+				name: cg.to_owned(),
+			}))
+		}
+	}
 }
 
 /// Namespace data access provider.
@@ -43,20 +64,13 @@ pub(crate) trait NamespaceProvider {
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip(self, ctx))]
 	async fn get_or_add_ns(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: &str,
-		strict: bool,
 	) -> Result<Arc<NamespaceDefinition>> {
 		match self.get_ns_by_name(ns).await? {
 			Some(val) => Ok(val),
 			// The entry is not in the database
 			None => {
-				if strict {
-					return Err(Error::NsNotFound {
-						name: ns.to_owned(),
-					}
-					.into());
-				}
 				let ns = NamespaceDefinition {
 					namespace_id: self.get_next_ns_id(ctx).await?,
 					name: ns.to_owned(),
@@ -68,7 +82,7 @@ pub(crate) trait NamespaceProvider {
 	}
 
 	/// Get the next namespace id.
-	async fn get_next_ns_id(&self, ctx: Option<&MutableContext>) -> Result<NamespaceId>;
+	async fn get_next_ns_id(&self, ctx: Option<&Context>) -> Result<NamespaceId>;
 
 	/// Put a namespace definition into the datastore.
 	async fn put_ns(&self, ns: NamespaceDefinition) -> Result<Arc<NamespaceDefinition>>;
@@ -98,19 +112,14 @@ pub(crate) trait DatabaseProvider: NamespaceProvider {
 	/// dynamic mode.
 	async fn get_or_add_db_upwards(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: &str,
 		db: &str,
-		strict: bool,
 		upwards: bool,
 	) -> Result<Arc<DatabaseDefinition>>;
 
 	/// Get the next database id.
-	async fn get_next_db_id(
-		&self,
-		ctx: Option<&MutableContext>,
-		ns: NamespaceId,
-	) -> Result<DatabaseId>;
+	async fn get_next_db_id(&self, ctx: Option<&Context>, ns: NamespaceId) -> Result<DatabaseId>;
 
 	/// Put a database definition into a namespace.
 	async fn put_db(&self, ns: &str, db: DatabaseDefinition) -> Result<Arc<DatabaseDefinition>>;
@@ -298,7 +307,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Arc<[TableDefinition]>>;
 
 	/// Retrieve a specific table definition.
@@ -306,7 +315,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: &str,
 		db: &str,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Option<Arc<TableDefinition>>>;
 
 	/// Retrieve a specific table definition returning an error if it does not exist.
@@ -314,7 +323,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: &str,
 		db: &str,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Arc<TableDefinition>> {
 		match self.get_tb_by_name(ns, db, tb).await? {
 			Some(val) => Ok(val),
@@ -326,20 +335,18 @@ pub(crate) trait TableProvider {
 
 	/// Get or add a table with a default configuration, only if we are in
 	/// dynamic mode.
-	async fn get_or_add_tb_upwards(
+	async fn get_or_add_tb(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: &str,
 		db: &str,
-		tb: &str,
-		strict: bool,
-		upwards: bool,
+		tb: &TableName,
 	) -> Result<Arc<TableDefinition>>;
 
 	/// Get the next namespace id.
 	async fn get_next_tb_id(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: NamespaceId,
 		db: DatabaseId,
 	) -> Result<TableId>;
@@ -353,17 +360,17 @@ pub(crate) trait TableProvider {
 	) -> Result<Arc<TableDefinition>>;
 
 	/// Delete a table definition.
-	async fn del_tb(&self, ns: &str, db: &str, tb: &str) -> Result<()>;
+	async fn del_tb(&self, ns: &str, db: &str, tb: &TableName) -> Result<()>;
 
 	/// Clear a table definition.
-	async fn clr_tb(&self, ns: &str, db: &str, tb: &str) -> Result<()>;
+	async fn clr_tb(&self, ns: &str, db: &str, tb: &TableName) -> Result<()>;
 
 	/// Retrieve all event definitions for a specific table.
 	async fn all_tb_events(
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Arc<[catalog::EventDefinition]>>;
 
 	/// Retrieve all field definitions for a specific table.
@@ -371,7 +378,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		version: Option<u64>,
 	) -> Result<Arc<[catalog::FieldDefinition]>>;
 
@@ -380,7 +387,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Arc<[catalog::IndexDefinition]>>;
 
 	/// Retrieve all live definitions for a specific table.
@@ -388,7 +395,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Arc<[catalog::SubscriptionDefinition]>>;
 
 	/// Retrieve a specific table definition.
@@ -396,30 +403,15 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Option<Arc<TableDefinition>>>;
-
-	/// Check if a table exists.
-	async fn check_tb(
-		&self,
-		ns: NamespaceId,
-		db: DatabaseId,
-		tb: &str,
-		strict: bool,
-	) -> Result<()> {
-		if !strict {
-			return Ok(());
-		}
-		self.expect_tb(ns, db, tb).await?;
-		Ok(())
-	}
 
 	/// Retrieve a specific table definition returning an error if it does not exist.
 	async fn expect_tb(
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 	) -> Result<Arc<TableDefinition>> {
 		match self.get_tb(ns, db, tb).await? {
 			Some(val) => Ok(val),
@@ -434,7 +426,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		ev: &str,
 	) -> Result<Arc<catalog::EventDefinition>>;
 
@@ -443,7 +435,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		fd: &str,
 	) -> Result<Option<Arc<catalog::FieldDefinition>>>;
 
@@ -452,7 +444,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		fd: &catalog::FieldDefinition,
 	) -> Result<()>;
 
@@ -461,7 +453,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		ix: &str,
 	) -> Result<Option<Arc<catalog::IndexDefinition>>>;
 
@@ -470,7 +462,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		ix: IndexId,
 	) -> Result<Option<Arc<catalog::IndexDefinition>>>;
 
@@ -479,7 +471,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		ix: &str,
 	) -> Result<Arc<catalog::IndexDefinition>> {
 		self.get_tb_index(ns, db, tb, ix).await?.ok_or_else(|| {
@@ -495,19 +487,24 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		ix: &catalog::IndexDefinition,
 	) -> Result<()>;
 
-	async fn del_tb_index(&self, ns: NamespaceId, db: DatabaseId, tb: &str, ix: &str)
-	-> Result<()>;
+	async fn del_tb_index(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		tb: &TableName,
+		ix: &str,
+	) -> Result<()>;
 
 	/// Fetch a specific record value.
 	async fn get_record(
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		id: &RecordIdKey,
 		version: Option<u64>,
 	) -> Result<Arc<Record>>;
@@ -517,7 +514,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		id: &RecordIdKey,
 	) -> Result<bool>;
 
@@ -528,7 +525,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		id: &RecordIdKey,
 		record: Arc<Record>,
 		version: Option<u64>,
@@ -541,7 +538,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		id: &RecordIdKey,
 		record: Arc<Record>,
 		version: Option<u64>,
@@ -552,7 +549,7 @@ pub(crate) trait TableProvider {
 		&self,
 		ns: NamespaceId,
 		db: DatabaseId,
-		tb: &str,
+		tb: &TableName,
 		id: &RecordIdKey,
 	) -> Result<()>;
 }
@@ -812,47 +809,20 @@ pub(crate) trait CatalogProvider:
 	/// dynamic mode.
 	async fn get_or_add_db(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: &str,
 		db: &str,
-		strict: bool,
 	) -> Result<Arc<DatabaseDefinition>> {
-		self.get_or_add_db_upwards(ctx, ns, db, strict, false).await
+		self.get_or_add_db_upwards(ctx, ns, db, false).await
 	}
 
 	/// Ensures that the given namespace and database exist. If they do not, they will be created.
 	async fn ensure_ns_db(
 		&self,
-		ctx: Option<&MutableContext>,
+		ctx: Option<&Context>,
 		ns: &str,
 		db: &str,
-		strict: bool,
 	) -> Result<Arc<DatabaseDefinition>> {
-		self.get_or_add_db_upwards(ctx, ns, db, strict, true).await
-	}
-
-	/// Get or add a table with a default configuration, only if we are in
-	/// dynamic mode.
-	async fn get_or_add_tb(
-		&self,
-		ctx: Option<&MutableContext>,
-		ns: &str,
-		db: &str,
-		tb: &str,
-		strict: bool,
-	) -> Result<Arc<TableDefinition>> {
-		self.get_or_add_tb_upwards(ctx, ns, db, tb, strict, false).await
-	}
-
-	/// Ensures that a table, database, and namespace are all fully defined.
-	async fn ensure_ns_db_tb(
-		&self,
-		ctx: Option<&MutableContext>,
-		ns: &str,
-		db: &str,
-		tb: &str,
-		strict: bool,
-	) -> Result<Arc<TableDefinition>> {
-		self.get_or_add_tb_upwards(ctx, ns, db, tb, strict, true).await
+		self.get_or_add_db_upwards(ctx, ns, db, true).await
 	}
 }

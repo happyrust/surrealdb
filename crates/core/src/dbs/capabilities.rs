@@ -120,7 +120,6 @@ impl std::str::FromStr for FuncTarget {
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ExperimentalTarget {
-	RecordReferences,
 	GraphQL,
 	DefineApi,
 	Files,
@@ -130,7 +129,6 @@ pub enum ExperimentalTarget {
 impl fmt::Display for ExperimentalTarget {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::RecordReferences => write!(f, "record_references"),
 			Self::GraphQL => write!(f, "graphql"),
 			Self::DefineApi => write!(f, "define_api"),
 			Self::Files => write!(f, "files"),
@@ -148,7 +146,6 @@ impl Target for ExperimentalTarget {
 impl Target<str> for ExperimentalTarget {
 	fn matches(&self, elem: &str) -> bool {
 		match self {
-			Self::RecordReferences => elem.eq_ignore_ascii_case("record_references"),
 			Self::GraphQL => elem.eq_ignore_ascii_case("graphql"),
 			Self::DefineApi => elem.eq_ignore_ascii_case("define_api"),
 			Self::Files => elem.eq_ignore_ascii_case("files"),
@@ -178,7 +175,6 @@ impl std::str::FromStr for ExperimentalTarget {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		match s.trim().to_ascii_lowercase().as_str() {
-			"record_references" => Ok(ExperimentalTarget::RecordReferences),
 			"graphql" => Ok(ExperimentalTarget::GraphQL),
 			"define_api" => Ok(ExperimentalTarget::DefineApi),
 			"files" => Ok(ExperimentalTarget::Files),
@@ -317,15 +313,15 @@ impl std::str::FromStr for NetTarget {
 
 		// Parse the host and port parts from a string in the form of 'host' or
 		// 'host:port'
-		if let Ok(url) = Url::parse(format!("http://{s}").as_str()) {
-			if let Some(host) = url.host() {
-				// Url::parse will return port=None if the provided port was 80 (given we are
-				// using the http scheme). Get the original port from the string.
-				if let Some(Ok(port)) = s.split(':').next_back().map(|p| p.parse::<u16>()) {
-					return Ok(NetTarget::Host(host.to_owned(), Some(port)));
-				} else {
-					return Ok(NetTarget::Host(host.to_owned(), None));
-				}
+		if let Ok(url) = Url::parse(format!("http://{s}").as_str())
+			&& let Some(host) = url.host()
+		{
+			// Url::parse will return port=None if the provided port was 80 (given we are
+			// using the http scheme). Get the original port from the string.
+			if let Some(Ok(port)) = s.split(':').next_back().map(|p| p.parse::<u16>()) {
+				return Ok(NetTarget::Host(host.to_owned(), Some(port)));
+			} else {
+				return Ok(NetTarget::Host(host.to_owned(), None));
 			}
 		}
 

@@ -44,11 +44,18 @@ use std::mem;
 use ahash::HashMap;
 use anyhow::{Result, bail, ensure};
 use revision::revisioned;
-use serde::{Deserialize, Serialize};
+use surrealdb_types::ToSql;
 
 use crate::err::Error;
+use crate::expr::field::Selector;
+use crate::expr::statements::define::DefineConfigStatement;
+use crate::expr::statements::{
+	CreateStatement, DefineAccessStatement, DefineApiStatement, DefineFieldStatement,
+	DefineFunctionStatement, DefineIndexStatement, InsertStatement, RelateStatement,
+	UpdateStatement, UpsertStatement,
+};
 use crate::expr::visit::{MutVisitor, VisitMut};
-use crate::expr::{Expr, Field, Fields, Function, Groups, Idiom, Part};
+use crate::expr::{Expr, Field, Fields, Function, Groups, Idiom, Part, SelectStatement};
 use crate::val::{Array, Datetime, Number, Object, TryAdd as _, TryFloatDiv, TryMul, Value};
 
 /// An expression which will be aggregated over for each group.
@@ -127,7 +134,7 @@ impl Aggregation {
 
 /// A enum containing the data for an aggregation.
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AggregationStat {
 	Count {
 		count: i64,
@@ -257,7 +264,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "math::max".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `number` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -274,7 +281,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "math::min".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `number` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -291,7 +298,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "math::sum".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `number` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -307,7 +314,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "math::mean".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `number` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -326,7 +333,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "math::stddev".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `number` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -346,7 +353,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "math::variance".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `number` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -364,7 +371,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "time::max".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `datetime` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -382,7 +389,7 @@ pub fn add_to_aggregation_stats(arguments: &[Value], stats: &mut [AggregationSta
 						name: "time::min".to_string(),
 						message: format!(
 							"Argument 1 was the wrong type. Expected `datetime` but found `{}`",
-							arguments[*arg]
+							arguments[*arg].to_sql()
 						),
 					})
 				};
@@ -611,6 +618,15 @@ impl MutVisitor for AggregateExprCollector<'_> {
 				*s = Expr::Idiom(Idiom::field(aggregate_field_name(self.aggregations.len() - 1)));
 				Ok(())
 			}
+			Expr::Param(p) => {
+				if p.as_str() == "this" {
+					bail!(Error::Query{
+						message: "Found a `$this` parameter refering to the document of a group by select statement\n\
+							Select statements with a group by currently have no defined document to refer to".to_string()
+					});
+				}
+				Ok(())
+			}
 			Expr::Idiom(i) => {
 				if !self.within_aggregate_argument {
 					if let Some(group_idx) = self.groups.0.iter().position(|x| x.0 == *i) {
@@ -634,8 +650,12 @@ impl MutVisitor for AggregateExprCollector<'_> {
 								.or_insert_with(|| len);
 							self.aggregations.push(Aggregation::Accumulate(arg))
 						} else {
-							bail!(Error::InvalidAggregationSelector {
-								expr: i.to_string(),
+							bail!(Error::Query {
+								message: format!(
+									"Found idiom `{}` within the selector of a materialized aggregate view.\n\
+											 Selection of document fields which are not used within the argument of an optimized aggregate function is currently not supported",
+									i.to_sql()
+								)
 							})
 						}
 					}
@@ -646,6 +666,296 @@ impl MutVisitor for AggregateExprCollector<'_> {
 			}
 			x => x.visit_mut(self),
 		}
+	}
+
+	// ---------------
+	// We need to avoid trying to find aggregates in places where there are no aggregates.
+	// Take `SELECT (SELECT foo FROM ONLY { foo: math::mean(bar)  }) FROM foo GROUP ALL`
+	// `foo` here has nothing to do as it is calculated in a different context fromn `bar`
+	// which is part of the aggregate calculation.
+	//
+	//
+	// The implementations below ensure that only the places where we are within the same
+	// context are traversed.
+	// ---------------
+
+	fn visit_mut_create(&mut self, s: &mut CreateStatement) -> Result<(), Self::Error> {
+		for e in s.what.iter_mut() {
+			self.visit_mut_expr(e)?;
+		}
+		self.visit_mut_expr(&mut s.timeout)?;
+		if let Some(d) = &mut s.data {
+			ParentRewritor.visit_mut_data(d)?;
+		}
+		self.visit_mut_expr(&mut s.version)?;
+		Ok(())
+	}
+
+	fn visit_mut_select(&mut self, s: &mut SelectStatement) -> Result<(), Self::Error> {
+		for v in s.what.iter_mut() {
+			self.visit_mut_expr(v)?;
+		}
+		if let Some(l) = s.limit.as_mut() {
+			self.visit_mut_expr(&mut l.0)?;
+		}
+		self.visit_mut_expr(&mut s.version)?;
+
+		ParentRewritor.visit_mut_fields(&mut s.expr)?;
+		for o in s.omit.iter_mut() {
+			ParentRewritor.visit_mut_expr(o)?;
+		}
+		if let Some(c) = s.cond.as_mut() {
+			ParentRewritor.visit_mut_expr(&mut c.0)?;
+		}
+		if let Some(s) = s.split.as_mut() {
+			for s in s.0.iter_mut() {
+				ParentRewritor.visit_mut_idiom(&mut s.0)?;
+			}
+		}
+		if let Some(g) = s.group.as_mut() {
+			for g in g.0.iter_mut() {
+				ParentRewritor.visit_mut_idiom(&mut g.0)?;
+			}
+		}
+		if let Some(o) = s.order.as_mut() {
+			ParentRewritor.visit_mut_ordering(o)?;
+		}
+		if let Some(f) = s.fetch.as_mut() {
+			for f in f.0.iter_mut() {
+				ParentRewritor.visit_mut_expr(&mut f.0)?;
+			}
+		}
+
+		Ok(())
+	}
+
+	fn visit_mut_update(&mut self, s: &mut UpdateStatement) -> Result<(), Self::Error> {
+		for e in s.what.iter_mut() {
+			self.visit_mut_expr(e)?;
+		}
+		if let Some(e) = &mut s.data {
+			ParentRewritor.visit_mut_data(e)?;
+		}
+		if let Some(e) = &mut s.cond {
+			ParentRewritor.visit_mut_expr(&mut e.0)?;
+		}
+		self.visit_mut_expr(&mut s.timeout)?;
+		Ok(())
+	}
+
+	fn visit_mut_upsert(&mut self, s: &mut UpsertStatement) -> Result<(), Self::Error> {
+		for e in s.what.iter_mut() {
+			self.visit_mut_expr(e)?;
+		}
+		if let Some(d) = &mut s.data {
+			ParentRewritor.visit_mut_data(d)?;
+		}
+		if let Some(e) = &mut s.cond {
+			ParentRewritor.visit_mut_expr(&mut e.0)?;
+		}
+		self.visit_mut_expr(&mut s.timeout)?;
+		Ok(())
+	}
+
+	fn visit_mut_relate(&mut self, s: &mut RelateStatement) -> Result<(), Self::Error> {
+		self.visit_mut_expr(&mut s.through)?;
+		self.visit_mut_expr(&mut s.from)?;
+		self.visit_mut_expr(&mut s.to)?;
+		self.visit_mut_expr(&mut s.timeout)?;
+
+		if let Some(d) = s.data.as_mut() {
+			ParentRewritor.visit_mut_data(d)?;
+		}
+		if let Some(o) = s.output.as_mut() {
+			ParentRewritor.visit_mut_output(o)?;
+		}
+		Ok(())
+	}
+
+	fn visit_mut_insert(&mut self, i: &mut InsertStatement) -> Result<(), Self::Error> {
+		if let Some(into) = &mut i.into {
+			self.visit_mut_expr(into)?;
+		}
+		self.visit_mut_expr(&mut i.timeout)?;
+		self.visit_mut_expr(&mut i.version)?;
+
+		ParentRewritor.visit_mut_data(&mut i.data)?;
+		if let Some(update) = i.update.as_mut() {
+			ParentRewritor.visit_mut_data(update)?;
+		}
+		if let Some(o) = i.output.as_mut() {
+			ParentRewritor.visit_mut_output(o)?;
+		}
+		Ok(())
+	}
+
+	fn visit_mut_define_api(
+		&mut self,
+		d: &mut DefineApiStatement,
+	) -> std::result::Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.path)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_function(
+		&mut self,
+		d: &mut DefineFunctionStatement,
+	) -> std::result::Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_access(
+		&mut self,
+		d: &mut DefineAccessStatement,
+	) -> std::result::Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.name)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		self.visit_mut_expr(&mut d.duration.grant)?;
+		self.visit_mut_expr(&mut d.duration.token)?;
+		self.visit_mut_expr(&mut d.duration.session)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_index(&mut self, d: &mut DefineIndexStatement) -> Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.name)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_field(&mut self, d: &mut DefineFieldStatement) -> Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.name)?;
+		self.visit_mut_expr(&mut d.what)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
+	}
+}
+
+// Rewrites all `$parent` parameters that are evauluated in the current context to `None`
+struct ParentRewritor;
+
+impl MutVisitor for ParentRewritor {
+	type Error = Error;
+
+	fn visit_mut_expr(&mut self, e: &mut Expr) -> Result<(), Self::Error> {
+		if let Expr::Param(p) = e
+			&& p.as_str() == "parent"
+		{
+			return Err(Error::Query{
+					message: "Found a `$parent` parameter refering to the document of a GROUP select statement\n\
+						Select statements with a GROUP BY or GROUP ALL currently have no defined document to refer to".to_string()
+				});
+		}
+		e.visit_mut(self)
+	}
+
+	fn visit_mut_create(&mut self, s: &mut CreateStatement) -> Result<(), Self::Error> {
+		for e in s.what.iter_mut() {
+			self.visit_mut_expr(e)?;
+		}
+		self.visit_mut_expr(&mut s.timeout)?;
+		self.visit_mut_expr(&mut s.version)?;
+		Ok(())
+	}
+
+	fn visit_mut_select(&mut self, s: &mut SelectStatement) -> Result<(), Self::Error> {
+		self.visit_mut_fields(&mut s.expr)?;
+		for v in s.what.iter_mut() {
+			self.visit_mut_expr(v)?;
+		}
+		if let Some(l) = s.limit.as_mut() {
+			self.visit_mut_expr(&mut l.0)?;
+		}
+		self.visit_mut_expr(&mut s.version)?;
+		Ok(())
+	}
+
+	fn visit_mut_update(&mut self, s: &mut UpdateStatement) -> Result<(), Self::Error> {
+		for e in s.what.iter_mut() {
+			self.visit_mut_expr(e)?;
+		}
+
+		self.visit_mut_expr(&mut s.timeout)?;
+		Ok(())
+	}
+
+	fn visit_mut_upsert(&mut self, s: &mut UpsertStatement) -> Result<(), Self::Error> {
+		for e in s.what.iter_mut() {
+			self.visit_mut_expr(e)?;
+		}
+		self.visit_mut_expr(&mut s.timeout)?;
+		Ok(())
+	}
+
+	fn visit_mut_relate(&mut self, s: &mut RelateStatement) -> Result<(), Self::Error> {
+		self.visit_mut_expr(&mut s.through)?;
+		self.visit_mut_expr(&mut s.from)?;
+		self.visit_mut_expr(&mut s.to)?;
+		self.visit_mut_expr(&mut s.timeout)?;
+
+		Ok(())
+	}
+
+	fn visit_mut_insert(&mut self, i: &mut InsertStatement) -> Result<(), Self::Error> {
+		if let Some(into) = &mut i.into {
+			self.visit_mut_expr(into)?;
+		}
+		self.visit_mut_expr(&mut i.timeout)?;
+		self.visit_mut_expr(&mut i.version)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_api(
+		&mut self,
+		d: &mut DefineApiStatement,
+	) -> std::result::Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.path)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
+	}
+
+	fn visit_mut_permission(&mut self, _: &mut super::Permission) -> Result<(), Self::Error> {
+		Ok(())
+	}
+
+	fn visit_mut_define_config(
+		&mut self,
+		_: &mut DefineConfigStatement,
+	) -> Result<(), Self::Error> {
+		Ok(())
+	}
+
+	fn visit_mut_define_function(
+		&mut self,
+		_: &mut DefineFunctionStatement,
+	) -> std::result::Result<(), Self::Error> {
+		Ok(())
+	}
+
+	fn visit_mut_define_access(
+		&mut self,
+		d: &mut DefineAccessStatement,
+	) -> std::result::Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.name)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		self.visit_mut_expr(&mut d.duration.grant)?;
+		self.visit_mut_expr(&mut d.duration.token)?;
+		self.visit_mut_expr(&mut d.duration.session)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_index(&mut self, d: &mut DefineIndexStatement) -> Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.name)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
+	}
+
+	fn visit_mut_define_field(&mut self, d: &mut DefineFieldStatement) -> Result<(), Self::Error> {
+		self.visit_mut_expr(&mut d.name)?;
+		self.visit_mut_expr(&mut d.what)?;
+		self.visit_mut_expr(&mut d.comment)?;
+		Ok(())
 	}
 }
 
@@ -708,31 +1018,21 @@ impl AggregationAnalysis {
 		let fields = match fields {
 			Fields::Value(field) => {
 				// alias is unused when using a value selector.
-				let Field::Single {
-					expr,
-					..
-				} = field.as_ref()
-				else {
-					// all is not a valid aggregate selector.
-					bail!(Error::InvalidAggregationSelector {
-						expr: field.to_string()
-					})
-				};
-				let mut expr = expr.clone();
+				let mut expr = field.expr.clone();
 				collect.visit_mut_expr(&mut expr)?;
 				AggregateFields::Value(expr)
 			}
 			Fields::Select(fields) => {
 				let mut collect_fields = Vec::with_capacity(fields.len());
 				for f in fields.iter() {
-					let Field::Single {
+					let Field::Single(Selector {
 						expr,
 						alias,
-					} = f
+					}) = f
 					else {
 						// all is not a valid aggregate selector.
 						bail!(Error::InvalidAggregationSelector {
-							expr: f.to_string()
+							expr: f.to_sql()
 						})
 					};
 
@@ -769,7 +1069,7 @@ impl AggregationAnalysis {
 
 		// Place the expression which need to be calculated for the aggregate in the right index.
 		let mut aggregate_arguments = Vec::with_capacity(exprs_map.len());
-		for (k, v) in exprs_map.into_iter() {
+		for (k, v) in exprs_map {
 			if aggregate_arguments.len() > v {
 				aggregate_arguments[v] = k
 			} else {

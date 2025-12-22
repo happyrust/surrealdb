@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
 use crate::Value;
-use crate::sql::ToSql;
+use crate::sql::{SqlFormat, ToSql};
 
 /// A set of unique values in SurrealDB
 ///
@@ -13,6 +13,7 @@ use crate::sql::ToSql;
 /// deduplication and sorted iteration based on `Value`'s `Ord` implementation.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Set(pub(crate) BTreeSet<Value>);
 
 impl Set {
@@ -21,43 +22,9 @@ impl Set {
 		Self(BTreeSet::new())
 	}
 
-	/// Get the number of elements in the set
-	pub fn len(&self) -> usize {
-		self.0.len()
-	}
-
-	/// Check if the set is empty
-	pub fn is_empty(&self) -> bool {
-		self.0.is_empty()
-	}
-
-	/// Get an iterator over the values in the set
-	pub fn iter(&self) -> impl Iterator<Item = &Value> {
-		self.0.iter()
-	}
-
-	/// Insert a value into the set
-	///
-	/// Returns `true` if the value was newly inserted, `false` if it was already present
-	pub fn insert(&mut self, value: Value) -> bool {
-		self.0.insert(value)
-	}
-
-	/// Remove a value from the set
-	///
-	/// Returns `true` if the value was present and removed, `false` if it wasn't present
-	pub fn remove(&mut self, value: &Value) -> bool {
-		self.0.remove(value)
-	}
-
-	/// Check if the set contains a value
-	pub fn contains(&self, value: &Value) -> bool {
-		self.0.contains(value)
-	}
-
-	/// Remove all values from the set
-	pub fn clear(&mut self) {
-		self.0.clear()
+	/// Convert into the inner BTreeSet<Value>
+	pub fn into_inner(self) -> BTreeSet<Value> {
+		self.0
 	}
 }
 
@@ -88,6 +55,15 @@ impl IntoIterator for Set {
 	}
 }
 
+impl<'a> IntoIterator for &'a Set {
+	type Item = &'a Value;
+	type IntoIter = std::collections::btree_set::Iter<'a, Value>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.0.iter()
+	}
+}
+
 impl Deref for Set {
 	type Target = BTreeSet<Value>;
 
@@ -103,7 +79,7 @@ impl DerefMut for Set {
 }
 
 impl ToSql for Set {
-	fn fmt_sql(&self, f: &mut String) {
+	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
 		if self.is_empty() {
 			f.push_str("{,}");
 			return;
@@ -113,7 +89,7 @@ impl ToSql for Set {
 		f.push('{');
 		let len = self.len();
 		for (i, v) in self.iter().enumerate() {
-			v.fmt_sql(f);
+			v.fmt_sql(f, fmt);
 			if len == 1 {
 				f.push(',');
 			} else if i < len - 1 {

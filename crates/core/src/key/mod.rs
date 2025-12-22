@@ -27,6 +27,7 @@
 //! crate::key::root::ns                 /!ns{ns} -> NamespaceDefinition
 //! crate::key::root::us                 /!us{us}
 //! crate::key::root::tl                 /!tl{tl}
+//! crate::key::root::cg                 /!cg{ty}
 //!
 //! crate::key::node::all                /${nd}
 //! crate::key::node::lq                 /${nd}!lq{lq}{ns}{db}
@@ -99,7 +100,7 @@
 //! crate::key::record                   /*{ns}*{db}*{tb_name}*{id}
 //!
 //! crate::key::graph                    /*{ns}*{db}*{tb_name}~{id}{eg}{ft}{fk}
-//! crate::key::ref                      /*{ns}*{db}*{tb_name}&{id}{ft}{fk}{ff}
+//! crate::key::ref                      /*{ns}*{db}*{tb_name}&{id}{ft}{ff}{fk}
 //!
 //! crate::key::sequence::st             /*{ns}*{db}*{tb_name}*{sq}!st{id}
 //! crate::key::sequence::ba             /*{ns}*{db}*{tb_name}*{sq}!ba{start}

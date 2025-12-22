@@ -89,8 +89,8 @@ pub async fn signup_record(new_db: impl CreateDb) {
 	drop(permit);
 	response.check().unwrap();
 	db.signup(RecordAccess {
-		namespace: namespace.to_string(),
-		database: database.to_string(),
+		namespace: namespace.clone(),
+		database: database.clone(),
 		access: access.to_string(),
 		params: AuthParams {
 			email: "john.doe@example.com".to_string(),
@@ -113,7 +113,7 @@ pub async fn signin_ns(new_db: impl CreateDb) {
 	drop(permit);
 	response.check().unwrap();
 	db.signin(Namespace {
-		namespace: namespace.to_string(),
+		namespace: namespace.clone(),
 		username: user,
 		password: pass,
 	})
@@ -134,8 +134,8 @@ pub async fn signin_db(new_db: impl CreateDb) {
 	drop(permit);
 	response.check().unwrap();
 	db.signin(Database {
-		namespace: namespace.to_string(),
-		database: database.to_string(),
+		namespace: namespace.clone(),
+		database: database.clone(),
 		username: user,
 		password: pass.to_string(),
 	})
@@ -164,8 +164,8 @@ pub async fn signin_record(new_db: impl CreateDb) {
 	drop(permit);
 	response.check().unwrap();
 	db.signup(RecordAccess {
-		namespace: namespace.to_string(),
-		database: database.to_string(),
+		namespace: namespace.clone(),
+		database: database.clone(),
 		access: access.to_string(),
 		params: AuthParams {
 			pass: pass.to_string(),
@@ -175,8 +175,8 @@ pub async fn signin_record(new_db: impl CreateDb) {
 	.await
 	.unwrap();
 	db.signin(RecordAccess {
-		namespace: namespace.to_string(),
-		database: database.to_string(),
+		namespace: namespace.clone(),
+		database: database.clone(),
 		access: access.to_string(),
 		params: AuthParams {
 			pass: pass.to_string(),
@@ -210,9 +210,9 @@ pub async fn record_access_throws_error(new_db: impl CreateDb) {
 
 	let err = db
 		.signup(RecordAccess {
-			namespace: namespace.to_string(),
-			database: database.to_string(),
-			access: access.to_string(),
+			namespace: namespace.clone(),
+			database: database.clone(),
+			access: access.clone(),
 			params: AuthParams {
 				pass: pass.to_string(),
 				email: email.clone(),
@@ -238,9 +238,9 @@ pub async fn record_access_throws_error(new_db: impl CreateDb) {
 
 	let err = db
 		.signin(RecordAccess {
-			namespace: namespace.to_string(),
-			database: database.to_string(),
-			access: access.to_string(),
+			namespace: namespace.clone(),
+			database: database.clone(),
+			access: access.clone(),
 			params: AuthParams {
 				pass: pass.to_string(),
 				email: email.clone(),
@@ -288,9 +288,9 @@ pub async fn record_access_invalid_query(new_db: impl CreateDb) {
 
 	let err = db
 		.signup(RecordAccess {
-			namespace: namespace.to_string(),
-			database: database.to_string(),
-			access: access.to_string(),
+			namespace: namespace.clone(),
+			database: database.clone(),
+			access: access.clone(),
 			params: AuthParams {
 				pass: pass.to_string(),
 				email: email.clone(),
@@ -318,9 +318,9 @@ pub async fn record_access_invalid_query(new_db: impl CreateDb) {
 
 	let err = db
 		.signin(RecordAccess {
-			namespace: namespace.to_string(),
-			database: database.to_string(),
-			access: access.to_string(),
+			namespace: namespace.clone(),
+			database: database.clone(),
+			access: access.clone(),
 			params: AuthParams {
 				pass: pass.to_string(),
 				email: email.clone(),
@@ -360,7 +360,7 @@ pub async fn authenticate(new_db: impl CreateDb) {
 	response.check().unwrap();
 	let token = db
 		.signin(Namespace {
-			namespace: namespace.to_string(),
+			namespace: namespace.clone(),
 			username: user,
 			password: pass.to_string(),
 		})
@@ -477,12 +477,16 @@ pub async fn query_chaining(new_db: impl CreateDb) {
 	db.use_ns(Ulid::new().to_string()).use_db(Ulid::new().to_string()).await.unwrap();
 	drop(permit);
 	let response = db
-		.query("BEGIN")
-		.query("CREATE account:one SET balance = 135605.16")
-		.query("CREATE account:two SET balance = 91031.31")
-		.query("UPDATE account:one SET balance += 300.00")
-		.query("UPDATE account:two SET balance -= 300.00")
-		.query("COMMIT")
+		.query(
+			"
+			BEGIN;
+			CREATE account:one SET balance = 135605.16;
+			CREATE account:two SET balance = 91031.31;
+			UPDATE account:one SET balance += 300.00;
+			UPDATE account:two SET balance -= 300.00;
+			COMMIT;
+		",
+		)
 		.await
 		.unwrap();
 	response.check().unwrap();
@@ -673,13 +677,13 @@ pub async fn insert_relation_table(new_db: impl CreateDb) {
 	drop(permit);
 	let tmp: Result<Vec<ApiRecordId>, _> = db.insert("likes").relation(object! {}).await;
 	tmp.unwrap_err();
-	let val = object! {in: RecordId::new("person", "a"), out: RecordId::new("thing", "a")};
+	let val = object! {in: RecordId::new("person", "a"), out: RecordId::new("record", "a")};
 	let _: Vec<ApiRecordId> = db.insert("likes").relation(val).await.unwrap();
 
 	let vals = array![
-		object! { in: rid!(person:b), out: rid!("thing:a") },
-		object! { id: rid!("likes:2"), in: rid!("person:c"), out: rid!("thing:a") },
-		object! { id: rid!("likes:3"), in: rid!("person:d"), out: rid!("thing:a") },
+		object! { in: rid!(person:b), out: rid!("record:a") },
+		object! { id: rid!("likes:2"), in: rid!("person:c"), out: rid!("record:a") },
+		object! { id: rid!("likes:3"), in: rid!("person:d"), out: rid!("record:a") },
 	];
 	let _: Vec<ApiRecordId> = db.insert("likes").relation(vals).await.unwrap();
 }
@@ -1542,7 +1546,7 @@ pub async fn changefeed(new_db: impl CreateDb) {
 	let Value::Number(_versionstamp1) = a.get("versionstamp").unwrap() else {
 		unreachable!()
 	};
-	let changes = a.get("changes").unwrap().clone().clone();
+	let changes = a.get("changes").unwrap().clone();
 	assert_eq!(
 		changes,
 		surrealdb::parse::value(
@@ -1787,7 +1791,7 @@ pub async fn client_side_transactions(new_db: impl CreateDb) {
 		.await
 		.unwrap();
 	assert!(user.is_some());
-	txn.commit().await.unwrap();
+	let db = txn.commit().await.unwrap();
 
 	// Verify the user was created by querying through the main db connection
 	let users: Vec<User> = db.select("user").await.unwrap();
@@ -1806,7 +1810,7 @@ pub async fn client_side_transactions(new_db: impl CreateDb) {
 		.await
 		.unwrap();
 	// Cancel the transaction - the user should not be persisted
-	txn.cancel().await.unwrap();
+	let db = txn.cancel().await.unwrap();
 
 	// Verify Jane was not created
 	let users: Vec<User> = db.select("user").await.unwrap();
@@ -1831,7 +1835,7 @@ pub async fn client_side_transactions(new_db: impl CreateDb) {
 		})
 		.await
 		.unwrap();
-	txn.commit().await.unwrap();
+	let db = txn.commit().await.unwrap();
 
 	// Verify all users were created
 	let users: Vec<User> = db.select("user").await.unwrap();
