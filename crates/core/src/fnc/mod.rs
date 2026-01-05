@@ -322,6 +322,10 @@ pub fn synchronous(
 		"parse::url::port" => parse::url::port,
 		"parse::url::query" => parse::url::query,
 		"parse::url::scheme" => parse::url::scheme,
+		"parse::uint64::to_u64" => parse::uint64::to_u64,
+		"parse::uint64::to_u64_many" => parse::uint64::to_u64_many,
+		"parse::uint64::to_u64" => parse::uint64::to_u64,
+		"parse::uint64::to_u64_many" => parse::uint64::to_u64_many,
 		//
 		"rand" => rand::rand,
 		"rand::bool" => rand::bool,

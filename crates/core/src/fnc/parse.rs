@@ -152,3 +152,103 @@ pub mod url {
 		}
 	}
 }
+
+pub mod uint64 {
+
+	use anyhow::Result;
+
+	use crate::val::{Array, Value};
+
+	const HI_MAX: u64 = 0x7fff_ffff;
+	const LO_MAX: u64 = 0xffff_ffff;
+	const I64_MAX_U: u64 = i64::MAX as u64;
+
+	fn strip_wrappers(s: &str) -> &str {
+		let s = s.trim_start_matches("pe:");
+		s.trim_matches(['`', '⟨', '⟩'])
+	}
+
+	fn combine(hi: u64, lo: u64) -> Option<i64> {
+		if hi > HI_MAX || lo > LO_MAX {
+			return None;
+		}
+		let v = (hi << 32) | lo;
+		if v > I64_MAX_U {
+			return None;
+		}
+		Some(v as i64)
+	}
+
+	fn parse_str(s: &str) -> Option<i64> {
+		let raw = strip_wrappers(s);
+		let mut parts = raw.split(|c| c == '_' || c == '/');
+		let hi = parts.next()?.parse::<u64>().ok()?;
+		let lo = parts.next()?.parse::<u64>().ok()?;
+		combine(hi, lo)
+	}
+
+	fn parse_value(v: &Value) -> Option<i64> {
+		match v {
+			Value::Strand(s) => parse_str(s.as_str()),
+			Value::String(s) => parse_str(s.as_str()),
+			Value::Array(Array(items)) if items.len() == 2 => {
+				let hi = items[0].clone().cast_to::<i64>().ok()?;
+				let lo = items[1].clone().cast_to::<i64>().ok()?;
+				if hi < 0 || lo < 0 {
+					return None;
+				}
+				combine(hi as u64, lo as u64)
+			}
+			_ => None,
+		}
+	}
+
+	pub fn to_u64((val,): (Value,)) -> Result<Value> {
+		Ok(parse_value(&val).map(Value::from).unwrap_or(Value::None))
+	}
+
+		pub fn to_u64_many((val,): (Value,)) -> Result<Value> {
+			match val {
+				Value::Array(Array(items)) => Ok(Value::Array(Array(
+					items
+						.iter()
+						.map(|v| parse_value(v).map(Value::from).unwrap_or(Value::None))
+						.collect(),
+				))),
+				_ => Ok(Value::None),
+			}
+		}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn parse_string_underscore() {
+			let v = to_u64((Value::from("24383_73962"),)).unwrap();
+			assert_eq!(v, Value::from(((24383u64 << 32) | 73962) as i64));
+		}
+
+		#[test]
+		fn parse_array_pair() {
+			let v = to_u64((Value::Array(Array(vec![Value::from(1), Value::from(2)])),)).unwrap();
+			assert_eq!(v, Value::from(((1u64 << 32) | 2) as i64));
+		}
+
+		#[test]
+		fn parse_many_mixed() {
+			let input = Value::Array(Array(vec![
+				Value::from("1/2"),
+				Value::Array(Array(vec![Value::from(3), Value::from(4)])),
+			]));
+			let out = to_u64_many((input,)).unwrap();
+			assert_eq!(
+				out,
+				Value::Array(Array(vec![
+					Value::from(((1u64 << 32) | 2) as i64),
+					Value::from(((3u64 << 32) | 4) as i64),
+				]))
+			);
+		}
+	}
+}
