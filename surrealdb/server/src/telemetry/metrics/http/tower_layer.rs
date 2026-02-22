@@ -84,7 +84,6 @@ where
 		// Initialize the metrics if not already done.
 		if this.tracker.state.get_mut() == &ResultState::None {
 			this.tracker.set_state(ResultState::Started);
-
 			on_request_start(this.tracker);
 		}
 

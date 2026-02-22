@@ -36,10 +36,8 @@ error = false
 
 # 7
 [[test.results]]
-error = "No output strategy was possible for this API request"
-
-[env.capabilities]
-allow-experimental = ["define_api"]
+skip-api-request-id = true
+value = "{ body: 'No output strategy was possible for this API request', headers: {  }, status: 406 }"
 
 */
 

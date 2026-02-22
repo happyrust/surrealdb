@@ -5,13 +5,11 @@
 value = "NONE"
 
 [[test.results]]
-error = "deadline has elapsed"
+skip-api-request-id = true
+value = "{ body: 'deadline has elapsed', headers: {  }, status: 500 }"
 
 [[test.results]]
 error = "The string could not be parsed into a path: Segment should start with /"
-
-[env.capabilities]
-allow-experimental = ["define_api"]
 
 */
 

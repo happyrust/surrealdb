@@ -7,7 +7,7 @@ use std::net::ToSocketAddrs;
 use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow};
-use opentelemetry::{Key, KeyValue, Value, global};
+use opentelemetry::global;
 use opentelemetry_sdk::Resource;
 use tracing::{Level, Subscriber};
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
@@ -20,25 +20,9 @@ use crate::cli::validator::parser::tracing::CustomFilter;
 use crate::cnf::ENABLE_TOKIO_CONSOLE;
 
 pub static OTEL_DEFAULT_RESOURCE: LazyLock<Resource> = LazyLock::new(|| {
-	let resource = Resource::default();
-	let service_key = Key::from_static_str("service.name");
-	let needs_override = resource
-		.get(service_key.clone())
-		.and_then(|value| match value {
-			Value::String(name) => Some(name.as_str() == "unknown_service"),
-			_ => None,
-		})
-		.unwrap_or(true);
-
-	if needs_override {
-		let existing = resource
-			.iter()
-			.map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
-			.chain(std::iter::once(KeyValue::new(service_key.clone(), "surrealdb")));
-		Resource::new(existing)
-	} else {
-		resource
-	}
+	// Build resource from environment variables and default attributes
+	// The Resource will automatically merge SDK, environment, and telemetry metadata
+	Resource::builder().with_service_name("surrealdb").build()
 });
 
 #[derive(Debug, Clone)]
@@ -299,12 +283,7 @@ impl Builder {
 pub fn shutdown() {
 	// Output information to logs
 	trace!("Shutting down telemetry service");
-	// Flush all telemetry data and block until done
-	if let Some(provider) = traces::take_provider() {
-		if let Err(err) = provider.shutdown() {
-			warn!("Failed to shut down tracer provider: {err}");
-		}
-	}
+	// Explicit shutdown is handled by Drop implementations
 }
 
 /// Create an EnvFilter from the given value. If the value is not a valid log

@@ -134,10 +134,10 @@ implement_visitor! {
 			TopLevelExpr::Access(s) => {this.visit_access(s)? },
 			TopLevelExpr::Kill(s) => {this.visit_kill(s)?; },
 			TopLevelExpr::Live(s) => {this.visit_live(s)?; },
-			TopLevelExpr::Option(s) =>{ this.visit_option(s)?; },
-			TopLevelExpr::Use(s) => {this.visit_use(s)?; },
-			TopLevelExpr::Show(s) => {this.visit_show(s)?; },
-			TopLevelExpr::Expr(e) => {this.visit_expr(e)?; },
+		TopLevelExpr::Option(s) =>{ this.visit_option(s)?; },
+		TopLevelExpr::Use(s) => {this.visit_use(s)?; },
+		TopLevelExpr::Show(s) => {this.visit_show(s)?; },
+		TopLevelExpr::Expr(e) => {this.visit_expr(e)?; },
 		}
 		Ok(())
 	}
@@ -209,7 +209,7 @@ implement_visitor! {
 			this.visit_expr(&c.0)?;
 		}
 		if let Some(f) = l.fetch.as_ref(){
-			for f in f.0.iter(){
+			for f in f.iter(){
 				this.visit_expr(&f.0)?;
 			}
 		}
@@ -290,15 +290,18 @@ implement_visitor! {
 			Expr::Foreach(s) => {
 				this.visit_foreach(s)?;
 			},
-			Expr::Let(s) => {
-				this.visit_set(s)?;
-			},
-			Expr::Sleep(s) => {
-				this.visit_sleep(s)?;
-			},
-		}
+		Expr::Let(s) => {
+			this.visit_set(s)?;
+		},
+		Expr::Sleep(s) => {
+			this.visit_sleep(s)?;
+		},
+		Expr::Explain { statement, .. } => {
+			this.visit_expr(statement)?;
+		},
+	}
 
-		Ok(())
+	Ok(())
 	}
 
 	fn visit_literal(this, s: &Literal){
@@ -471,7 +474,7 @@ implement_visitor! {
 	}
 
 	fn visit_select(this, s: &SelectStatement){
-		this.visit_fields(&s.expr)?;
+		this.visit_fields(&s.fields)?;
 		for o in s.omit.iter(){
 			this.visit_expr(o)?;
 		}
@@ -498,7 +501,7 @@ implement_visitor! {
 			this.visit_expr(&l.0)?;
 		}
 		if let Some(f) = s.fetch.as_ref(){
-			for f in f.0.iter(){
+			for f in f.iter(){
 				this.visit_expr(&f.0)?;
 			}
 		}
@@ -656,7 +659,7 @@ implement_visitor! {
 	fn visit_output_stmt(this, o: &OutputStatement){
 		this.visit_expr(&o.what)?;
 		if let Some(f) = o.fetch.as_ref(){
-			for f in f.0.iter(){
+			for f in f.iter(){
 				this.visit_expr(&f.0)?;
 			}
 		}
@@ -675,7 +678,6 @@ implement_visitor! {
 			this.visit_output(o)?;
 		}
 		this.visit_expr(&i.timeout)?;
-		this.visit_expr(&i.version)?;
 		Ok(())
 	}
 
@@ -1138,8 +1140,6 @@ implement_visitor! {
 
 		this.visit_expr(&c.timeout)?;
 
-		this.visit_expr(&c.version)?;
-
 		Ok(())
 	}
 
@@ -1542,10 +1542,10 @@ implement_visitor_mut! {
 			TopLevelExpr::Access(s) => {this.visit_mut_access(s)? },
 			TopLevelExpr::Kill(s) => {this.visit_mut_kill(s)?; },
 			TopLevelExpr::Live(s) => {this.visit_mut_live(s)?; },
-			TopLevelExpr::Option(s) =>{ this.visit_mut_option(s)?; },
-			TopLevelExpr::Use(s) => {this.visit_mut_use(s)?; },
-			TopLevelExpr::Show(s) => {this.visit_mut_show(s)?; },
-			TopLevelExpr::Expr(e) => {this.visit_mut_expr(e)?; },
+		TopLevelExpr::Option(s) =>{ this.visit_mut_option(s)?; },
+		TopLevelExpr::Use(s) => {this.visit_mut_use(s)?; },
+		TopLevelExpr::Show(s) => {this.visit_mut_show(s)?; },
+		TopLevelExpr::Expr(e) => {this.visit_mut_expr(e)?; },
 		}
 		Ok(())
 	}
@@ -1617,7 +1617,7 @@ implement_visitor_mut! {
 			this.visit_mut_expr(&mut c.0)?;
 		}
 		if let Some(f) = l.fetch.as_mut(){
-			for f in f.0.iter_mut(){
+			for f in f.iter_mut(){
 				this.visit_mut_expr(&mut f.0)?;
 			}
 		}
@@ -1698,15 +1698,18 @@ implement_visitor_mut! {
 			Expr::Foreach(s) => {
 				this.visit_mut_foreach(s)?;
 			},
-			Expr::Let(s) => {
-				this.visit_mut_set(s)?;
-			},
-			Expr::Sleep(s) => {
-				this.visit_mut_sleep(s)?;
-			},
-		}
+		Expr::Let(s) => {
+			this.visit_mut_set(s)?;
+		},
+		Expr::Sleep(s) => {
+			this.visit_mut_sleep(s)?;
+		},
+		Expr::Explain { statement, .. } => {
+			this.visit_mut_expr(statement)?;
+		},
+	}
 
-		Ok(())
+	Ok(())
 	}
 
 	fn visit_mut_liter_mutal(this, s: &mut Literal){
@@ -1879,7 +1882,7 @@ implement_visitor_mut! {
 	}
 
 	fn visit_mut_select(this, s: &mut SelectStatement){
-		this.visit_mut_fields(&mut s.expr)?;
+		this.visit_mut_fields(&mut s.fields)?;
 		for o in s.omit.iter_mut(){
 			this.visit_mut_expr(o)?;
 		}
@@ -1906,7 +1909,7 @@ implement_visitor_mut! {
 			this.visit_mut_expr(&mut l.0)?;
 		}
 		if let Some(f) = s.fetch.as_mut(){
-			for f in f.0.iter_mut(){
+			for f in f.iter_mut(){
 				this.visit_mut_expr(&mut f.0)?;
 			}
 		}
@@ -2064,7 +2067,7 @@ implement_visitor_mut! {
 	fn visit_mut_output_stmt(this, o: &mut OutputStatement){
 		this.visit_mut_expr(&mut o.what)?;
 		if let Some(f) = o.fetch.as_mut(){
-			for f in f.0.iter_mut(){
+			for f in f.iter_mut(){
 				this.visit_mut_expr(&mut f.0)?;
 			}
 		}
@@ -2083,7 +2086,6 @@ implement_visitor_mut! {
 			this.visit_mut_output(o)?;
 		}
 		this.visit_mut_expr(&mut i.timeout)?;
-		this.visit_mut_expr(&mut i.version)?;
 		Ok(())
 	}
 
@@ -2542,8 +2544,6 @@ implement_visitor_mut! {
 		}
 
 		this.visit_mut_expr(&mut c.timeout)?;
-
-		this.visit_mut_expr(&mut c.version)?;
 
 		Ok(())
 	}

@@ -17,7 +17,8 @@ value = "NONE"
 
 # 3
 [[test.results]]
-value = "{ body: 'raw string response', context: {  }, headers: {}, status: 200 }"
+skip-api-request-id = true
+value = "{ body: 'raw string response', headers: {}, status: 200 }"
 
 # 4
 [[test.results]]
@@ -27,9 +28,6 @@ value = "NONE"
 [[test.results]]
 match = "type::is_bytes($result.body) AND $result.headers['content-type'] == 'application/octet-stream' AND $result.status == 200"
 error = false
-
-[env.capabilities]
-allow-experimental = ["define_api"]
 
 */
 

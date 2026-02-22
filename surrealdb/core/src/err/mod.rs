@@ -4,7 +4,6 @@ use std::io::Error as IoError;
 use std::string::FromUtf8Error;
 
 use base64::DecodeError as Base64Error;
-use bincode::Error as BincodeError;
 #[cfg(storage)]
 use ext_sort::SortError;
 use fst::Error as FstError;
@@ -13,7 +12,7 @@ use jsonwebtoken::errors::Error as JWTError;
 use object_store::Error as ObjectStoreError;
 use revision::Error as RevisionError;
 use serde::Serialize;
-use storekey::DecodeError;
+use storekey::DecodeError as StorekeyError;
 use surrealdb_types::ToSql;
 use thiserror::Error;
 
@@ -27,6 +26,9 @@ use crate::idx::trees::vector::SharedVector;
 use crate::kvs::Error as KvsError;
 use crate::syn::error::RenderedError as RenderedParserError;
 use crate::val::{CastError, CoerceError, Duration, RecordId, TableName, Value};
+
+mod to_types;
+pub(crate) use to_types::into_types_error;
 
 /// An error originating from an embedded SurrealDB database.
 #[derive(Error, Debug)]
@@ -139,7 +141,15 @@ pub(crate) enum Error {
 	/// The wrong quantity or magnitude of arguments was given for the specified
 	/// function
 	#[error("Incorrect arguments for function {name}(). {message}")]
-	InvalidArguments {
+	InvalidFunctionArguments {
+		name: String,
+		message: String,
+	},
+
+	/// The wrong quantity or magnitude of arguments was given for the specified
+	/// function
+	#[error("Incorrect arguments for method {name}(). {message}")]
+	InvalidMethodArguments {
 		name: String,
 		message: String,
 	},
@@ -625,7 +635,7 @@ pub(crate) enum Error {
 
 	/// Represents an error when decoding a key-value entry
 	#[error("Key decoding error: {0}")]
-	Decode(#[from] DecodeError),
+	Storekey(#[from] StorekeyError),
 
 	/// Represents an underlying error with versioned data encoding / decoding
 	#[error("Versioned error: {0}")]
@@ -649,10 +659,6 @@ pub(crate) enum Error {
 	/// Represents an error when trying to highlight a value
 	#[error("A value can't be highlighted: {0}")]
 	HighlightError(String),
-
-	/// Represents an underlying error with Bincode serializing / deserializing
-	#[error("Bincode error: {0}")]
-	Bincode(#[from] BincodeError),
 
 	/// Represents an underlying error with FST
 	#[error("FstError error: {0}")]
@@ -687,6 +693,16 @@ pub(crate) enum Error {
 	/// Unimplemented functionality
 	#[error("Unimplemented functionality: {0}")]
 	Unimplemented(String),
+
+	/// The planner does not support this statement type (e.g. DML/DDL).
+	/// Callers should always fall back to the compute path.
+	#[error("Planner unsupported: {0}")]
+	PlannerUnsupported(String),
+
+	/// The planner intends to support this but it is not yet implemented.
+	/// Callers fall back in BestEffort mode; hard error in AllReadOnlyStatements mode.
+	#[error("Planner not yet implemented: {0}")]
+	PlannerUnimplemented(String),
 
 	/// Represents an underlying IAM error
 	#[error("IAM error: {0}")]
@@ -1025,9 +1041,14 @@ pub(crate) enum Error {
 
 	/// There was an outdated storage version stored in the database
 	#[error(
-		"The data stored on disk is out-of-date with this version. Please follow the upgrade guides in the documentation"
+		"The data stored on disk is out-of-date with this version (Expected: {expected}, Actual: {actual}). \
+		 Please follow the upgrade guides in the documentation, \
+		 or use a clean storage directory if this is intended to be a new instance"
 	)]
-	OutdatedStorageVersion,
+	OutdatedStorageVersion {
+		expected: u16,
+		actual: u16,
+	},
 
 	#[error("Size of query script exceeded maximum supported size of 4,294,967,295 bytes.")]
 	QueryTooLarge,
@@ -1067,6 +1088,12 @@ pub(crate) enum Error {
 	/// supported
 	#[error("Cannot construct a recursion plan when an instruction is provided")]
 	RecursionInstructionPlanConflict,
+
+	/// Encountered a non-record-id value during recursive graph traversal
+	#[error("Expected a record ID during recursive graph traversal, but found `{value}`")]
+	InvalidRecursionTarget {
+		value: String,
+	},
 
 	/// The record cannot be deleted as it's still referenced elsewhere
 	#[error("Cannot delete `{0}` as it is referenced by `{1}` with an ON DELETE REJECT clause")]
@@ -1148,6 +1175,10 @@ pub(crate) enum Error {
 	#[error("Cannot define field `{0}` as `COMPUTED` fields must be top-level.")]
 	ComputedNestedField(String),
 
+	/// Cyclic dependency detected among computed fields
+	#[error("Cyclic dependency detected among computed fields: {0}")]
+	ComputedFieldCycle(String),
+
 	/// Cannot use the `{0}` keyword on the `id` field
 	#[error("Cannot use the `{0}` keyword on the `id` field.")]
 	IdFieldKeywordConflict(String),
@@ -1155,6 +1186,25 @@ pub(crate) enum Error {
 	/// Cannot use the `{0}` keyword on the `id` field
 	#[error("Cannot use the `{0}` type on the `id` field, as that's not a valid record id key.")]
 	IdFieldUnsupportedKind(String),
+
+	#[error(
+		"Error with the event {0}. The ID of the namespace `{1}` does not match the namespace this event has been generated from."
+	)]
+	EvNamespaceMismatch(String, String),
+
+	#[error(
+		"Error with the event {0}. The ID of the database `{1}` does not match the database this event has been generated from."
+	)]
+	EvDatabaseMismatch(String, String),
+
+	#[error("The event {0} reached the max async event nesting depth: {1}.")]
+	EvReachMaxDepth(String, u16),
+
+	#[error("Computed fields cannot be indexed. Index: '{index}' - Field: '{field}'")]
+	ComputedFieldCannotBeIndexed {
+		field: String,
+		index: String,
+	},
 }
 
 impl Error {
@@ -1174,6 +1224,27 @@ impl Error {
 				| Error::FieldValue { .. }
 				| Error::FieldReadonly { .. }
 				| Error::FieldUndefined { .. }
+		)
+	}
+
+	/// Returns true if this error represents a data-shape problem
+	/// (type mismatch, coercion failure, etc.) that can be safely
+	/// treated as NONE in expression evaluation contexts.
+	///
+	/// Returns false for system errors (storage, I/O, timeout,
+	/// permissions) that must always propagate.
+	pub fn is_ignorable(&self) -> bool {
+		matches!(
+			self,
+			Error::Coerce(_)
+				| Error::Cast(_)
+				| Error::InvalidFunctionArguments { .. }
+				| Error::TryAdd(..)
+				| Error::TrySub(..)
+				| Error::TryMul(..)
+				| Error::TryDiv(..)
+				| Error::TryPow(..)
+				| Error::TryNeg(..)
 		)
 	}
 }

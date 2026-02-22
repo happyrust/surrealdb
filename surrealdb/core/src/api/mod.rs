@@ -5,8 +5,15 @@ pub mod path;
 pub mod request;
 pub mod response;
 
+use http::HeaderName;
+
+/// Header name for SurrealDB request ID tracking
+pub const X_SURREAL_REQUEST_ID: HeaderName = HeaderName::from_static("x-surreal-request-id");
+
 pub mod format {
 	//! MIME type string constants for use in HTTP headers
+
+	pub const ANY: &str = "*/*";
 
 	pub const JSON: &str = "application/json";
 	pub const CBOR: &str = "application/cbor";

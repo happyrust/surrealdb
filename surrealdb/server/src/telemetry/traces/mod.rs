@@ -4,9 +4,7 @@ use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::runtime;
-use opentelemetry_sdk::trace::Config;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 
@@ -14,7 +12,7 @@ use crate::cli::validator::parser::tracing::CustomFilter;
 use crate::cnf::{TELEMETRY_DISABLE_TRACING, TELEMETRY_PROVIDER};
 use crate::telemetry::OTEL_DEFAULT_RESOURCE;
 
-static ACTIVE_TRACER_PROVIDER: LazyLock<Mutex<Option<TracerProvider>>> =
+static ACTIVE_TRACER_PROVIDER: LazyLock<Mutex<Option<SdkTracerProvider>>> =
 	LazyLock::new(|| Mutex::new(None));
 
 // Returns a tracer provider based on the SURREAL_TELEMETRY_PROVIDER environment
@@ -26,21 +24,18 @@ where
 	match TELEMETRY_PROVIDER.trim() {
 		// The OTLP telemetry provider has been specified
 		s if s.eq_ignore_ascii_case("otlp") && !*TELEMETRY_DISABLE_TRACING => {
-			// Build a new span exporter which uses gRPC
-			let span_exporter = opentelemetry_otlp::new_exporter().tonic().build_span_exporter()?;
-			// Create the provider with the Tokio runtime
-			let config = Config::default().with_resource(OTEL_DEFAULT_RESOURCE.clone());
-			let provider = TracerProvider::builder()
-				.with_batch_exporter(span_exporter, runtime::Tokio)
-				.with_config(config)
+			// Build a new span exporter which uses gRPC via tonic
+			let span_exporter = opentelemetry_otlp::SpanExporter::builder().with_tonic().build()?;
+			// Create a batch span processor with the exporter (uses Tokio runtime automatically)
+			let batch_processor =
+				opentelemetry_sdk::trace::BatchSpanProcessor::builder(span_exporter).build();
+			// Create the provider
+			let provider = SdkTracerProvider::builder()
+				.with_span_processor(batch_processor)
+				.with_resource(OTEL_DEFAULT_RESOURCE.clone())
 				.build();
 			// Set it as the global tracer provider
-			let _ = opentelemetry::global::set_tracer_provider(provider.clone());
-			// Store it so we can flush on shutdown
-			{
-				let mut slot = ACTIVE_TRACER_PROVIDER.lock().unwrap();
-				*slot = Some(provider.clone());
-			}
+			opentelemetry::global::set_tracer_provider(provider.clone());
 			// Return the tracing layer with the specified filter
 			Ok(Some(
 				tracing_opentelemetry::layer()
@@ -55,6 +50,6 @@ where
 	}
 }
 
-pub fn take_provider() -> Option<TracerProvider> {
+pub fn take_provider() -> Option<SdkTracerProvider> {
 	ACTIVE_TRACER_PROVIDER.lock().unwrap().take()
 }
