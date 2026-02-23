@@ -407,6 +407,15 @@ impl<'ctx> Planner<'ctx> {
 			Some(RecurseInstruction::Path {
 				..
 			}) => Ok(PhysicalRecurseInstruction::Path),
+			Some(RecurseInstruction::Prune {
+				predicate,
+				..
+			}) => {
+				let pred = self.physical_expr(predicate).await?;
+				Ok(PhysicalRecurseInstruction::Prune {
+					predicate: pred,
+				})
+			}
 			Some(RecurseInstruction::Shortest {
 				expects,
 				..
@@ -448,6 +457,9 @@ fn is_inclusive_recurse(instruction: &Option<RecurseInstruction>) -> bool {
 			inclusive: true,
 			..
 		}) | Some(RecurseInstruction::Collect {
+			inclusive: true,
+			..
+		}) | Some(RecurseInstruction::Prune {
 			inclusive: true,
 			..
 		}) | Some(RecurseInstruction::Shortest {

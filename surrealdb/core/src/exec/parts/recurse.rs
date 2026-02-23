@@ -30,6 +30,12 @@ pub enum PhysicalRecurseInstruction {
 	/// Return all paths as arrays of arrays
 	Path,
 
+	/// Prune branches where predicate is truthy, collecting remaining nodes
+	Prune {
+		/// Expression evaluated for each candidate; truthy = prune that branch
+		predicate: Arc<dyn PhysicalExpr>,
+	},
+
 	/// Find shortest path to a target node
 	Shortest {
 		/// Expression that evaluates to the target RecordId

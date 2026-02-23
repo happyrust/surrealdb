@@ -60,6 +60,7 @@ mod collect;
 mod common;
 mod default;
 mod path;
+mod prune;
 mod repeat;
 mod shortest;
 
@@ -158,6 +159,9 @@ impl ExecOperator for RecursionOp {
 			PhysicalRecurseInstruction::Default => "default",
 			PhysicalRecurseInstruction::Collect => "collect",
 			PhysicalRecurseInstruction::Path => "path",
+			PhysicalRecurseInstruction::Prune {
+				..
+			} => "prune",
 			PhysicalRecurseInstruction::Shortest {
 				..
 			} => "shortest",
@@ -179,6 +183,9 @@ impl ExecOperator for RecursionOp {
 			PhysicalRecurseInstruction::Default
 			| PhysicalRecurseInstruction::Collect
 			| PhysicalRecurseInstruction::Path => ContextLevel::Root,
+			PhysicalRecurseInstruction::Prune {
+				predicate,
+			} => predicate.required_context(),
 			PhysicalRecurseInstruction::Shortest {
 				target,
 			} => target.required_context(),
@@ -194,6 +201,9 @@ impl ExecOperator for RecursionOp {
 			PhysicalRecurseInstruction::Default
 			| PhysicalRecurseInstruction::Collect
 			| PhysicalRecurseInstruction::Path => AccessMode::ReadOnly,
+			PhysicalRecurseInstruction::Prune {
+				predicate,
+			} => predicate.access_mode(),
 			PhysicalRecurseInstruction::Shortest {
 				target,
 			} => target.access_mode(),
@@ -297,6 +307,20 @@ impl ExecOperator for RecursionOp {
 							min_depth,
 							max_depth,
 							inclusive,
+							eval_ctx.with_value(&value),
+						)
+						.await?
+					}
+					PhysicalRecurseInstruction::Prune {
+						predicate,
+					} => {
+						prune::evaluate_recurse_prune(
+							&value,
+							&path,
+							min_depth,
+							max_depth,
+							inclusive,
+							predicate,
 							eval_ctx.with_value(&value),
 						)
 						.await?

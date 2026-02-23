@@ -1,7 +1,5 @@
 pub mod rpc;
 
-use std::sync::{LazyLock, Mutex};
-
 use anyhow::Result;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -11,9 +9,6 @@ use tracing_subscriber::Layer;
 use crate::cli::validator::parser::tracing::CustomFilter;
 use crate::cnf::{TELEMETRY_DISABLE_TRACING, TELEMETRY_PROVIDER};
 use crate::telemetry::OTEL_DEFAULT_RESOURCE;
-
-static ACTIVE_TRACER_PROVIDER: LazyLock<Mutex<Option<SdkTracerProvider>>> =
-	LazyLock::new(|| Mutex::new(None));
 
 // Returns a tracer provider based on the SURREAL_TELEMETRY_PROVIDER environment
 // variable
@@ -48,8 +43,4 @@ where
 		// No matching telemetry provider was found
 		_ => Ok(None),
 	}
-}
-
-pub fn take_provider() -> Option<SdkTracerProvider> {
-	ACTIVE_TRACER_PROVIDER.lock().unwrap().take()
 }
