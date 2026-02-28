@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::{Kind, Object, SurrealValue, ToSql, Value};
+use crate::{Kind, SurrealValue, ToSql, Value};
 
 // -----------------------------------------------------------------------------
 // JSON-RPC 2.0 and SurrealDB-specific error codes (wire backwards compatibility)
@@ -47,7 +47,8 @@ fn default_code() -> i64 {
 ///
 /// The `details` field is flattened into the serialized object, so the wire
 /// format contains `kind` (string) and optionally `details` (object) at the
-/// same level as `code` and `message`.
+/// same level as `code` and `message`. The optional `cause` field allows
+/// error chaining so that SDKs can receive and display full error chains.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
 pub struct Error {
@@ -60,6 +61,10 @@ pub struct Error {
 	/// Flattened into the parent object: contributes `kind` and optionally `details` fields.
 	#[surreal(flatten)]
 	details: ErrorDetails,
+	/// Optional underlying cause for error chaining. Serialized as a nested error object on the
+	/// wire.
+	#[surreal(default)]
+	cause: Option<Box<Error>>,
 }
 
 impl Error {
@@ -91,6 +96,7 @@ impl Error {
 			message,
 			code,
 			details: ErrorDetails::Validation(details),
+			cause: None,
 		}
 	}
 
@@ -134,6 +140,7 @@ impl Error {
 			message,
 			code,
 			details: ErrorDetails::NotAllowed(details),
+			cause: None,
 		}
 	}
 
@@ -153,6 +160,7 @@ impl Error {
 			message,
 			code,
 			details: ErrorDetails::Configuration(details),
+			cause: None,
 		}
 	}
 
@@ -162,6 +170,7 @@ impl Error {
 			message,
 			code: code::THROWN,
 			details: ErrorDetails::Thrown,
+			cause: None,
 		}
 	}
 
@@ -183,6 +192,7 @@ impl Error {
 			message,
 			code,
 			details: ErrorDetails::Query(details),
+			cause: None,
 		}
 	}
 
@@ -201,6 +211,7 @@ impl Error {
 			message,
 			code,
 			details: ErrorDetails::Serialization(details),
+			cause: None,
 		}
 	}
 
@@ -222,6 +233,7 @@ impl Error {
 			message,
 			code,
 			details: ErrorDetails::NotFound(details),
+			cause: None,
 		}
 	}
 
@@ -232,6 +244,7 @@ impl Error {
 			message,
 			code: code::INTERNAL_ERROR,
 			details: ErrorDetails::AlreadyExists(details),
+			cause: None,
 		}
 	}
 
@@ -243,6 +256,7 @@ impl Error {
 			message,
 			code: code::CLIENT_SIDE_ERROR,
 			details: ErrorDetails::Connection(details),
+			cause: None,
 		}
 	}
 
@@ -252,6 +266,36 @@ impl Error {
 			message,
 			code: code::INTERNAL_ERROR,
 			details: ErrorDetails::Internal,
+			cause: None,
+		}
+	}
+
+	/// Build an error from a message and pre-parsed [`ErrorDetails`].
+	/// Uses [`default_code`] for the wire code. Intended for deserialization paths
+	/// that already have a typed `ErrorDetails` (e.g. via `ErrorDetails::from_value`).
+	#[doc(hidden)]
+	pub fn from_details(message: String, details: ErrorDetails) -> Self {
+		Self {
+			code: default_code(),
+			message,
+			details,
+			cause: None,
+		}
+	}
+
+	/// Build an error from message, details, and optional cause. For deserialization when cause is
+	/// present.
+	#[doc(hidden)]
+	pub fn from_details_with_cause(
+		message: String,
+		details: ErrorDetails,
+		cause: Option<Box<Error>>,
+	) -> Self {
+		Self {
+			code: default_code(),
+			message,
+			details,
+			cause,
 		}
 	}
 
@@ -270,7 +314,19 @@ impl Error {
 			code: default_code(),
 			message,
 			details: typed_details,
+			cause: None,
 		}
+	}
+
+	/// Returns the optional underlying cause for error chaining.
+	pub fn cause(&self) -> Option<&Error> {
+		self.cause.as_deref()
+	}
+
+	/// Returns an error with the given cause attached. Consumes `self`.
+	pub fn with_cause(mut self, cause: Error) -> Self {
+		self.cause = Some(Box::new(cause));
+		self
 	}
 
 	/// Returns the kind string for this error (e.g. "NotAllowed", "Internal").
@@ -423,8 +479,10 @@ impl Error {
 ///     _ => ...,
 /// }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[non_exhaustive]
+#[surreal(crate = "crate")]
+#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
 pub enum ErrorDetails {
 	/// Validation error (parse error, invalid request/params).
 	Validation(Option<ValidationError>),
@@ -445,6 +503,8 @@ pub enum ErrorDetails {
 	/// User-thrown error (THROW in SurrealQL). No detail type.
 	Thrown,
 	/// Internal/unexpected error. No detail type.
+	/// Acts as a catch-all for unknown kinds during deserialization (forward compatibility).
+	#[surreal(other)]
 	Internal,
 }
 
@@ -569,70 +629,6 @@ impl ErrorDetails {
 	}
 }
 
-impl SurrealValue for ErrorDetails {
-	fn kind_of() -> Kind {
-		Kind::Object
-	}
-
-	fn is_value(value: &Value) -> bool {
-		matches!(value, Value::Object(_))
-	}
-
-	/// Serializes as `{ "kind": "<variant>", "details": <inner> }`.
-	/// When flattened into Error, this merges `kind` and `details` into the parent object.
-	fn into_value(self) -> Value {
-		let mut obj = Object::new();
-		obj.insert("kind", Value::String(self.kind_str().to_string()));
-		match self {
-			Self::Validation(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::Configuration(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::Query(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::Serialization(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::NotAllowed(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::NotFound(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::AlreadyExists(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			Self::Connection(Some(d)) => {
-				obj.insert("details", d.into_value());
-			}
-			// No inner data -- just kind, no details field
-			_ => {}
-		}
-		Value::Object(obj)
-	}
-
-	/// Deserializes from `{ "kind": "<variant>", "details"?: <inner> }`.
-	fn from_value(value: Value) -> Result<Self, Error> {
-		let Value::Object(mut map) = value else {
-			return Err(Error::internal("Expected object for ErrorDetails".to_string()));
-		};
-		let kind_str = map
-			.remove("kind")
-			.and_then(|v| match v {
-				Value::String(s) => Some(s),
-				_ => None,
-			})
-			.unwrap_or_else(|| "Internal".to_string());
-		match map.remove("details") {
-			Some(v) => Self::from_value_with_kind_str(&kind_str, v),
-			None => Ok(Self::from_kind_str(&kind_str)),
-		}
-	}
-}
-
 // -----------------------------------------------------------------------------
 // Structured error details (wire format in Error.details)
 // -----------------------------------------------------------------------------
@@ -640,26 +636,35 @@ impl SurrealValue for ErrorDetails {
 /// Auth failure reason for [`ErrorKind::NotAllowed`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", content = "details")]
 #[non_exhaustive]
 pub enum AuthError {
 	/// The token used for authentication has expired.
+	#[surreal(skip_content)]
 	TokenExpired,
 	/// The session has expired.
+	#[surreal(skip_content)]
 	SessionExpired,
 	/// Authentication failed (invalid credentials or similar).
+	#[surreal(skip_content)]
 	InvalidAuth,
 	/// Unexpected error while performing authentication.
+	#[surreal(skip_content)]
 	UnexpectedAuth,
 	/// Username or password was not provided.
+	#[surreal(skip_content)]
 	MissingUserOrPass,
 	/// No signin target (SC, DB, NS, or KV) specified.
+	#[surreal(skip_content)]
 	NoSigninTarget,
 	/// The password did not verify.
+	#[surreal(skip_content)]
 	InvalidPass,
 	/// Failed to create the authentication token.
+	#[surreal(skip_content)]
 	TokenMakingFailed,
 	/// Signup failed.
+	#[surreal(skip_content)]
 	InvalidSignup,
 	/// Invalid role (IAM). Carries the role name.
 	InvalidRole {
@@ -686,18 +691,23 @@ impl From<AuthError> for Option<NotAllowedError> {
 /// Validation failure reason for [`ErrorKind::Validation`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", content = "details")]
 #[non_exhaustive]
 pub enum ValidationError {
 	/// Parse error (invalid message or request format).
+	#[surreal(skip_content)]
 	Parse,
 	/// Invalid request structure.
+	#[surreal(skip_content)]
 	InvalidRequest,
 	/// Invalid parameters.
+	#[surreal(skip_content)]
 	InvalidParams,
 	/// Namespace is empty.
+	#[surreal(skip_content)]
 	NamespaceEmpty,
 	/// Database is empty.
+	#[surreal(skip_content)]
 	DatabaseEmpty,
 	/// Invalid parameter with name.
 	InvalidParameter {
@@ -719,10 +729,11 @@ pub enum ValidationError {
 /// Not-allowed reason for [`ErrorKind::NotAllowed`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", content = "details")]
 #[non_exhaustive]
 pub enum NotAllowedError {
 	/// Scripting not allowed.
+	#[surreal(skip_content)]
 	Scripting,
 	/// Authentication or authorisation failure.
 	Auth(AuthError),
@@ -746,7 +757,7 @@ pub enum NotAllowedError {
 /// Configuration failure reason for [`ErrorKind::Configuration`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", skip_content)]
 #[non_exhaustive]
 pub enum ConfigurationError {
 	/// Live query not supported.
@@ -760,7 +771,7 @@ pub enum ConfigurationError {
 /// Serialisation failure reason for [`ErrorKind::Serialization`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", skip_content)]
 #[non_exhaustive]
 pub enum SerializationError {
 	/// Serialisation error.
@@ -772,7 +783,7 @@ pub enum SerializationError {
 /// Not-found reason for [`ErrorKind::NotFound`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", content = "details")]
 #[non_exhaustive]
 pub enum NotFoundError {
 	/// RPC method not found.
@@ -806,16 +817,18 @@ pub enum NotFoundError {
 		name: String,
 	},
 	/// Transaction not found.
+	#[surreal(skip_content)]
 	Transaction,
 }
 
 /// Query failure reason for [`ErrorKind::Query`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", content = "details")]
 #[non_exhaustive]
 pub enum QueryError {
 	/// Query was not executed.
+	#[surreal(skip_content)]
 	NotExecuted,
 	/// Query timed out.
 	TimedOut {
@@ -823,13 +836,14 @@ pub enum QueryError {
 		duration: Duration,
 	},
 	/// Query was cancelled.
+	#[surreal(skip_content)]
 	Cancelled,
 }
 
 /// Already-exists reason for [`ErrorKind::AlreadyExists`] errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", content = "details")]
 #[non_exhaustive]
 pub enum AlreadyExistsError {
 	/// Session already exists.
@@ -863,7 +877,7 @@ pub enum AlreadyExistsError {
 /// Used in the SDK for client-side connection state errors.
 #[derive(Clone, Debug, PartialEq, Eq, SurrealValue)]
 #[surreal(crate = "crate")]
-#[surreal(tag = "kind", content = "details", skip_content_if = "Value::is_empty")]
+#[surreal(tag = "kind", skip_content)]
 #[non_exhaustive]
 pub enum ConnectionError {
 	/// Connection was used before being initialised.
@@ -878,7 +892,11 @@ impl fmt::Display for Error {
 	}
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		self.cause.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
+	}
+}
 
 // -----------------------------------------------------------------------------
 // Type conversion errors (internal to the types layer)
