@@ -1,0 +1,91 @@
+name: Build Ubuntu Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        required: true
+        type: string
+        default: dev-3.1
+        description: "Branch to build"
+      surrealkv-branch:
+        required: true
+        type: string
+        default: fix/windows-io-errors
+        description: "surrealkv-fork branch"
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x86_64 Linux Release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/swift /usr/lib/jvm /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/vcpkg /usr/share/miniconda || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Checkout surrealdb
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          path: surrealdb
+
+      - name: Checkout surrealkv-fork
+        uses: actions/checkout@v4
+        with:
+          repository: happyrust/surrealkv-fork
+          ref: ${{ inputs.surrealkv-branch }}
+          path: surrealkv-fork
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev cmake
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: surrealdb -> target
+
+      - name: Build release binary
+        working-directory: surrealdb
+        run: |
+          echo "Building SurrealDB release binary..."
+          cargo build --release --no-default-features --features "allocator,allocation-tracking,storage-mem,storage-surrealkv,storage-rocksdb,scripting,http,graphql,cli"
+          echo "Build completed!"
+          ls -lh target/release/surreal
+          ./target/release/surreal version
+
+      - name: Package binary
+        working-directory: surrealdb
+        run: |
+          cp target/release/surreal ./surreal
+          tar -zcvf surreal-ubuntu22-amd64.tar.gz surreal
+          sha256sum surreal-ubuntu22-amd64.tar.gz > surreal-ubuntu22-amd64.sha256
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: surreal-ubuntu22-amd64
+          path: |
+            surrealdb/surreal
+            surrealdb/surreal-ubuntu22-amd64.tar.gz
+            surrealdb/surreal-ubuntu22-amd64.sha256
+          retention-days: 30
