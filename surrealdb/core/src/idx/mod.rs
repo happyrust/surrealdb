@@ -5,6 +5,7 @@ pub(super) mod seqdocids;
 pub mod trees;
 
 use std::borrow::Cow;
+use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -50,6 +51,12 @@ struct Inner {
 	db: DatabaseId,
 	tb: TableName,
 	ix: IndexId,
+}
+
+impl Display for IndexKeyBase {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "NS: {} - DB: {} - TB: {} - IX: {}", self.0.ns, self.0.db, self.0.tb, self.0.ix.0)
+	}
 }
 
 impl IndexKeyBase {
@@ -203,8 +210,20 @@ impl IndexKeyBase {
 		Dc::range(self.0.ns, self.0.db, &self.0.tb, self.0.ix)
 	}
 
+	fn new_dc_range_with_root(&self) -> Result<(Key, Key)> {
+		Dc::range_with_root(self.0.ns, self.0.db, &self.0.tb, self.0.ix)
+	}
+
 	fn new_dl(&self, doc_id: DocId) -> Dl<'_> {
 		Dl::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, doc_id)
+	}
+
+	pub(crate) fn ns(&self) -> NamespaceId {
+		self.0.ns
+	}
+
+	pub(crate) fn db(&self) -> DatabaseId {
+		self.0.db
 	}
 
 	pub(crate) fn table(&self) -> &TableName {

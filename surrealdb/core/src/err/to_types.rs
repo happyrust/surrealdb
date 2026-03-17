@@ -83,9 +83,8 @@ pub fn into_types_error(error: Error) -> TypesError {
 		InvalidPatch(_) => TypesError::validation(message, None),
 		Coerce(_) => TypesError::validation(message, None),
 		Cast(_) => TypesError::validation(message, None),
-		TryAdd(..) | TrySub(..) | TryMul(..) | TryDiv(..) | TryRem(..) | TryPow(..) | TryNeg(_) => {
-			TypesError::validation(message, None)
-		}
+		TryAdd(..) | TrySub(..) | TryMul(..) | TryDiv(..) | TryRem(..) | TryPow(..) | TryNeg(_)
+		| TryExtend(_) => TypesError::validation(message, None),
 		TryFrom(..) => TypesError::validation(message, None),
 		DuplicatedMatchRef {
 			..
@@ -113,6 +112,12 @@ pub fn into_types_error(error: Error) -> TypesError {
 
 		// Query
 		QueryTimedout(duration) => TypesError::query(
+			message,
+			QueryError::TimedOut {
+				duration: duration.0,
+			},
+		),
+		TransactionTimedout(duration) => TypesError::query(
 			message,
 			QueryError::TimedOut {
 				duration: duration.0,

@@ -210,6 +210,10 @@ pub(crate) enum Error {
 	#[error("The query was not executed because it exceeded the timeout: {0}")]
 	QueryTimedout(Duration),
 
+	/// The transaction timed out
+	#[error("The transaction was not completed because it exceeded the timeout: {0}")]
+	TransactionTimedout(Duration),
+
 	/// The query did not execute, because the transaction was cancelled
 	#[error("The query was not executed due to a cancelled transaction")]
 	QueryCancelled,
@@ -611,6 +615,10 @@ pub(crate) enum Error {
 	/// Cannot perform negation
 	#[error("Cannot negate the value '{0}'")]
 	TryNeg(String),
+
+	/// Cannot extend a non-array value
+	#[error("Cannot extend '{0}' as it is not an array")]
+	TryExtend(String),
 
 	/// It's is not possible to convert between the two types
 	#[error("Cannot convert from '{0}' to '{1}'")]
@@ -1245,6 +1253,7 @@ impl Error {
 				| Error::TryDiv(..)
 				| Error::TryPow(..)
 				| Error::TryNeg(..)
+				| Error::TryExtend(..)
 		)
 	}
 }

@@ -6,7 +6,8 @@ use surrealdb_types::{SurrealValue, ToSql};
 
 use super::Transaction;
 use crate::catalog::providers::{
-	AuthorisationProvider, DatabaseProvider, TableProvider, UserProvider,
+	ApiProvider, AuthorisationProvider, BucketProvider, DatabaseProvider, TableProvider,
+	UserProvider,
 };
 use crate::catalog::{DatabaseId, NamespaceId, Record, TableDefinition};
 use crate::cnf::EXPORT_BATCH_SIZE;
@@ -19,6 +20,7 @@ use crate::kvs::KVValue;
 use crate::sql::statements::OptionStatement;
 
 #[derive(Clone, Debug, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
 #[surreal(default)]
 pub struct Config {
 	pub users: bool,
@@ -26,6 +28,10 @@ pub struct Config {
 	pub params: bool,
 	pub functions: bool,
 	pub analyzers: bool,
+	pub apis: bool,
+	pub buckets: bool,
+	pub modules: bool,
+	pub configs: bool,
 	pub tables: TableConfig,
 	pub versions: bool,
 	pub records: bool,
@@ -40,6 +46,10 @@ impl Default for Config {
 			params: true,
 			functions: true,
 			analyzers: true,
+			apis: true,
+			buckets: true,
+			modules: true,
+			configs: true,
 			tables: TableConfig::default(),
 			versions: false,
 			records: true,
@@ -48,7 +58,16 @@ impl Default for Config {
 	}
 }
 
+/// Named-field wrapper so that the untagged `SurrealValue` serialization
+/// can differentiate `Exclude` from `Some` (include).
+#[derive(Clone, Debug, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
+pub struct ExcludedTables {
+	pub exclude: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
 #[surreal(untagged)]
 pub enum TableConfig {
 	#[default]
@@ -57,6 +76,7 @@ pub enum TableConfig {
 	#[surreal(value = false)]
 	None,
 	Some(Vec<String>),
+	Exclude(ExcludedTables),
 }
 
 // TODO: This should probably be removed
@@ -86,7 +106,7 @@ impl From<Vec<&str>> for TableConfig {
 impl TableConfig {
 	/// Check if we should export tables
 	pub(crate) fn is_any(&self) -> bool {
-		matches!(self, Self::All | Self::Some(_))
+		matches!(self, Self::All | Self::Some(_) | Self::Exclude(_))
 	}
 	// Check if we should export a specific table
 	pub(crate) fn includes(&self, table: &str) -> bool {
@@ -94,6 +114,15 @@ impl TableConfig {
 			Self::All => true,
 			Self::None => false,
 			Self::Some(v) => v.iter().any(|v| v.eq(table)),
+			Self::Exclude(v) => !v.exclude.iter().any(|v| v.eq(table)),
+		}
+	}
+	/// Returns the explicitly listed table names, if any.
+	pub(crate) fn names(&self) -> Option<&[String]> {
+		match self {
+			Self::Some(v) => Some(v.as_slice()),
+			Self::Exclude(v) => Some(v.exclude.as_slice()),
+			_ => None,
 		}
 	}
 }
@@ -208,6 +237,30 @@ impl Transaction {
 			.await?;
 		}
 
+		// Output APIS
+		if cfg.apis {
+			let apis = self.all_db_apis(ns, db).await?;
+			self.export_section("APIS", apis.iter(), chn).await?;
+		}
+
+		// Output BUCKETS
+		if cfg.buckets {
+			let buckets = self.all_db_buckets(ns, db).await?;
+			self.export_section("BUCKETS", buckets.iter(), chn).await?;
+		}
+
+		// Output MODULES
+		if cfg.modules {
+			let modules = self.all_db_modules(ns, db).await?;
+			self.export_section("MODULES", modules.iter(), chn).await?;
+		}
+
+		// Output CONFIGS
+		if cfg.configs {
+			let configs = self.all_db_configs(ns, db).await?;
+			self.export_section("CONFIGS", configs.iter(), chn).await?;
+		}
+
 		// Output SEQUENCES
 		if cfg.sequences {
 			let sequences = self.all_db_sequences(ns, db).await?;
@@ -256,6 +309,15 @@ impl Transaction {
 		}
 		// Fetch all of the tables for this NS / DB
 		let tables = self.all_tb(ns, db, None).await?;
+		// Warn if any specified table names don't match existing tables
+		if let Some(names) = cfg.tables.names() {
+			let existing: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+			for name in names {
+				if !existing.contains(&name.as_str()) {
+					warn!("Table '{name}' does not exist in the database");
+				}
+			}
+		}
 		// Loop over all of the tables in order
 		for table in tables.iter() {
 			// Check if this table is included in the export config

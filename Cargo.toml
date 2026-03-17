@@ -57,7 +57,7 @@ surrealism-types = { version = "0.1", path = "surrealism/types", default-feature
 # External surreal crates
 affinitypool = "0.4.0"
 dmp = "0.2.3"
-indxdb = "0.11.0"
+indxdb = "0.12.0"
 lexicmp = "0.2.0"
 revision = { version = "0.17.0", features = [
     "bytes",
@@ -70,7 +70,7 @@ revision = { version = "0.17.0", features = [
     "uuid",
 ] }
 storekey = { version = "0.11.0", features = ["bytes", "uuid"] }
-surrealkv = "0.20.2"
+surrealkv = "0.21.0"
 surrealmx = "0.18.0"
 web-time = "1.1.0"
 vart = "0.9.3"
@@ -205,8 +205,8 @@ tar = "0.4.44"
 toml = "0.9.11"
 walrus = "0.24.4"
 wasm-opt = "0.116.1"
-wasmtime = { version = "41.0.0", default-features = false, features = ["cranelift", "winch", "runtime", "std", "wat"] }
-wasmtime-wasi = { version = "41.0.0", features = ["p1"] }
+wasmtime = { version = "41.0.4", default-features = false, features = ["cranelift", "winch", "runtime", "std", "wat"] }
+wasmtime-wasi = { version = "41.0.4", features = ["p1"] }
 zstd = "0.13.3"
 
 [package]
@@ -405,6 +405,10 @@ large_types_passed_by_value = "warn"
 # https://rust-lang.github.io/rust-clippy/master/#lossy_float_literal
 lossy_float_literal = "warn"
 
+# Checks for binding to underscore prefixed variable without side-effects.
+# https://rust-lang.github.io/rust-clippy/master/index.html#no_effect_underscore_binding
+no_effect_underscore_binding = "warn"
+
 # Checks for usage of `.as_ref().cloned()` and suggests `.cloned()` instead.
 # Using `.cloned()` directly is more concise and easier to read.
 # https://rust-lang.github.io/rust-clippy/master/#option_as_ref_cloned
@@ -432,6 +436,15 @@ unnecessary_to_owned = "warn"
 # SurrealDB relies on async functions in the AST parser and executor to avoid stack overflows.
 # Warning or denying this lint can cause unexpected errors.
 unused_async = "allow"
+
+
+# Checks for `.unwrap()` or `.unwrap_err()` calls on Results and `.unwrap()` call on `Option`s.
+# https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used
+unwrap_used = "warn"
+
+# Checks for the use of bindings with a single leading underscore.
+# https://rust-lang.github.io/rust-clippy/master/index.html#used_underscore_binding
+used_underscore_binding = "warn"
 
 # Profiles
 [profile.release]

@@ -6,6 +6,7 @@ mod enum_tagged_variant;
 mod enum_unit_value;
 mod enum_untagged;
 mod struct_flatten;
+mod wrap;
 
 use rstest::rstest;
 use surrealdb_types::{Array, Object, SurrealValue, Uuid, Value, object};
@@ -15,6 +16,7 @@ use surrealdb_types::{Array, Object, SurrealValue, Uuid, Value, object};
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 struct Person {
 	name: String,
 	age: i64,
@@ -58,6 +60,7 @@ fn test_simple_struct() {
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 struct PersonRenamed {
 	#[surreal(rename = "full_name")]
 	name: String,
@@ -107,6 +110,7 @@ fn test_simple_struct_with_renamed_fields() {
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 struct StringWrapper(String);
 
 #[test]
@@ -136,6 +140,7 @@ fn test_simple_single_field_struct() {
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 #[surreal(tuple)]
 struct StringWrapperTuple(String);
 
@@ -167,6 +172,7 @@ fn test_simple_single_field_tuple_struct() {
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 struct Point(i64, i64);
 
 #[test]
@@ -201,6 +207,7 @@ fn test_simple_multi_field_struct() {
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 struct UnitStruct;
 
 #[test]
@@ -229,6 +236,7 @@ fn test_unit_struct() {
 ////////////////////////////////////////////////////
 
 #[derive(SurrealValue, Debug, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 #[surreal(value = true)]
 struct UnitStructWithValue;
 
@@ -258,6 +266,7 @@ fn test_unit_struct_with_value() {
 ////////////////////////////////////////////////////
 
 #[derive(Clone, Debug, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
 pub(crate) struct RouterRequest {
 	id: Option<i64>,
 	method: String,
@@ -291,6 +300,7 @@ fn test_router_request() {
 }
 
 #[derive(Clone, Debug, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
 struct TestOptional {
 	id: i64,
 	name: Option<String>,
@@ -299,6 +309,7 @@ struct TestOptional {
 #[test]
 fn test_test_optional() {
 	#[derive(Clone, Debug, SurrealValue)]
+	#[surreal(crate = "surrealdb_types")]
 	struct TestOptionalNoOption {
 		id: i64,
 	}
@@ -318,6 +329,7 @@ fn test_test_optional() {
 }
 
 #[derive(Clone, Debug, SurrealValue, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 #[surreal(default)]
 struct TestDefault {
 	str: String,
@@ -355,6 +367,7 @@ fn default_code_for_test() -> i64 {
 }
 
 #[derive(Clone, Debug, SurrealValue, PartialEq)]
+#[surreal(crate = "surrealdb_types")]
 struct StructWithFieldDefaults {
 	#[surreal(default = "default_code_for_test")]
 	code: i64,

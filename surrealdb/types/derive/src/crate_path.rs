@@ -15,7 +15,8 @@ impl CratePath {
 	/// Parse the crate path from attributes.
 	///
 	/// Looks for `#[surreal(crate = "path::to::crate")]` attribute.
-	/// Defaults to `::surrealdb_types` if not specified.
+	/// If not specified, defaults to `::surrealdb::types` when the
+	/// `sdk-path` feature is enabled, otherwise `::surrealdb_types`.
 	pub fn parse(attrs: &[Attribute]) -> Self {
 		for attr in attrs {
 			if attr.path().is_ident("surreal") {
@@ -40,7 +41,6 @@ impl CratePath {
 			}
 		}
 
-		// Default to ::surrealdb_types
 		Self::default()
 	}
 
@@ -104,12 +104,23 @@ impl CratePath {
 		let base = &self.path;
 		quote! { #base::Value::from_t }
 	}
+
+	/// Get the path to the SerdeWrapper type
+	pub fn wrapper(&self) -> TokenStream {
+		let base = &self.path;
+		quote! { #base::SerdeWrapper }
+	}
 }
 
 impl Default for CratePath {
 	fn default() -> Self {
+		let path = if cfg!(feature = "sdk-path") {
+			quote! { ::surrealdb::types }
+		} else {
+			quote! { ::surrealdb_types }
+		};
 		Self {
-			path: quote! { ::surrealdb_types },
+			path,
 		}
 	}
 }

@@ -273,11 +273,27 @@ impl IndexedResults {
 		}
 	}
 
+	/// Returns a mutable reference to the `Ok` value at the given index.
+	/// If the result is an error, the entry is removed and the error is returned.
+	/// Returns `Ok(None)` if no entry exists at the index.
+	pub(crate) fn try_get_value_mut(&mut self, index: &usize) -> Result<Option<&mut Value>> {
+		if matches!(self.results.get(index), Some((_, Err(_)))) {
+			let Some((_, Err(err))) = self.results.swap_remove(index) else {
+				unreachable!()
+			};
+			return Err(err);
+		}
+		match self.results.get_mut(index) {
+			Some((_, Ok(val))) => Ok(Some(val)),
+			_ => Ok(None),
+		}
+	}
+
 	/// Takes and returns records returned from the database
 	///
 	/// A query that only returns one result can be deserialized into an
 	/// `Option<T>`, while those that return multiple results should be
-	/// deserialized into a `Vec<T>`.
+	/// deserialized into a `Vec<T>`, `LinkedList<T>` or `HashSet<T>`.
 	///
 	/// # Examples
 	///
@@ -630,11 +646,13 @@ mod tests {
 	use super::*;
 
 	#[derive(Debug, Clone, SurrealValue)]
+	#[surreal(crate = "crate::types")]
 	struct Summary {
 		title: String,
 	}
 
 	#[derive(Debug, Clone, SurrealValue)]
+	#[surreal(crate = "crate::types")]
 	struct Article {
 		title: String,
 		body: String,

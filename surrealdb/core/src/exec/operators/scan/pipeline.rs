@@ -65,10 +65,8 @@ impl ScanPipeline {
 	/// computed fields, field-level permissions, or WHERE predicate) is
 	/// needed.
 	///
-	/// Callers use this *before* constructing a `ScanPipeline` to decide
-	/// whether `pre_skip` / `effective_storage_limit` can be pushed to
-	/// the KV layer. The same check is cached internally so that
-	/// [`process_batch`] can skip work when nothing is needed.
+	/// This is cached internally so that [`process_batch`] can skip work
+	/// when nothing is needed.
 	pub(crate) fn compute_needs_processing(
 		permission: &PhysicalPermission,
 		field_state: &FieldState,
@@ -79,6 +77,21 @@ impl ScanPipeline {
 			|| !field_state.computed_fields.is_empty()
 			|| (check_perms && !field_state.field_permissions.is_empty())
 			|| predicate.is_some()
+	}
+
+	/// Check whether any operation that **removes rows** is active.
+	///
+	/// Row-modifying operations (computed fields, field-level permissions)
+	/// preserve row count and positional ordering, so `pre_skip` and
+	/// `effective_storage_limit` can safely be pushed to the KV layer
+	/// even when they are present. Only table-level permission filtering
+	/// and WHERE predicates can change which rows survive, preventing
+	/// positional pushdown.
+	pub(crate) fn compute_needs_row_filtering(
+		permission: &PhysicalPermission,
+		predicate: Option<&Arc<dyn PhysicalExpr>>,
+	) -> bool {
+		!matches!(permission, PhysicalPermission::Allow) || predicate.is_some()
 	}
 
 	pub(crate) fn new(
@@ -260,10 +273,18 @@ macro_rules! check_perm {
 			PhysicalPermission::Allow => Ok::<bool, ControlFlow>(true),
 			PhysicalPermission::Deny => Ok(false),
 			PhysicalPermission::Conditional(expr) => {
-				let eval_ctx = EvalContext::from_exec_ctx($ctx).with_value($value);
-				expr.evaluate(eval_ctx).await.map(|v| v.is_truthy()).map_err(|e| {
-					ControlFlow::Err(anyhow::anyhow!("Failed to check permission: {e}"))
-				})
+				// When already inside a permission predicate evaluation
+				// (propagated via skip_fetch_perms), allow unconditionally
+				// to prevent reentrant permission checks on cyclic links.
+				if $ctx.root().skip_fetch_perms {
+					Ok(true)
+				} else {
+					let mut eval_ctx = EvalContext::from_exec_ctx($ctx).with_value($value);
+					eval_ctx.skip_fetch_perms = true;
+					expr.evaluate(eval_ctx).await.map(|v| v.is_truthy()).map_err(|e| {
+						ControlFlow::Err(anyhow::anyhow!("Failed to check permission: {e}"))
+					})
+				}
 			}
 		}
 	};
@@ -318,7 +339,7 @@ pub(crate) async fn filter_and_process_batch(
 			batch.swap(write_idx, read_idx);
 		}
 		// Computed fields (must run before predicate)
-		compute_fields_for_value(ctx, state, &mut batch[write_idx]).await?;
+		compute_fields_for_value(ctx, state, &mut batch[write_idx], false).await?;
 		// Field-level permissions (must run before the WHERE predicate so that
 		// restricted fields are removed before the condition is evaluated,
 		// matching the old compute path's behaviour).
@@ -483,10 +504,13 @@ pub(crate) async fn build_field_state_raw(
 		.context("Failed to get field definitions")?;
 
 	// Fast path: if there are no computed fields and no field-level permissions
-	// that need checking, skip the expensive resolution.
+	// that need checking, skip the expensive resolution. Both Permission::None
+	// (deny) and Permission::Specific (conditional) require enforcement.
 	let has_computed = field_defs.iter().any(|fd| fd.computed.is_some());
-	let has_field_perms =
-		check_perms && field_defs.iter().any(|fd| fd.select_permission.is_specific());
+	let has_field_perms = check_perms
+		&& field_defs
+			.iter()
+			.any(|fd| !matches!(fd.select_permission, crate::catalog::Permission::Full));
 	if !has_computed && !has_field_perms {
 		return Ok(FieldState::empty());
 	}
@@ -560,7 +584,6 @@ pub(crate) async fn build_field_state_raw(
 /// `Some`, the cached full state is cheaply filtered to the required subset.
 /// This avoids repeated expensive work (KV lookups, PhysicalExpr compilation,
 /// dependency analysis, topological sort) for projected queries.
-#[allow(clippy::type_complexity)]
 pub(crate) async fn build_field_state(
 	ctx: &ExecutionContext,
 	table_name: &TableName,
@@ -632,16 +655,24 @@ pub(crate) fn filter_field_state_for_projection(
 }
 
 /// Compute all computed fields for a single value.
+///
+/// When `skip_fetch_perms` is `true`, any RecordId dereferences inside
+/// computed field expressions will bypass permission checks (using
+/// `fetch_record_no_perms`).  This must be set when computing fields
+/// during permission predicate evaluation to prevent reentrant permission
+/// checks on cyclic record links.
 pub(crate) async fn compute_fields_for_value(
 	ctx: &ExecutionContext,
 	state: &FieldState,
 	value: &mut Value,
+	skip_fetch_perms: bool,
 ) -> Result<(), ControlFlow> {
 	if state.computed_fields.is_empty() {
 		return Ok(());
 	}
 
-	let eval_ctx = EvalContext::from_exec_ctx(ctx);
+	let mut eval_ctx = EvalContext::from_exec_ctx(ctx);
+	eval_ctx.skip_fetch_perms = skip_fetch_perms;
 
 	for cf in &state.computed_fields {
 		// Evaluate with the current value as context

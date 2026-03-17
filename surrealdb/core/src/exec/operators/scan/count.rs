@@ -20,9 +20,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::instrument;
 
-use crate::catalog::providers::TableProvider;
-use crate::catalog::{DatabaseId, NamespaceId, Permission};
+use crate::catalog::{DatabaseId, Index, NamespaceId, Permission};
 use crate::err::Error;
+use crate::exec::operators::scan::index_count::sum_index_count_deltas;
 use crate::exec::permission::{
 	PhysicalPermission, convert_permission_to_physical, should_check_perms,
 	validate_record_user_access,
@@ -221,11 +221,44 @@ impl ExecOperator for CountScan {
 					&rid.key, &txn, version,
 				).await?
 			} else {
-				// Full table
-				let beg = record::prefix(ns.namespace_id, db.database_id, &table_name)?;
-				let end = record::suffix(ns.namespace_id, db.database_id, &table_name)?;
-				txn.count(beg..end, version).await
-					.context("Failed to count table records")?
+				// Check for an unconditional COUNT index first (O(deltas) vs O(records))
+				let count_from_index = if version.is_none() {
+					let indexes = db_ctx
+						.get_table_indexes(&table_name)
+						.await
+						.ok();
+					if let Some(indexes) = indexes {
+						let matching = indexes.iter().find(|ix| {
+							matches!(&ix.index, Index::Count(None))
+						});
+						if let Some(ix_def) = matching {
+							sum_index_count_deltas(
+								&ctx,
+								&txn,
+								ns.namespace_id,
+								db.database_id,
+								&table_name,
+								ix_def.index_id,
+							).await.ok()
+						} else {
+							None
+						}
+					} else {
+						None
+					}
+				} else {
+					None
+				};
+
+				if let Some(count) = count_from_index {
+					count
+				} else {
+					// Fallback: iterate all KV keys
+					let beg = record::prefix(ns.namespace_id, db.database_id, &table_name)?;
+					let end = record::suffix(ns.namespace_id, db.database_id, &table_name)?;
+					txn.count(beg..end, version).await
+						.context("Failed to count table records")?
+				}
 			};
 
 			yield make_count_batch(count, &field_names);
@@ -358,17 +391,11 @@ async fn count_with_perm_fallback(
 			}
 			_ => {
 				// Single record – do a point check with permission evaluation
-				let record = txn
-					.get_record(ns_id, db_id, table_name, &rid.key, version)
-					.await
-					.context("Failed to get record")?;
-
-				if record.data.is_none() {
+				let Some(value) =
+					crate::exec::operators::fetch::fetch_raw_record(ctx, rid, version).await?
+				else {
 					return Ok(0);
-				}
-
-				let mut value = record.data.clone();
-				value.def(rid.clone());
+				};
 				let allowed = check_perm_value(ctx, &value, permission).await?;
 				return Ok(usize::from(allowed));
 			}

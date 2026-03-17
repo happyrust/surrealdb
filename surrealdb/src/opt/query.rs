@@ -1,7 +1,8 @@
+use std::collections::{HashSet, LinkedList};
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem;
 
-// Removed anyhow::bail - using return Err() instead
 use futures::future::Either;
 use futures::stream::select_all;
 use surrealdb_core::rpc::DbResultStats;
@@ -55,26 +56,16 @@ where
 	T: SurrealValue,
 {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Option<T>> {
-		let value = match response.results.get_mut(&self) {
-			Some((_, result)) => match result {
-				Ok(val) => val,
-				Err(_) => {
-					response.results.swap_remove(&self);
-					return Err(Error::connection(
-						"Connection uninitialised".to_string(),
-						Some(crate::types::ConnectionError::Uninitialised),
-					));
-				}
-			},
-			None => {
-				return Ok(None);
-			}
+		let value = match response.results.swap_remove(&self) {
+			Some((_, Err(err))) => return Err(err),
+			Some((_, Ok(value))) => value,
+			None => return Ok(None),
 		};
-		let result = match value {
-			Value::Array(vec) => match &mut vec[..] {
-				[] => Ok(None),
-				[value] => {
-					let value = mem::take(value);
+		match value {
+			Value::Array(mut vec) => match vec.len() {
+				0 => Ok(None),
+				1 => {
+					let value = vec.swap_remove(0);
 					match value {
 						Value::None => Ok(None),
 						v => {
@@ -87,16 +78,9 @@ where
 						.to_string(),
 				)),
 			},
-			value => {
-				let value = mem::take(value);
-				match value {
-					Value::None => Ok(None),
-					v => Ok(Some(T::from_value(v).map_err(|e| Error::internal(e.to_string()))?)),
-				}
-			}
-		};
-		response.results.swap_remove(&self);
-		result
+			Value::None => Ok(None),
+			v => Ok(Some(T::from_value(v).map_err(|e| Error::internal(e.to_string()))?)),
+		}
 	}
 
 	fn stats(&self, response: &QueryResponse) -> Option<DbResultStats> {
@@ -108,20 +92,8 @@ impl QueryResult<Value> for (usize, &str) {}
 impl query_result::Sealed<Value> for (usize, &str) {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Value> {
 		let (index, key) = self;
-		let value = match response.results.get_mut(&index) {
-			Some((_, result)) => match result {
-				Ok(val) => val,
-				Err(_) => {
-					response.results.swap_remove(&index);
-					return Err(Error::connection(
-						"Connection uninitialised".to_string(),
-						Some(crate::types::ConnectionError::Uninitialised),
-					));
-				}
-			},
-			None => {
-				return Ok(Value::None);
-			}
+		let Some(value) = response.try_get_value_mut(&index)? else {
+			return Ok(Value::None);
 		};
 
 		let value = match value {
@@ -144,20 +116,8 @@ where
 {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Option<T>> {
 		let (index, key) = self;
-		let value: &mut Value = match response.results.get_mut(&index) {
-			Some((_, result)) => match result {
-				Ok(val) => val,
-				Err(_) => {
-					response.results.swap_remove(&index);
-					return Err(Error::connection(
-						"Connection uninitialised".to_string(),
-						Some(crate::types::ConnectionError::Uninitialised),
-					));
-				}
-			},
-			None => {
-				return Ok(None);
-			}
+		let Some(value) = response.try_get_value_mut(&index)? else {
+			return Ok(None);
 		};
 		let value = match value {
 			Value::Array(vec) => match &mut vec[..] {
@@ -232,43 +192,172 @@ where
 {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Vec<T>> {
 		let (index, key) = self;
-		match response.results.get_mut(&index) {
-			Some((_, result)) => match result {
-				Ok(val) => match val {
-					Value::Array(vec) => {
-						let mut responses = Vec::with_capacity(vec.len());
-						for value in vec.iter_mut() {
-							if let Value::Object(object) = value
-								&& let Some(value) = object.remove(key)
-							{
-								responses.push(value);
-							}
-						}
-						responses
-							.into_iter()
-							.map(|v| T::from_value(v).map_err(|e| Error::internal(e.to_string())))
-							.collect::<Result<Vec<T>>>()
-					}
-					val => {
-						if let Value::Object(object) = val
+		match response.try_get_value_mut(&index)? {
+			Some(val) => match val {
+				Value::Array(vec) => {
+					let mut responses = Vec::with_capacity(vec.len());
+					for value in vec.iter_mut() {
+						if let Value::Object(object) = value
 							&& let Some(value) = object.remove(key)
 						{
-							return Ok(vec![
-								T::from_value(value).map_err(|e| Error::internal(e.to_string()))?,
-							]);
+							responses.push(value);
 						}
-						Ok(vec![])
 					}
-				},
-				Err(_) => {
-					response.results.swap_remove(&index);
-					Err(Error::connection(
-						"Connection uninitialised".to_string(),
-						Some(crate::types::ConnectionError::Uninitialised),
-					))
+					responses
+						.into_iter()
+						.map(|v| T::from_value(v).map_err(|e| Error::internal(e.to_string())))
+						.collect::<Result<Vec<T>>>()
+				}
+				val => {
+					if let Value::Object(object) = val
+						&& let Some(value) = object.remove(key)
+					{
+						return Ok(vec![
+							T::from_value(value).map_err(|e| Error::internal(e.to_string()))?,
+						]);
+					}
+					Ok(vec![])
 				}
 			},
 			None => Ok(vec![]),
+		}
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<DbResultStats> {
+		response.results.get(&self.0).map(|x| x.0)
+	}
+}
+
+impl<T> QueryResult<LinkedList<T>> for usize where T: SurrealValue {}
+impl<T> query_result::Sealed<LinkedList<T>> for usize
+where
+	T: SurrealValue,
+{
+	fn query_result(self, response: &mut QueryResponse) -> Result<LinkedList<T>> {
+		let vec = match response.results.swap_remove(&self) {
+			Some((_, result)) => match result? {
+				Value::Array(arr) => arr.into_vec(),
+				vec => vec![vec],
+			},
+			None => {
+				return Ok(LinkedList::new());
+			}
+		};
+
+		vec.into_iter()
+			.map(|v| T::from_value(v).map_err(|e| Error::internal(e.to_string())))
+			.collect::<Result<LinkedList<T>>>()
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<DbResultStats> {
+		response.results.get(self).map(|x| x.0)
+	}
+}
+
+impl<T> QueryResult<LinkedList<T>> for (usize, &str) where T: SurrealValue {}
+impl<T> query_result::Sealed<LinkedList<T>> for (usize, &str)
+where
+	T: SurrealValue,
+{
+	fn query_result(self, response: &mut QueryResponse) -> Result<LinkedList<T>> {
+		let (index, key) = self;
+		match response.try_get_value_mut(&index)? {
+			Some(val) => match val {
+				Value::Array(vec) => {
+					let mut responses = Vec::with_capacity(vec.len());
+					for value in vec.iter_mut() {
+						if let Value::Object(object) = value
+							&& let Some(value) = object.remove(key)
+						{
+							responses.push(value);
+						}
+					}
+					responses
+						.into_iter()
+						.map(|v| T::from_value(v).map_err(|e| Error::internal(e.to_string())))
+						.collect::<Result<LinkedList<T>>>()
+				}
+				val => {
+					if let Value::Object(object) = val
+						&& let Some(value) = object.remove(key)
+					{
+						return Ok(LinkedList::from([
+							T::from_value(value).map_err(|e| Error::internal(e.to_string()))?
+						]));
+					}
+					Ok(LinkedList::new())
+				}
+			},
+			None => Ok(LinkedList::new()),
+		}
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<DbResultStats> {
+		response.results.get(&self.0).map(|x| x.0)
+	}
+}
+
+impl<T> QueryResult<HashSet<T>> for usize where T: SurrealValue + Hash + Eq {}
+impl<T> query_result::Sealed<HashSet<T>> for usize
+where
+	T: SurrealValue + Hash + Eq,
+{
+	fn query_result(self, response: &mut QueryResponse) -> Result<HashSet<T>> {
+		let vec = match response.results.swap_remove(&self) {
+			Some((_, result)) => match result? {
+				Value::Array(arr) => arr.into_vec(),
+				vec => vec![vec],
+			},
+			None => {
+				return Ok(HashSet::new());
+			}
+		};
+
+		vec.into_iter()
+			.map(|v| T::from_value(v).map_err(|e| Error::internal(e.to_string())))
+			.collect::<Result<HashSet<T>>>()
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<DbResultStats> {
+		response.results.get(self).map(|x| x.0)
+	}
+}
+
+impl<T> QueryResult<HashSet<T>> for (usize, &str) where T: SurrealValue + Hash + Eq {}
+impl<T> query_result::Sealed<HashSet<T>> for (usize, &str)
+where
+	T: SurrealValue + Hash + Eq,
+{
+	fn query_result(self, response: &mut QueryResponse) -> Result<HashSet<T>> {
+		let (index, key) = self;
+		match response.try_get_value_mut(&index)? {
+			Some(val) => match val {
+				Value::Array(vec) => {
+					let mut responses = Vec::with_capacity(vec.len());
+					for value in vec.iter_mut() {
+						if let Value::Object(object) = value
+							&& let Some(value) = object.remove(key)
+						{
+							responses.push(value);
+						}
+					}
+					responses
+						.into_iter()
+						.map(|v| T::from_value(v).map_err(|e| Error::internal(e.to_string())))
+						.collect::<Result<HashSet<T>>>()
+				}
+				val => {
+					if let Value::Object(object) = val
+						&& let Some(value) = object.remove(key)
+					{
+						return Ok(HashSet::from([
+							T::from_value(value).map_err(|e| Error::internal(e.to_string()))?
+						]));
+					}
+					Ok(HashSet::new())
+				}
+			},
+			None => Ok(HashSet::new()),
 		}
 	}
 
@@ -300,6 +389,26 @@ where
 	T: SurrealValue,
 {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Vec<T>> {
+		(0, self).query_result(response)
+	}
+}
+
+impl<T> QueryResult<LinkedList<T>> for &str where T: SurrealValue {}
+impl<T> query_result::Sealed<LinkedList<T>> for &str
+where
+	T: SurrealValue,
+{
+	fn query_result(self, response: &mut QueryResponse) -> Result<LinkedList<T>> {
+		(0, self).query_result(response)
+	}
+}
+
+impl<T> QueryResult<HashSet<T>> for &str where T: SurrealValue + Hash + Eq {}
+impl<T> query_result::Sealed<HashSet<T>> for &str
+where
+	T: SurrealValue + Hash + Eq,
+{
+	fn query_result(self, response: &mut QueryResponse) -> Result<HashSet<T>> {
 		(0, self).query_result(response)
 	}
 }
@@ -360,11 +469,8 @@ impl query_stream::Sealed<Value> for () {
 				Err(e) => {
 					if e.message().contains("is not a live query") {
 						match response.results.swap_remove(&index) {
-							Some((_, Err(_))) => {
-								return Err(Error::connection(
-									"Connection uninitialised".to_string(),
-									Some(crate::types::ConnectionError::Uninitialised),
-								));
+							Some((_, Err(err))) => {
+								return Err(err);
 							}
 							Some((_, Ok(..))) => unreachable!(
 								"the internal error variant indicates that an error occurred in the `LIVE SELECT` query"
@@ -440,11 +546,8 @@ where
 				Err(e) => {
 					if e.message().contains("is not a live query") {
 						match response.results.swap_remove(&index) {
-							Some((_, Err(_))) => {
-								return Err(Error::connection(
-									"Connection uninitialised".to_string(),
-									Some(crate::types::ConnectionError::Uninitialised),
-								));
+							Some((_, Err(err))) => {
+								return Err(err);
 							}
 							Some((_, Ok(..))) => unreachable!(
 								"the internal error variant indicates that an error occurred in the `LIVE SELECT` query"
