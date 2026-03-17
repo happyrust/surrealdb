@@ -153,6 +153,7 @@ regex-syntax = "0.8.8"
 reqwest = { version = "0.13.1", default-features = false }
 ring = "0.17.14"
 roaring = "0.11.3"
+rust-s3 = "0.35.1"
 rustls = { version = "0.23.36", default-features = false, features = ["logging", "std", "tls12"] }
 rust_decimal = "1.40.0"
 rust-stemmers = "1.2.0" # TODO: Look at the use of this dependency. Last update 5 years ago, unmaintained.
@@ -181,11 +182,13 @@ url = "2.5.8"
 uuid = "1.19.0"
 wasm-bindgen-futures = "0.4.58"
 wasmtimer = { version = "0.4.3", default-features = false }
+ws_stream_wasm = "0.7.4"
 
 # Dev dependencies
 criterion = "0.8.1"
 env_logger = "0.11.8"
 flate2 = "1.1.8"
+hashbrown = "0.14.5"
 rstest = "0.26.1"
 serial_test = "3.3.1"
 temp-dir = "0.1.16"
