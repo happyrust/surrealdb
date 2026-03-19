@@ -100,16 +100,10 @@ impl ToFlatbuffers for RecordIdKey {
 					},
 				))
 			}
-			RecordIdKey::Object(object) => {
-				let id = object.to_fb(builder)?.as_union_value();
-				Ok(proto_fb::RecordIdKey::create(
-					builder,
-					&proto_fb::RecordIdKeyArgs {
-						id_type: proto_fb::RecordIdKeyType::Object,
-						id: Some(id),
-					},
-				))
-			}
+			RecordIdKey::Object(_) => Err(anyhow::anyhow!(
+				"Unsupported Id type for FlatBuffers serialization: {:?}",
+				self
+			)),
 		}
 	}
 }
@@ -153,12 +147,7 @@ impl FromFlatbuffers for RecordIdKey {
 				let range = RecordIdKeyRange::from_fb(key_value)?;
 				Ok(RecordIdKey::Range(Box::new(range)))
 			}
-			proto_fb::RecordIdKeyType::Object => {
-				let key_value =
-					input.id_as_object().ok_or_else(|| anyhow::anyhow!("Expected Object Id"))?;
-				let object = crate::Object::from_fb(key_value)?;
-				Ok(RecordIdKey::Object(object))
-			}
+
 			_ => Err(anyhow::anyhow!(
 				"Unsupported RecordIdKey type for FlatBuffers deserialization: {:?}",
 				input.id_type()
