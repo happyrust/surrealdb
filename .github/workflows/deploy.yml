@@ -1,0 +1,120 @@
+# SurrealDB 构建并部署到 Ubuntu 服务器
+#
+# 使用方式:
+# 1. 在 GitHub 仓库 Settings -> Secrets and variables -> Actions 中配置:
+#    - DEPLOY_HOST: 服务器 IP 或域名
+#    - DEPLOY_USER: SSH 用户名
+#    - DEPLOY_KEY: SSH 私钥 (推荐) 或使用 DEPLOY_PASSWORD
+#    - DEPLOY_PATH: 部署目录 (如 /opt/surrealdb)
+#    - DEPLOY_SERVICE: (可选) systemd 服务名，部署后自动重启
+#
+# 2. 手动触发: Actions -> Deploy to Ubuntu -> Run workflow
+#    或推送到 main 分支时自动部署 (可修改 on.push 配置)
+
+name: Deploy to Ubuntu
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy-branch:
+        description: '要部署的分支或 ref（留空则使用触发工作流时的分支）'
+        required: false
+        default: ''
+      features:
+        description: '构建启用的 features (逗号分隔，留空用默认)'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+      - updated
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux binary
+    runs-on: ubuntu-latest
+    outputs:
+      binary-path: ${{ steps.build.outputs.binary-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy-branch != '' && github.event.inputs.deploy-branch || github.ref }}
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/updated' }}
+
+      - name: Install tools
+        uses: ./.github/actions/install-tools
+
+      - name: Build release binary
+        id: build
+        run: |
+          FEATURES="${{ github.event.inputs.features }}"
+          if [[ -z "$FEATURES" ]]; then
+            # 默认 features：不含 tikv/ml（需额外依赖）
+            cargo build --release --no-default-features \
+              --features "allocator,storage-mem,storage-surrealkv,storage-rocksdb,scripting,http,surrealism,graphql,cli"
+          else
+            cargo build --release --features "$FEATURES"
+          fi
+          mkdir -p deploy-artifact
+          cp target/release/surreal deploy-artifact/
+          echo "binary-path=deploy-artifact/surreal" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: surreal-binary
+          path: deploy-artifact/surreal
+
+  deploy:
+    name: Deploy to server
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/updated'
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: surreal-binary
+
+      - name: Deploy via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          password: ${{ secrets.DEPLOY_PASSWORD }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          source: "surreal"
+          target: "${{ secrets.DEPLOY_PATH || '/opt/surrealdb' }}"
+
+      - name: Set executable and restart service
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/surrealdb' }}
+          DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          password: ${{ secrets.DEPLOY_PASSWORD }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          envs: DEPLOY_PATH,DEPLOY_SERVICE
+          script: |
+            chmod +x "$DEPLOY_PATH/surreal"
+            echo "Deployed to $DEPLOY_PATH/surreal"
+            if [[ -n "$DEPLOY_SERVICE" ]]; then
+              sudo systemctl restart "$DEPLOY_SERVICE"
+              echo "Restarted service: $DEPLOY_SERVICE"
+            fi
