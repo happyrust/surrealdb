@@ -181,7 +181,7 @@ pub mod uint64 {
 
 	fn parse_str(s: &str) -> Option<i64> {
 		let raw = strip_wrappers(s);
-		let mut parts = raw.split(|c| c == '_' || c == '/');
+		let mut parts = raw.split(['_', '/']);
 		let hi = parts.next()?.parse::<u64>().ok()?;
 		let lo = parts.next()?.parse::<u64>().ok()?;
 		combine(hi, lo)
