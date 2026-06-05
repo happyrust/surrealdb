@@ -1,0 +1,31 @@
+name: Windows x64 build
+
+run-name: "Windows x64 build (${{ github.ref_name }} @ ${{ github.sha }})"
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: Build x86_64-pc-windows-msvc binary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build Windows binary
+        uses: ./.github/actions/build-windows
+        with:
+          arch: x86_64-pc-windows-msvc
+          platform: amd64
+          name: windows-x64-ci
+          build-metadata: ${{ github.sha }}
+          upload: true
+          release: true
