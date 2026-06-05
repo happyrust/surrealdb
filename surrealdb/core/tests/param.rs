@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod helpers;
 use anyhow::Result;
 use helpers::new_ds;
@@ -13,7 +15,7 @@ async fn define_global_param() -> Result<()> {
 		LET $test = 56789;
 		SELECT * FROM $test;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", true).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 5);
@@ -63,7 +65,7 @@ async fn define_protected_param() -> Result<()> {
 		SELECT * FROM $test WHERE some = 'thing';
 		LET $auth = { ID: admin:tester };
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", true).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 4);

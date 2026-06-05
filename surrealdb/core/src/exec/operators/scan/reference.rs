@@ -7,18 +7,19 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 
 use super::common::{
-	BATCH_SIZE, evaluate_bound_key, extract_record_ids_into, resolve_record_batch,
+	evaluate_bound_key, extract_record_ids_into, resolve_record_batch, resolve_version_stamp,
 };
 use crate::catalog::{DatabaseId, NamespaceId};
+use crate::exec::permission::{PhysicalPermission, should_check_perms};
 use crate::exec::{
 	AccessMode, ContextLevel, ControlFlowExt, ExecOperator, ExecutionContext, FlowResult,
 	OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream, buffer_stream, monitor_stream,
 };
 use crate::expr::ControlFlow;
+use crate::iam::Action;
 use crate::idx::planner::ScanDirection;
 use crate::kvs::CachePolicy;
 use crate::val::{RecordId, TableName};
@@ -67,6 +68,9 @@ pub struct ReferenceScan {
 	/// When `Unbounded`, ends at the field/table suffix.
 	pub(crate) range_end: Bound<Arc<dyn PhysicalExpr>>,
 
+	/// Optional VERSION timestamp for time-travel queries.
+	pub(crate) version: Option<Arc<dyn PhysicalExpr>>,
+
 	/// Per-operator runtime metrics for EXPLAIN ANALYZE.
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
@@ -79,6 +83,7 @@ impl ReferenceScan {
 		output_mode: ReferenceScanOutput,
 		range_start: Bound<Arc<dyn PhysicalExpr>>,
 		range_end: Bound<Arc<dyn PhysicalExpr>>,
+		version: Option<Arc<dyn PhysicalExpr>>,
 	) -> Self {
 		Self {
 			input,
@@ -87,13 +92,11 @@ impl ReferenceScan {
 			output_mode,
 			range_start,
 			range_end,
+			version,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for ReferenceScan {
 	fn name(&self) -> &'static str {
 		"ReferenceScan"
@@ -127,7 +130,11 @@ impl ExecOperator for ReferenceScan {
 	}
 
 	fn access_mode(&self) -> AccessMode {
-		self.input.access_mode()
+		let mut mode = self.input.access_mode();
+		if let Some(ref version) = self.version {
+			mode = mode.combine(version.access_mode());
+		}
+		mode
 	}
 
 	fn metrics(&self) -> Option<&OperatorMetrics> {
@@ -140,27 +147,43 @@ impl ExecOperator for ReferenceScan {
 
 	fn execute(&self, ctx: &ExecutionContext) -> FlowResult<ValueBatchStream> {
 		let db_ctx = ctx.database()?.clone();
+		// SECURITY: reference scan results bypass `Document::pluck_select`, so
+		// the referencing table's SELECT permission must be enforced here
+		// (same family as the graph scan check).
+		let check_perms = should_check_perms(&db_ctx, Action::View)?;
 		let input_stream = buffer_stream(
 			self.input.execute(ctx)?,
 			self.input.access_mode(),
 			self.input.cardinality_hint(),
+			ctx.root().ctx.config.operator_buffer_size,
 		);
 		let referencing_table = self.referencing_table.clone();
 		let referencing_field = self.referencing_field.clone();
 		let output_mode = self.output_mode;
 		let range_start = self.range_start.clone();
 		let range_end = self.range_end.clone();
+		let scan_batch_size = ctx.root().ctx.config.scan_batch_size;
 		let ctx = ctx.clone();
 		let fetch_full = output_mode == ReferenceScanOutput::FullRecord;
+		let version_expr = self.version.clone();
 
 		let stream = async_stream::try_stream! {
 			let txn = ctx.txn();
 			let ns_id = db_ctx.ns_ctx.ns.namespace_id;
 			let db_id = db_ctx.db.database_id;
+			let mut perm_cache: std::collections::HashMap<
+				crate::val::TableName,
+				PhysicalPermission,
+			> = std::collections::HashMap::new();
+
+			// Resolve VERSION timestamp; see [`resolve_version_stamp`] for
+			// why we prefer the stamp already set by the enclosing
+			// `VersionScope` over re-evaluating `version_expr` here.
+			let version: Option<u64> = resolve_version_stamp(&ctx, version_expr.as_ref()).await?;
 
 			// Read from the child operator stream and extract RecordIds
 			futures::pin_mut!(input_stream);
-			let mut rid_batch: Vec<RecordId> = Vec::with_capacity(BATCH_SIZE);
+			let mut rid_batch: Vec<RecordId> = Vec::with_capacity(scan_batch_size);
 
 			while let Some(batch_result) = input_stream.next().await {
 				let batch = batch_result?;
@@ -183,29 +206,39 @@ impl ExecOperator for ReferenceScan {
 						&ctx,
 					).await?;
 
-					let kv_stream = txn.stream_keys(beg..end, None, None, 0, ScanDirection::Forward);
-					futures::pin_mut!(kv_stream);
-
-					while let Some(result) = kv_stream.next().await {
-						let keys = result.context("Failed to scan reference")?;
-
-						for key in keys {
-							let decoded = crate::key::r#ref::Ref::decode_key(&key)
+					let mut cursor = txn
+						.open_keys_cursor(beg..end, ScanDirection::Forward, 0, version)
+						.await
+						.context("Failed to open reference cursor")?;
+					loop {
+						let batch = cursor
+							.next_batch(crate::kvs::ScanLimit::Count(
+								crate::kvs::NORMAL_BATCH_SIZE,
+							))
+							.await
+							.context("Failed to scan reference")?;
+						if batch.is_empty() {
+							break;
+						}
+						for key in &batch {
+							let decoded = crate::key::r#ref::Ref::decode_key(key)
 								.context("Failed to decode ref key")?;
 
 							rid_batch.push(RecordId {
 								table: decoded.ft.into_owned(),
 								key: decoded.fk.into_owned(),
 							});
-
-							if rid_batch.len() >= BATCH_SIZE {
-								let values = resolve_record_batch(
-									&txn, ns_id, db_id, &rid_batch, fetch_full, None,
-									CachePolicy::ReadWrite,
-								).await?;
-								yield ValueBatch { values };
-								rid_batch.clear();
-							}
+						}
+						// Resolve full batches before fetching the next batch
+						// from the cursor — keeps the cursor's reusable
+						// buffer free for the next call and bounds memory.
+						if rid_batch.len() >= scan_batch_size {
+							let values = resolve_record_batch(
+								&ctx, &txn, ns_id, db_id, &rid_batch, fetch_full, check_perms,
+								version, CachePolicy::ReadWrite, &mut perm_cache,
+							).await?;
+							yield ValueBatch { values };
+							rid_batch.clear();
 						}
 					}
 				}
@@ -214,8 +247,8 @@ impl ExecOperator for ReferenceScan {
 			// Yield remaining batch
 			if !rid_batch.is_empty() {
 				let values = resolve_record_batch(
-					&txn, ns_id, db_id, &rid_batch, fetch_full, None,
-					CachePolicy::ReadWrite,
+					&ctx, &txn, ns_id, db_id, &rid_batch, fetch_full, check_perms, version,
+					CachePolicy::ReadWrite, &mut perm_cache,
 				).await?;
 				yield ValueBatch { values };
 			}
@@ -251,8 +284,9 @@ async fn compute_ref_key_range(
 		// Range-bounded scan requires both table and field
 		let table = referencing_table
 			.context("Range-bounded reference scans require a referencing table")?;
-		let field = referencing_field
-			.context("Range-bounded reference scans require a referencing field")?;
+		let field = referencing_field.context(
+			"Cannot scan a specific range of record references without a referencing field",
+		)?;
 
 		let beg = eval_ref_bound(ns_id, db_id, rid, table, field, range_start, true, ctx).await?;
 		let end = eval_ref_bound(ns_id, db_id, rid, table, field, range_end, false, ctx).await?;
@@ -355,6 +389,7 @@ mod tests {
 			ReferenceScanOutput::RecordId,
 			Bound::Unbounded,
 			Bound::Unbounded,
+			None,
 		);
 
 		assert_eq!(scan.name(), "ReferenceScan");

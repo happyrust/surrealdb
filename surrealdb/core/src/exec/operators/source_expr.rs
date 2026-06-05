@@ -2,12 +2,15 @@
 //!
 //! This operator is specifically designed for FROM clause sources, handling:
 //! - None/Null: yields no rows (empty stream)
-//! - Arrays: yields each element as a separate row
+//! - Arrays: yields each element as a separate row, resolving RecordIds to full documents
+//! - RecordId: fetches the full document and yields it
 //! - Other values: yields the value as a single row
+//!
+//! RecordId resolution ensures downstream pipeline operators (Filter, Sort, etc.)
+//! can access document fields, matching the behaviour of RecordIdScan and TableScan.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use crate::exec::context::{ContextLevel, ExecutionContext};
@@ -41,9 +44,6 @@ impl SourceExpr {
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for SourceExpr {
 	fn name(&self) -> &'static str {
 		"SourceExpr"
@@ -54,8 +54,9 @@ impl ExecOperator for SourceExpr {
 	}
 
 	fn required_context(&self) -> ContextLevel {
-		// Delegate to the wrapped expression's context requirements
-		self.expr.required_context()
+		// The expression may yield RecordId values that need resolving to full
+		// documents, which requires database-level context for transaction access.
+		self.expr.required_context().max(ContextLevel::Database)
 	}
 
 	fn access_mode(&self) -> AccessMode {
@@ -72,29 +73,46 @@ impl ExecOperator for SourceExpr {
 	}
 
 	fn execute(&self, ctx: &ExecutionContext) -> FlowResult<ValueBatchStream> {
-		let expr = self.expr.clone();
+		let expr = Arc::clone(&self.expr);
 		let ctx = ctx.clone();
 
 		let stream = async_stream::try_stream! {
+			// In a correlated subquery, ScalarSubquery binds the outer document
+			// as `$this`. Use it as current_value so that bare field paths in
+			// the FROM expression resolve against the outer row (e.g.
+			// `FROM data.files` where `data` is a record link on the outer row).
+			let this_value = ctx.value("this").cloned();
 			let eval_ctx = EvalContext::from_exec_ctx(&ctx);
+			let eval_ctx = match this_value {
+				Some(ref v) => eval_ctx.with_value(v),
+				None => eval_ctx,
+			};
 			let value = expr.evaluate(eval_ctx).await?;
 
 			match value {
-				// Arrays yield their elements, filtering out NONE/NULL
-				// entries to match the old compute path's behaviour.
 				Value::Array(arr) => {
-					let filtered: Vec<Value> = arr
+					let mut values: Vec<Value> = arr
 						.into_iter()
 						.filter(|v| !matches!(v, Value::None | Value::Null))
 						.collect();
-					if !filtered.is_empty() {
-						yield ValueBatch { values: filtered };
+					if !values.is_empty() {
+						// Resolve RecordId values to full documents so that
+						// downstream operators (Filter, Sort, etc.) can access
+						// document fields — matching RecordIdScan/TableScan.
+						super::fetch::batch_fetch_in_place(&ctx, &mut values).await?;
+						values.retain(|v| !matches!(v, Value::None | Value::Null));
+						if !values.is_empty() {
+							yield ValueBatch { values };
+						}
 					}
 				}
-				// NONE and NULL yield no rows (empty source), matching
-				// the behaviour of the old compute path.
 				Value::None | Value::Null => {}
-				// Everything else yields a single row
+				Value::RecordId(ref rid) => {
+					let fetched = super::fetch::fetch_record(&ctx, rid).await?;
+					if !matches!(fetched, Value::None) {
+						yield ValueBatch { values: vec![fetched] };
+					}
+				}
 				other => {
 					yield ValueBatch { values: vec![other] };
 				}

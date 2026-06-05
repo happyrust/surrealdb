@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::access::{authenticate_record, create_refresh_token_record};
 use crate::catalog;
 use crate::catalog::providers::{AuthorisationProvider, DatabaseProvider};
-use crate::cnf::{INSECURE_FORWARD_ACCESS_ERRORS, SERVER_NAME};
+use crate::cnf::SERVER_NAME;
 use crate::dbs::Session;
 use crate::err::Error;
 use crate::iam::issue::{config, expiration};
@@ -174,7 +174,7 @@ pub async fn db_access(
 ) -> Result<Token> {
 	// Create a new readonly transaction
 	let tx = kvs.transaction(Read, Optimistic).await?;
-	let db_def = match catch!(tx, tx.get_db_by_name(&ns, &db).await) {
+	let db_def = match catch!(tx, tx.get_db_by_name(&ns, &db, None).await) {
 		Some(db) => db,
 		None => {
 			let _ = tx.cancel().await;
@@ -185,7 +185,8 @@ pub async fn db_access(
 		}
 	};
 	// Fetch the specified access method from storage
-	let Some(av) = catch!(tx, tx.get_db_access(db_def.namespace_id, db_def.database_id, &ac).await)
+	let Some(av) =
+		catch!(tx, tx.get_db_access(db_def.namespace_id, db_def.database_id, &ac, None).await)
 	else {
 		let _ = tx.cancel().await;
 		bail!(Error::AccessNotFound);
@@ -257,8 +258,14 @@ pub async fn db_access(
 			// Create refresh token if defined for the record access method
 			let refresh = match &at.bearer {
 				Some(_) => Some(
-					create_refresh_token_record(kvs, av.name.clone(), &ns, &db, rid.clone().into())
-						.await?,
+					create_refresh_token_record(
+						kvs,
+						av.name.to_string(),
+						&ns,
+						&db,
+						rid.clone().into(),
+					)
+					.await?,
 				),
 				None => None,
 			};
@@ -308,7 +315,7 @@ pub async fn db_access(
 			}
 			// Otherwise, return a generic error unless it should be forwarded
 			_ => {
-				if *INSECURE_FORWARD_ACCESS_ERRORS {
+				if kvs.config().insecure_forward_access_errors {
 					Err(e)
 				} else {
 					Err(anyhow::Error::new(Error::AccessRecordSignupQueryFailed))

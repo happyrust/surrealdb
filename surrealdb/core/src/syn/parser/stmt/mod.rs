@@ -419,12 +419,22 @@ impl Parser<'_> {
 		let next = self.next();
 		let stmt = match next.kind {
 			t!("ROOT") => {
+				let version = if self.eat(t!("VERSION")) {
+					Some(stk.run(|stk| self.parse_expr_inherit(stk)).await?)
+				} else {
+					None
+				};
 				let structure = self.eat(t!("STRUCTURE"));
-				InfoStatement::Root(structure)
+				InfoStatement::Root(structure, version)
 			}
 			t!("NAMESPACE") => {
+				let version = if self.eat(t!("VERSION")) {
+					Some(stk.run(|stk| self.parse_expr_inherit(stk)).await?)
+				} else {
+					None
+				};
 				let structure = self.eat(t!("STRUCTURE"));
-				InfoStatement::Ns(structure)
+				InfoStatement::Ns(structure, version)
 			}
 			t!("DATABASE") => {
 				let version = if self.eat(t!("VERSION")) {
@@ -545,7 +555,7 @@ impl Parser<'_> {
 				let name = self.parse_ident()?;
 				expected!(self, t!("ON"));
 				self.eat(t!("TABLE"));
-				let what = self.parse_ident()?;
+				let what: crate::val::TableName = self.parse_ident_str()?.into();
 				let concurrently = self.eat(t!("CONCURRENTLY"));
 				RebuildStatement::Index(RebuildIndexStatement {
 					what,
@@ -585,7 +595,7 @@ impl Parser<'_> {
 	/// # Parser State
 	/// Expects `LET` to already be consumed.
 	pub(super) async fn parse_let_stmt(&mut self, stk: &mut Stk) -> ParseResult<SetStatement> {
-		let name = self.next_token_value::<Param>()?.into_string();
+		let name = self.next_token_value::<Param>()?.into_strand();
 		let kind = if self.eat(t!(":")) {
 			Some(self.parse_inner_kind(stk).await?)
 		} else {
@@ -611,7 +621,7 @@ impl Parser<'_> {
 		let next = self.next();
 		let table = match next.kind {
 			t!("TABLE") => {
-				let table = self.parse_ident()?;
+				let table: crate::val::TableName = self.parse_ident_str()?.into();
 				Some(table)
 			}
 			t!("DATABASE") => None,

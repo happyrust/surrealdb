@@ -37,7 +37,7 @@ impl RemoveAccessStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Actor, &self.base)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Actor, self.base)?;
 		// Compute the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "access name").await?;
 		// Check the statement type
@@ -46,7 +46,7 @@ impl RemoveAccessStatement {
 				// Get the transaction
 				let txn = ctx.tx();
 				// Get the definition
-				let Some(ac) = txn.get_root_access(&name).await? else {
+				let Some(ac) = txn.get_root_access(&name, None).await? else {
 					if self.if_exists {
 						return Ok(Value::None);
 					} else {
@@ -68,7 +68,7 @@ impl RemoveAccessStatement {
 				let txn = ctx.tx();
 				// Get the definition
 				let ns = ctx.get_ns_id(opt).await?;
-				let Some(ac) = txn.get_ns_access(ns, &name).await? else {
+				let Some(ac) = txn.get_ns_access(ns, &name, None).await? else {
 					if self.if_exists {
 						return Ok(Value::None);
 					} else {
@@ -92,7 +92,7 @@ impl RemoveAccessStatement {
 				let txn = ctx.tx();
 				// Get the definition
 				let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
-				let Some(ac) = txn.get_db_access(ns, db, &name).await? else {
+				let Some(ac) = txn.get_db_access(ns, db, &name, None).await? else {
 					if self.if_exists {
 						return Ok(Value::None);
 					} else {

@@ -14,7 +14,8 @@ use crate::conn::{Command, MlExportConfig};
 use crate::method::{BoxFuture, ExportConfig as Config, Model, OnceLockExt};
 use crate::{Connection, Error, ExtraFeatures, Result, Surreal};
 
-/// A database export future
+/// Returned by [`Surreal::export`](crate::Surreal::export). File targets complete in place, while
+/// `()` targets resolve to [`Backup`] for streaming chunks.
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Export<'r, C: Connection, R, T = ()> {
@@ -31,6 +32,7 @@ where
 	C: Connection,
 {
 	/// Export machine learning model
+	#[allow(clippy::needless_pass_by_value)] // Public SDK builder: ergonomic for callers passing an owned `Version`.
 	pub fn ml(self, name: &str, version: Version) -> Export<'r, C, R, Model> {
 		Export {
 			client: self.client,
@@ -138,6 +140,38 @@ where
 	pub fn records(mut self, records: bool) -> Self {
 		if let Some(cfg) = self.db_config.as_mut() {
 			cfg.records = records;
+		}
+		self
+	}
+
+	/// Whether to export apis from the database
+	pub fn apis(mut self, apis: bool) -> Self {
+		if let Some(cfg) = self.db_config.as_mut() {
+			cfg.apis = apis;
+		}
+		self
+	}
+
+	/// Whether to export buckets from the database
+	pub fn buckets(mut self, buckets: bool) -> Self {
+		if let Some(cfg) = self.db_config.as_mut() {
+			cfg.buckets = buckets;
+		}
+		self
+	}
+
+	/// Whether to export modules from the database
+	pub fn modules(mut self, modules: bool) -> Self {
+		if let Some(cfg) = self.db_config.as_mut() {
+			cfg.modules = modules;
+		}
+		self
+	}
+
+	/// Whether to export configs from the database
+	pub fn configs(mut self, configs: bool) -> Self {
+		if let Some(cfg) = self.db_config.as_mut() {
+			cfg.configs = configs;
 		}
 		self
 	}
@@ -253,7 +287,8 @@ where
 	}
 }
 
-/// A stream of exported data
+/// Byte chunks from [`Export`] when the destination is `()` (see
+/// [`Surreal::export`](crate::Surreal::export)).
 #[derive(Debug, Clone)]
 #[must_use = "streams do nothing unless you poll them"]
 pub struct Backup {

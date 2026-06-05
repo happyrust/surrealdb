@@ -58,10 +58,12 @@ impl Router {
 				},
 				response: sender,
 			};
-			self.sender
-				.send(route)
-				.await
-				.map_err(|e| crate::Error::internal(format!("Failed to send command: {e}")))?;
+			self.sender.send(route).await.map_err(|e| {
+				crate::Error::connection(
+					format!("Failed to send command: {e}"),
+					crate::types::ConnectionError::ConnectionFailed,
+				)
+			})?;
 			Ok(receiver)
 		})
 	}
@@ -124,7 +126,12 @@ impl Router {
 				}
 				v => R::from_value(v),
 			};
-			result.map_err(|e| crate::Error::internal(e.to_string()))
+			result.map_err(|e| {
+				crate::Error::serialization(
+					e.to_string(),
+					crate::types::SerializationError::Deserialization,
+				)
+			})
 		})
 	}
 
@@ -150,17 +157,27 @@ impl Router {
 						R::from_value(
 							array.into_iter().next().expect("array has exactly one element"),
 						)
-						.map_err(|e| crate::Error::internal(e.to_string()))?,
+						.map_err(|e| {
+							crate::Error::serialization(
+								e.to_string(),
+								crate::types::SerializationError::Deserialization,
+							)
+						})?,
 					)),
 					// Multiple elements should not happen for operations expecting Option<T>
-					_ => Ok(Some(
-						R::from_value(Value::Array(array))
-							.map_err(|e| crate::Error::internal(e.to_string()))?,
-					)),
+					_ => Ok(Some(R::from_value(Value::Array(array)).map_err(|e| {
+						crate::Error::serialization(
+							e.to_string(),
+							crate::types::SerializationError::Deserialization,
+						)
+					})?)),
 				},
-				value => Ok(Some(
-					R::from_value(value).map_err(|e| crate::Error::internal(e.to_string()))?,
-				)),
+				value => Ok(Some(R::from_value(value).map_err(|e| {
+					crate::Error::serialization(
+						e.to_string(),
+						crate::types::SerializationError::Deserialization,
+					)
+				})?)),
 			}
 		})
 	}
@@ -180,11 +197,21 @@ impl Router {
 				Value::None | Value::Null => Ok(Vec::new()),
 				Value::Array(array) => array
 					.into_iter()
-					.map(|v| R::from_value(v).map_err(|e| crate::Error::internal(e.to_string())))
+					.map(|v| {
+						R::from_value(v).map_err(|e| {
+							crate::Error::serialization(
+								e.to_string(),
+								crate::types::SerializationError::Deserialization,
+							)
+						})
+					})
 					.collect::<Result<Vec<R>>>(),
-				value => Ok(vec![
-					R::from_value(value).map_err(|e| crate::Error::internal(e.to_string()))?,
-				]),
+				value => Ok(vec![R::from_value(value).map_err(|e| {
+					crate::Error::serialization(
+						e.to_string(),
+						crate::types::SerializationError::Deserialization,
+					)
+				})?]),
 			}
 		})
 	}

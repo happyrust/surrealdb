@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use surrealdb_types::{SqlFormat, ToSql};
 
+use crate::err::Error;
 use crate::exec::physical_expr::{EvalContext, PhysicalExpr};
-use crate::exec::{AccessMode, ContextLevel, ExecOperator};
+use crate::exec::{AccessMode, BoxFut, ContextLevel, ExecOperator};
 use crate::expr::FlowResult;
 use crate::val::Value;
 
@@ -64,13 +64,18 @@ pub struct LookupPart {
 	/// When true, the continuation logic in `evaluate_parts_with_continuation` maps
 	/// per-element over non-lookup arrays even when this is the last part in the idiom.
 	pub fused: bool,
-}
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
+	/// When true, unwrap the result array into a single value (FROM ONLY semantics).
+	/// Empty results yield NONE; more than one result is an error.
+	pub only: bool,
+}
 impl PhysicalExpr for LookupPart {
 	fn name(&self) -> &'static str {
 		"Lookup"
+	}
+
+	fn as_any(&self) -> &dyn std::any::Any {
+		self
 	}
 
 	fn required_context(&self) -> ContextLevel {
@@ -78,9 +83,11 @@ impl PhysicalExpr for LookupPart {
 		self.plan.required_context().max(ContextLevel::Database)
 	}
 
-	async fn evaluate(&self, ctx: EvalContext<'_>) -> FlowResult<Value> {
-		let value = ctx.current_value.unwrap_or(&Value::NONE);
-		Ok(evaluate_lookup(value, self, ctx).await?)
+	fn evaluate<'a>(&'a self, ctx: EvalContext<'a>) -> BoxFut<'a, FlowResult<Value>> {
+		Box::pin(async move {
+			let value = ctx.current_value.unwrap_or(&Value::NONE);
+			Ok(evaluate_lookup(value, self, ctx).await?)
+		})
 	}
 
 	/// Parallel batch evaluation for graph/reference lookups.
@@ -88,22 +95,24 @@ impl PhysicalExpr for LookupPart {
 	/// Each lookup executes a plan per RecordId, which involves I/O.
 	/// Parallelizing across rows lets multiple lookups proceed concurrently.
 	/// Falls back to sequential for ReadWrite plans to preserve mutation ordering.
-	async fn evaluate_batch(
-		&self,
-		ctx: EvalContext<'_>,
-		values: &[Value],
-	) -> FlowResult<Vec<Value>> {
-		if values.len() < 2 || self.access_mode() == AccessMode::ReadWrite {
-			// Sequential for small batches or mutation plans
-			let mut results = Vec::with_capacity(values.len());
-			for value in values {
-				results.push(self.evaluate(ctx.with_value(value)).await?);
+	fn evaluate_batch<'a>(
+		&'a self,
+		ctx: EvalContext<'a>,
+		values: &'a [Value],
+	) -> BoxFut<'a, FlowResult<Vec<Value>>> {
+		Box::pin(async move {
+			if values.len() < 2 || self.access_mode() == AccessMode::ReadWrite {
+				// Sequential for small batches or mutation plans
+				let mut results = Vec::with_capacity(values.len());
+				for value in values {
+					results.push(self.evaluate(ctx.with_value(value)).await?);
+				}
+				return Ok(results);
 			}
-			return Ok(results);
-		}
-		let futures: Vec<_> =
-			values.iter().map(|value| self.evaluate(ctx.with_value(value))).collect();
-		futures::future::try_join_all(futures).await
+			let futures: Vec<_> =
+				values.iter().map(|value| self.evaluate(ctx.with_value(value))).collect();
+			futures::future::try_join_all(futures).await
+		})
 	}
 
 	fn access_mode(&self) -> AccessMode {
@@ -153,7 +162,7 @@ async fn evaluate_lookup(
 				let result = Box::pin(evaluate_lookup(item, lookup, ctx.clone())).await?;
 				// Flatten: extend results with array elements, or push single values
 				match result {
-					Value::Array(inner) => results.extend(inner.into_iter()),
+					Value::Array(inner) => results.extend(inner),
 					other => results.push(other),
 				}
 			}
@@ -175,6 +184,15 @@ async fn evaluate_lookup_for_value(
 	// Create a new execution context with the current value set.
 	// The CurrentValueSource operator reads this to seed the operator chain.
 	let bound_ctx = ctx.exec_ctx.with_current_value(value.clone());
+	// Bind $parent from the enclosing row so that graph WHERE clauses
+	// (e.g. `->edge[WHERE out=$parent.field]`) reference the current SELECT's
+	// row. Always overrides any existing binding from an outer subquery --
+	// graph [WHERE] $parent scoping is per-SELECT, not per-subquery-nesting.
+	let bound_ctx = if let Some(parent) = ctx.document_root {
+		bound_ctx.with_param("parent", parent.clone())
+	} else {
+		bound_ctx
+	};
 	let bound_ctx = if ctx.skip_fetch_perms {
 		bound_ctx.with_skip_fetch_perms(true)
 	} else {
@@ -212,7 +230,7 @@ async fn evaluate_lookup_for_value(
 	// When extract_id is set, the scan used FullEdge mode for WHERE/SPLIT filtering
 	// but no explicit SELECT clause was present. Project results back to RecordIds.
 	if lookup.extract_id {
-		let results = results
+		let results: Vec<Value> = results
 			.into_iter()
 			.filter_map(|v| match v {
 				Value::Object(ref obj) => {
@@ -222,7 +240,23 @@ async fn evaluate_lookup_for_value(
 				_ => None,
 			})
 			.collect();
-		return Ok(Value::Array(results));
+
+		if lookup.only {
+			return match results.len() {
+				0 => Ok(Value::None),
+				1 => Ok(results.into_iter().next().expect("Exactly one result in this branch")),
+				_ => Err(anyhow::anyhow!(Error::SingleOnlyOutput)),
+			};
+		}
+		return Ok(Value::Array(results.into()));
+	}
+
+	if lookup.only {
+		return match results.len() {
+			0 => Ok(Value::None),
+			1 => Ok(results.into_iter().next().expect("Exactly one result in this branch")),
+			_ => Err(anyhow::anyhow!(Error::SingleOnlyOutput)),
+		};
 	}
 
 	Ok(Value::Array(results.into()))

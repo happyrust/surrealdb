@@ -72,7 +72,20 @@ pub(crate) async fn run_router(
 		_ => None,
 	};
 
-	let kvs = match Datastore::new(&address.path).await {
+	let builder = Datastore::builder()
+		.with_query_timeout(address.config.query_timeout)
+		.with_transaction_timeout(address.config.transaction_timeout)
+		.with_auth(configured_root.is_some());
+
+	let (notify, builder) = if address.config.capabilities.allows_live_query_notifications() {
+		let (send, recv) =
+			surrealdb_core::channel::bounded(surrealdb_core::cnf::NOTIFICATIONS_CHANNEL_SIZE);
+		(Some(recv), builder.with_notify(send))
+	} else {
+		(None, builder)
+	};
+
+	let kvs = match builder.build_with_path(&address.path).await {
 		Ok(kvs) => {
 			if let Err(error) = kvs.check_version().await {
 				conn_tx.send(Err(crate::Error::internal(error.to_string()))).await.ok();
@@ -90,23 +103,13 @@ pub(crate) async fn run_router(
 				return;
 			}
 			conn_tx.send(Ok(())).await.ok();
-			kvs.with_auth_enabled(configured_root.is_some())
+			kvs
 		}
 		Err(error) => {
 			conn_tx.send(Err(crate::Error::internal(error.to_string()))).await.ok();
 			return;
 		}
 	};
-
-	let kvs = match address.config.capabilities.allows_live_query_notifications() {
-		true => kvs.with_notifications(),
-		false => kvs,
-	};
-
-	let kvs = kvs
-		.with_query_timeout(address.config.query_timeout)
-		.with_transaction_timeout(address.config.transaction_timeout)
-		.with_capabilities(address.config.capabilities);
 
 	let router_state = super::RouterState {
 		kvs: Arc::new(kvs),
@@ -130,8 +133,8 @@ pub(crate) async fn run_router(
 	}
 	let tasks = tasks::init(router_state.kvs.clone(), canceller.clone(), &opt);
 
-	let mut notifications = router_state.kvs.notifications().map(Box::pin);
-	let mut notification_stream = poll_fn(move |cx| match &mut notifications {
+	let mut notify = notify.map(Box::pin);
+	let mut notification_stream = poll_fn(move |cx| match &mut notify {
 		Some(rx) => rx.poll_next_unpin(cx),
 		// return poll pending so that this future is never woken up again and therefore not
 		// constantly polled.
@@ -146,25 +149,21 @@ pub(crate) async fn run_router(
 				let Ok(session_id) = session else {
 					break
 				};
-				match session_id {
-					SessionId::Initial(session_id) => {
-						router_state.handle_session_initial(session_id);
-					}
-					SessionId::Clone { old, new } => {
-						router_state.handle_session_clone(old, new).await;
-					}
-					SessionId::Drop(session_id) => {
-						router_state.handle_session_drop(session_id);
-					}
-				}
+				router_state.handle_session(session_id).await;
 			}
 			route = route_rx.recv().fuse() => {
 				let Ok(route) = route else {
 					// termination requested
 					break
 				};
-				match router_state.sessions.get(&route.request.session_id) {
-					Some(Ok(state)) => {
+				// `resolve_route_session` drains any session-lifecycle events enqueued
+				// before this route, so a freshly registered/cloned session is applied
+				// before the lookup (see its docs for the ordering guarantee).
+				match router_state
+					.resolve_route_session(&session_rx, route.request.session_id)
+					.await
+				{
+					Ok(state) => {
 						let kvs = router_state.kvs.clone();
 						spawn_local(async move {
 							match super::router(&kvs, &state, route.request.command)
@@ -179,15 +178,11 @@ pub(crate) async fn run_router(
 							}
 						});
 					}
-					Some(Err(error)) => {
+					Err(error) => {
 						route.response
 							.send(Err(crate::engine::session_error_to_error(error)))
 							.await
 							.ok();
-					}
-					None => {
-						let error = crate::engine::session_error_to_error(SessionError::NotFound(route.request.session_id));
-						route.response.send(Err(error)).await.ok();
 					}
 				}
 			}

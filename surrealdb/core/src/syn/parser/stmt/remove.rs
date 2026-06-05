@@ -1,8 +1,8 @@
 use reblessive::Stk;
 
 use crate::sql::statements::remove::{
-	RemoveAnalyzerStatement, RemoveApiStatement, RemoveBucketStatement, RemoveModuleStatement,
-	RemoveSequenceStatement,
+	RemoveAnalyzerStatement, RemoveApiStatement, RemoveBucketStatement, RemoveConfigKind,
+	RemoveConfigStatement, RemoveModuleStatement, RemoveSequenceStatement,
 };
 use crate::sql::statements::{
 	RemoveAccessStatement, RemoveDatabaseStatement, RemoveEventStatement, RemoveFieldStatement,
@@ -106,15 +106,15 @@ impl Parser<'_> {
 					t!("mod") => {
 						self.pop_peek();
 						expected_whitespace!(self, t!("::"));
-						let name = self.parse_ident()?;
+						let name = self.parse_ident()?.into_string();
 						ModuleName::Module(name)
 					}
 					t!("silo") => {
 						self.pop_peek();
 						expected_whitespace!(self, t!("::"));
-						let organisation = self.parse_ident()?;
+						let organisation = self.parse_ident()?.into_string();
 						expected_whitespace!(self, t!("::"));
-						let package = self.parse_ident()?;
+						let package = self.parse_ident()?.into_string();
 						expected_whitespace!(self, t!("<"));
 						let major = self.parse_version_digits()?;
 						expected_whitespace!(self, t!("."));
@@ -164,7 +164,7 @@ impl Parser<'_> {
 				let name = self.next_token_value::<Param>()?;
 
 				RemoveStatement::Param(RemoveParamStatement {
-					name: name.into_string(),
+					name: name.into_strand(),
 					if_exists,
 				})
 			}
@@ -317,7 +317,25 @@ impl Parser<'_> {
 					if_exists,
 				})
 			}
-			// TODO(raphaeldarley): add Config here
+			t!("CONFIG") => {
+				let if_exists = if self.eat(t!("IF")) {
+					expected!(self, t!("EXISTS"));
+					true
+				} else {
+					false
+				};
+				let next = self.next();
+				let kind = match next.kind {
+					t!("GRAPHQL") => RemoveConfigKind::GraphQL,
+					t!("API") => RemoveConfigKind::Api,
+					t!("DEFAULT") => RemoveConfigKind::Default,
+					_ => unexpected!(self, next, "a type of config"),
+				};
+				RemoveStatement::Config(RemoveConfigStatement {
+					kind,
+					if_exists,
+				})
+			}
 			_ => unexpected!(self, next, "a remove statement keyword"),
 		};
 		Ok(res)

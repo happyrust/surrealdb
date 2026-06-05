@@ -123,15 +123,73 @@ impl ScalarFunction for ValueChain {
 		args: Vec<Value>,
 	) -> crate::exec::BoxFut<'a, Result<Value>> {
 		Box::pin(async move {
+			use crate::doc::CursorDoc;
 			let args = FromArgs::from_args("value::chain", args)?;
 			let frozen = ctx.exec_ctx.ctx();
 			let opt = ctx.exec_ctx.options();
-			// Note: CursorDoc is not available in the streaming executor context
-			let doc = None;
+			let doc = ctx
+				.document_root
+				.or(ctx.current_value)
+				.map(|v| CursorDoc::new(None, None, v.clone()));
 			let mut stack = TreeStack::new();
 			stack
 				.enter(|stk| async move {
-					crate::fnc::value::chain((stk, frozen, opt, doc), args).await
+					crate::fnc::value::chain((stk, frozen, opt, doc.as_ref()), args).await
+				})
+				.finish()
+				.await
+		})
+	}
+}
+
+// value::expect: Assert a value with a closure returning bool
+// Original value is passed on if closure returns true
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ValueExpect;
+
+impl ScalarFunction for ValueExpect {
+	fn name(&self) -> &'static str {
+		"value::expect"
+	}
+
+	fn signature(&self) -> Signature {
+		Signature::new()
+			.arg("value", Kind::Any)
+			.arg("closure", Kind::Any)
+			.optional("message", Kind::String)
+			.returns(Kind::Any)
+	}
+
+	fn is_pure(&self) -> bool {
+		false
+	}
+
+	fn is_async(&self) -> bool {
+		true
+	}
+
+	fn invoke(&self, _args: Vec<Value>) -> Result<Value> {
+		Err(anyhow::anyhow!("Function '{}' requires async execution", self.name()))
+	}
+
+	fn invoke_async<'a>(
+		&'a self,
+		ctx: &'a EvalContext<'_>,
+		args: Vec<Value>,
+	) -> crate::exec::BoxFut<'a, Result<Value>> {
+		Box::pin(async move {
+			use crate::doc::CursorDoc;
+			let args = FromArgs::from_args("value::expect", args)?;
+			let frozen = ctx.exec_ctx.ctx();
+			let opt = ctx.exec_ctx.options();
+			let doc = ctx
+				.document_root
+				.or(ctx.current_value)
+				.map(|v| CursorDoc::new(None, None, v.clone()));
+			let mut stack = TreeStack::new();
+			stack
+				.enter(|stk| async move {
+					crate::fnc::value::expect((stk, frozen, opt, doc.as_ref()), args).await
 				})
 				.finish()
 				.await
@@ -143,4 +201,5 @@ pub fn register(registry: &mut FunctionRegistry) {
 	registry.register(ValueDiff);
 	registry.register(ValuePatch);
 	registry.register(ValueChain);
+	registry.register(ValueExpect);
 }

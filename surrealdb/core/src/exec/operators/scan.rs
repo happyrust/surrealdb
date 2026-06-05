@@ -7,10 +7,11 @@
 pub(crate) mod common;
 mod count;
 mod dynamic;
+mod empty;
 mod fulltext;
 mod graph;
 mod index;
-mod index_count;
+pub(crate) mod index_count;
 mod knn;
 pub(crate) mod pipeline;
 mod record_id;
@@ -21,6 +22,7 @@ mod union_index;
 
 pub use count::CountScan;
 pub use dynamic::DynamicScan;
+pub use empty::EmptyScan;
 pub use fulltext::FullTextScan;
 pub use graph::{EdgeTableSpec, GraphEdgeScan, GraphScanOutput};
 pub use index::IndexScan;

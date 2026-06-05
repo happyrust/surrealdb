@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use surrealdb_types::{ConnectionError, ValidationError};
 use tokio::net::TcpStream;
 use tokio::sync::{RwLock, watch};
 use tokio::time;
@@ -19,8 +20,7 @@ use uuid::Uuid;
 
 use super::{
 	HandleResult, PATH, PING_INTERVAL, SessionState, WsMessage, create_ping_message,
-	handle_response, handle_route, handle_session_clone, handle_session_drop,
-	handle_session_initial, replay_session, reset_sessions,
+	handle_response, handle_route, handle_session, replay_session, reset_sessions,
 };
 use crate::conn::{self, Route, Router};
 use crate::engine::{IntervalStream, SessionError};
@@ -87,9 +87,9 @@ pub(crate) async fn connect(
 	#[cfg_attr(not(any(feature = "native-tls", feature = "rustls")), expect(unused_variables))]
 	maybe_connector: Option<Connector>,
 ) -> crate::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-	let mut request = (&endpoint.url)
-		.into_client_request()
-		.map_err(|err| Error::internal(format!("Invalid URL: {}", err)))?;
+	let mut request = (&endpoint.url).into_client_request().map_err(|err| {
+		Error::validation(format!("Invalid URL: {}", err), ValidationError::InvalidRequest)
+	})?;
 
 	request.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("flatbuffers"));
 
@@ -101,12 +101,16 @@ pub(crate) async fn connect(
 		maybe_connector,
 	)
 	.await
-	.map_err(|err| Error::internal(format!("WebSocket error: {}", err)))?;
+	.map_err(|err| {
+		Error::connection(format!("WebSocket error: {}", err), ConnectionError::ConnectionFailed)
+	})?;
 
 	#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
 	let (socket, _) = tokio_tungstenite::connect_async_with_config(request, config, NAGLE_ALG)
 		.await
-		.map_err(|err| Error::internal(format!("WebSocket error: {}", err)))?;
+		.map_err(|err| {
+		Error::connection(format!("WebSocket error: {}", err), ConnectionError::ConnectionFailed)
+	})?;
 
 	Ok(socket)
 }
@@ -120,7 +124,10 @@ impl conn::Sealed for super::Client {
 		session_clone: Option<crate::SessionClone>,
 	) -> BoxFuture<'static, crate::Result<Surreal<Self>>> {
 		Box::pin(async move {
-			address.url = address.url.join(PATH).map_err(|e| Error::internal(e.to_string()))?;
+			address.url = address
+				.url
+				.join(PATH)
+				.map_err(|e| Error::validation(e.to_string(), ValidationError::InvalidRequest))?;
 			#[cfg(any(feature = "native-tls", feature = "rustls"))]
 			let maybe_connector = address.config.tls_config.clone().map(Connector::from);
 			#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -255,23 +262,7 @@ pub(crate) async fn run_router(
 					let Ok(session_id) = session else {
 						break 'router
 					};
-					match session_id {
-						SessionId::Initial(session_id) => {
-							handle_session_initial::<Message, _, _>(
-								session_id, &state.sessions, &state.sink
-							).await;
-						}
-						SessionId::Clone { old, new } => {
-							handle_session_clone::<Message, _, _>(
-								old, new, &state.sessions, &state.sink
-							).await;
-						}
-						SessionId::Drop(session_id) => {
-							handle_session_drop::<Message, _, _>(
-								session_id, &state.sessions, &state.sink
-							).await;
-						}
-					}
+					handle_session::<Message, _, _>(session_id, &state.sessions, &state.sink).await;
 				}
 				route = route_rx.recv() => {
 					let Ok(route) = route else {
@@ -281,6 +272,15 @@ pub(crate) async fn run_router(
 						}
 						break 'router;
 					};
+
+					// Apply any session-lifecycle events that were enqueued before this
+					// query. The session channel is separate from the route channel, so a
+					// freshly registered or cloned session may not have been processed yet;
+					// receiving this route establishes a happens-before with the sender, so
+					// those earlier events are now observable and one drain pass suffices.
+					while let Ok(session_id) = session_rx.try_recv() {
+						handle_session::<Message, _, _>(session_id, &state.sessions, &state.sink).await;
+					}
 
 					match handle_route::<Message, _, _>(
 						route, config.max_message_size, &state.sessions, &state.sink
@@ -348,7 +348,7 @@ mod tests {
 
 	use flate2::Compression;
 	use flate2::write::GzEncoder;
-	use rand::{Rng, thread_rng};
+	use rand::Rng;
 	use surrealdb_core::rpc;
 	use web_time::SystemTime;
 
@@ -372,9 +372,9 @@ mod tests {
 			2_000_000
 		};
 		let mut vector: Vec<i32> = Vec::new();
-		let mut rng = thread_rng();
+		let mut rng = rand::rng();
 		for _ in 0..vector_size {
-			vector.push(rng.r#gen());
+			vector.push(rng.random());
 		}
 		let mut results = vec![];
 		let ref_payload;
@@ -416,7 +416,7 @@ mod tests {
 				payload.len() as f32 / ref_compressed,
 			));
 		}
-		results.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
+		results.sort_by_key(|(a, _, _, _)| *a);
 		for (size, name, duration, factor) in &results {
 			info!("{name} - Size: {size} - Duration: {duration:?} - Factor: {factor}");
 		}

@@ -6,17 +6,17 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::stream;
 use surrealdb_types::{SqlFormat, ToSql};
 
+use crate::err::Error;
 use crate::exec::context::{ContextLevel, ExecutionContext};
 use crate::exec::plan_or_compute::{evaluate_expr, expr_required_context};
 use crate::exec::{
 	AccessMode, CardinalityHint, ExecOperator, FlowResult, OperatorMetrics, ValueBatch,
 	ValueBatchStream,
 };
-use crate::expr::Expr;
+use crate::expr::{ControlFlow, Expr};
 use crate::val::Value;
 
 /// IfElse operator with deferred planning.
@@ -54,9 +54,6 @@ impl IfElsePlan {
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for IfElsePlan {
 	fn name(&self) -> &'static str {
 		"IfElse"
@@ -131,12 +128,13 @@ async fn execute_ifelse(
 	else_body: &Option<Expr>,
 	ctx: &ExecutionContext,
 ) -> crate::expr::FlowResult<ValueBatch> {
-	// Evaluate each condition in order
 	for (cond, body) in branches {
+		if ctx.cancellation().is_cancelled() {
+			return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+		}
 		let cond_value = evaluate_expr(cond, ctx).await?;
 
 		if cond_value.is_truthy() {
-			// Execute the body of the first truthy branch
 			let result = evaluate_expr(body, ctx).await?;
 			return Ok(ValueBatch {
 				values: vec![result],

@@ -8,13 +8,20 @@ use surrealdb_types::{SqlFormat, ToSql};
 
 use crate::err::Error;
 use crate::expr::Expr;
-use crate::val::{IndexFormat, Value};
+use crate::val::{IndexFormat, Set, Value};
 
-#[revisioned(revision = 1)]
+/// - **Rev 1** — `u16 revision || Vec<Value>` (length-prefixed). Byte-identical to the legacy
+///   on-disk encoding.
+/// - **Rev 2** — optimised envelope (`u16 revision || u32_le payload_length`), inner `Vec` written
+///   via the indexed-seq prologue past `OFFSET_TABLE_MIN_LEN = 8`. Walker descent stays
+///   zero-allocation through the Wire-repr fast path (skip + borrow). Walker exposes
+///   `element_bytes(i)` for O(1) random access on the indexed path; sub-threshold arrays fall back
+///   to a linear walk of the legacy body.
+#[revisioned(revision(1), revision(2, optimised))]
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash, Encode, BorrowDecode)]
 #[storekey(format = "()")]
 #[storekey(format = "IndexFormat")]
-pub(crate) struct Array(pub(crate) Vec<Value>);
+pub(crate) struct Array(#[revision(indexed_seq)] pub(crate) Vec<Value>);
 
 impl<T> From<Vec<T>> for Array
 where
@@ -102,6 +109,10 @@ impl Array {
 		self.0.iter().all(|v| v.is_nullish())
 	}
 
+	pub(crate) fn is_any_none_or_null(&self) -> bool {
+		self.0.iter().any(|v| v.is_nullish())
+	}
+
 	/// Removes all values in the array which are equal to the given value.
 	pub fn remove_value(mut self, other: &Value) -> Self {
 		self.retain(|x| x != other);
@@ -114,9 +125,21 @@ impl Array {
 		self
 	}
 
+	/// Removes all values in the array that appear in `other`.
+	pub fn remove_all_set(mut self, other: &Set) -> Self {
+		self.retain(|x| !other.contains(x));
+		self
+	}
+
 	/// Concatenates the two arrays returning an array with the values of both arrays.
 	pub fn concat(mut self, mut other: Array) -> Self {
 		self.0.append(&mut other.0);
+		self
+	}
+
+	/// Concatenates the items of a set into an array, returning an array with the values of both.
+	pub fn concat_set(mut self, other: Set) -> Self {
+		self.0.append(&mut other.0.into_iter().collect());
 		self
 	}
 

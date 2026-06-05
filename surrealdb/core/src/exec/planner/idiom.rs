@@ -37,9 +37,18 @@ impl<'ctx> Planner<'ctx> {
 		let mut parts = idiom.0;
 
 		if let Some(Part::Start(_)) = parts.first() {
+			// `peek + remove` instead of one destructure because we need
+			// the index check separately. The `else` arm is provably
+			// unreachable given the `peek` succeeded — degraded to a typed
+			// `Error::Internal` so a future Part::Start variant change
+			// surfaces a useful planner-bug message rather than a panic on
+			// production user input.
 			let start_part = parts.remove(0);
 			let Part::Start(start_expr) = start_part else {
-				unreachable!()
+				return Err(Error::Internal(
+					"convert_idiom: parts.first() reported Part::Start but parts.remove(0) was not Part::Start"
+						.into(),
+				));
 			};
 			let start_phys = self.physical_expr(start_expr).await?;
 			let remaining_parts = self.convert_parts(parts).await?;
@@ -69,7 +78,7 @@ impl<'ctx> Planner<'ctx> {
 			while let Some(part) = iter.next() {
 				// Handle implicit recursion (Recurse with no inner path absorbs remaining parts)
 				if let Part::Recurse(recurse, None, instruction) = part {
-					let system_limit = *crate::cnf::IDIOM_RECURSION_LIMIT as u32;
+					let system_limit = self.ctx.config.idiom_recursion_limit;
 					let (min_depth, max_depth) = match recurse {
 						crate::expr::part::Recurse::Fixed(n) => (n, Some(n)),
 						crate::expr::part::Recurse::Range(min, max) => (min.unwrap_or(1), max),
@@ -164,22 +173,58 @@ impl<'ctx> Planner<'ctx> {
 				// CurrentValueSource, we thread the output of one lookup as the
 				// input to the next, forming a streaming DAG:
 				//   GraphEdgeScan(->person, GraphEdgeScan(->likes, CurrentValueSource))
+				//
+				// When a consecutive `->edge->vertex` pair is fast-path
+				// eligible (no edge-side filters/projections, edge table has
+				// `PERMISSIONS FULL`), both hops collapse into a single scan
+				// in `TargetVertex` mode that reads the target vertex from
+				// the adjacency key directly. See [`try_fast_path_pair`].
 				if let Part::Lookup(first_lookup) = part {
-					let (mut direction, mut extract_id) = lookup_metadata(&first_lookup);
-					let mut chain: Arc<dyn ExecOperator> = Arc::new(CurrentValueSource::new());
-					chain = self.plan_lookup_with_input(chain, first_lookup).await?;
-
-					// Consume all consecutive Part::Lookup nodes
-					let mut fused = false;
+					// Collect every consecutive lookup so we can inspect pairs.
+					// `Part::Lookup` boxes its payload (#209), so we deref each
+					// one as we collect.
+					let mut lookups: Vec<crate::expr::lookup::Lookup> = vec![*first_lookup];
 					while matches!(iter.peek(), Some(Part::Lookup(_))) {
-						let Some(Part::Lookup(next_lookup)) = iter.next() else {
-							unreachable!()
+						let Some(Part::Lookup(lu)) = iter.next() else {
+							return Err(Error::Internal(
+								"convert_parts lookup fusion: iter.peek() reported Part::Lookup but iter.next() did not yield one"
+									.into(),
+							));
 						};
-						let (d, e) = lookup_metadata(&next_lookup);
-						direction = d;
-						extract_id = e;
-						chain = self.plan_lookup_with_input(chain, next_lookup).await?;
-						fused = true;
+						lookups.push(*lu);
+					}
+					let fused = lookups.len() > 1;
+					let only = lookups.iter().any(|l| l.only);
+
+					let mut chain: Arc<dyn ExecOperator> = Arc::new(CurrentValueSource::new());
+					let mut direction = LookupDirection::Out;
+					let mut extract_id = false;
+
+					let mut idx = 0;
+					while idx < lookups.len() {
+						let advance = if idx + 1 < lookups.len() {
+							self.try_fast_path_pair(&lookups[idx], &lookups[idx + 1]).await?
+						} else {
+							None
+						};
+						if let Some(plan) = advance {
+							// Fast path: replace the (edge, vertex) pair with
+							// a single TargetVertex scan whose metadata is
+							// taken from the *vertex* lookup so downstream
+							// behavior matches the original two-scan chain.
+							chain = self.plan_target_vertex_scan(chain, plan).await?;
+							let (d, e) = lookup_metadata(&lookups[idx + 1]);
+							direction = d;
+							extract_id = e;
+							idx += 2;
+						} else {
+							let lu = lookups[idx].clone();
+							let (d, e) = lookup_metadata(&lu);
+							direction = d;
+							extract_id = e;
+							chain = self.plan_lookup_with_input(chain, lu).await?;
+							idx += 1;
+						}
 					}
 
 					converted.push(Arc::new(LookupPart {
@@ -187,6 +232,7 @@ impl<'ctx> Planner<'ctx> {
 						plan: chain,
 						extract_id,
 						fused,
+						only,
 					}));
 					continue;
 				}
@@ -208,7 +254,7 @@ impl<'ctx> Planner<'ctx> {
 	pub(crate) async fn convert_part(&self, part: Part) -> Result<Arc<dyn PhysicalExpr>, Error> {
 		match part {
 			Part::Field(name) => Ok(Arc::new(FieldPart {
-				name,
+				name: name.into_string(),
 			})),
 
 			Part::Value(expr) => {
@@ -232,9 +278,11 @@ impl<'ctx> Planner<'ctx> {
 			}
 
 			Part::Where(expr) => {
+				let needs_parent = super::row_scope::references_parent(&expr);
 				let phys_expr = self.physical_expr(expr).await?;
 				Ok(Arc::new(WherePart {
 					predicate: phys_expr,
+					needs_parent,
 				}))
 			}
 
@@ -244,13 +292,13 @@ impl<'ctx> Planner<'ctx> {
 					phys_args.push(self.physical_expr(arg).await?);
 				}
 				let registry = self.function_registry();
-				match registry.get_method(&name) {
+				match registry.get_method(name.as_str()) {
 					Some(descriptor) => Ok(Arc::new(MethodPart {
-						descriptor: descriptor.clone(),
+						descriptor: Arc::clone(descriptor),
 						args: phys_args,
 					})),
 					None => Ok(Arc::new(ClosureFieldCallPart {
-						field: name,
+						field: name.into_string(),
 						args: phys_args,
 					})),
 				}
@@ -277,17 +325,19 @@ impl<'ctx> Planner<'ctx> {
 				let needs_full_records =
 					needs_full_pipeline || lookup.cond.is_some() || lookup.split.is_some();
 				let extract_id = needs_full_records && !needs_full_pipeline;
-				let plan = self.plan_lookup(lookup).await?;
+				let only = lookup.only;
+				let plan = self.plan_lookup(*lookup).await?;
 				Ok(Arc::new(LookupPart {
 					direction,
 					plan,
 					extract_id,
 					fused: false,
+					only,
 				}))
 			}
 
 			Part::Recurse(recurse, inner_path, instruction) => {
-				let system_limit = *crate::cnf::IDIOM_RECURSION_LIMIT as u32;
+				let system_limit = self.ctx.config.idiom_recursion_limit;
 				let (min_depth, max_depth) = match recurse {
 					crate::expr::part::Recurse::Fixed(n) => (n, Some(n)),
 					crate::expr::part::Recurse::Range(min, max) => (min.unwrap_or(1), max),
@@ -361,10 +411,15 @@ impl<'ctx> Planner<'ctx> {
 						// extract it, convert to a physical expression, and prepend
 						// to the path. This occurs when the parser wraps non-idiom
 						// expressions (like $this or level * 2) in Part::Start
-						// within destructure aliases.
+						// within destructure aliases. The `else` arm is provably
+						// unreachable; converted to `Error::Internal` for the
+						// same reason as the matching site in `convert_idiom`.
 						let start_expr = if matches!(parts.first(), Some(Part::Start(_))) {
 							let Part::Start(expr) = parts.remove(0) else {
-								unreachable!()
+								return Err(Error::Internal(
+									"convert_destructure: parts.first() reported Part::Start but parts.remove(0) was not Part::Start"
+										.into(),
+								));
 							};
 							Some(self.physical_expr(expr).await?)
 						} else {
@@ -480,7 +535,7 @@ fn insert_auto_flattens(parts: Vec<Arc<dyn PhysicalExpr>>) -> Vec<Arc<dyn Physic
 
 	let mut result = Vec::with_capacity(parts.len() * 2);
 	for i in 0..parts.len() {
-		result.push(parts[i].clone());
+		result.push(Arc::clone(&parts[i]));
 		if parts[i].name() == "Lookup"
 			&& let Some(next) = parts.get(i + 1)
 			&& (next.name() == "Lookup" || next.name() == "Where")
@@ -531,10 +586,8 @@ fn ast_contains_repeat_recurse(parts: &[Part]) -> bool {
 					}
 				}
 			}
-			Part::Recurse(_, Some(inner_path), _) => {
-				if ast_contains_repeat_recurse(&inner_path.0) {
-					return true;
-				}
+			Part::Recurse(_, Some(inner_path), _) if ast_contains_repeat_recurse(&inner_path.0) => {
+				return true;
 			}
 			_ => {}
 		}

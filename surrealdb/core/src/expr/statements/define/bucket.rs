@@ -45,19 +45,19 @@ impl DefineBucketStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Bucket, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Bucket, Base::Db)?;
 		// Process the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "bucket name").await?;
 		// Fetch the transaction
 		let txn = ctx.tx();
 		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
 		// Check if the definition exists
-		if let Some(bucket) = txn.get_db_bucket(ns, db, &name).await? {
+		if let Some(bucket) = txn.get_db_bucket(ns, db, &name, None).await? {
 			match self.kind {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::BuAlreadyExists {
-							value: bucket.name.clone(),
+							value: bucket.name.to_string(),
 						});
 					}
 				}
@@ -97,13 +97,13 @@ impl DefineBucketStatement {
 
 		let ap = BucketDefinition {
 			id: None,
-			name: name.clone(),
-			backend,
+			name: name.clone().into(),
+			backend: backend.map(|s| s.into()),
 			permissions: self.permissions.clone(),
 			readonly: self.readonly,
 			comment,
 		};
-		txn.set(&key, &ap, None).await?;
+		txn.set(&key, &ap).await?;
 		// Clear the cache
 		txn.clear_cache();
 		// Ok all good

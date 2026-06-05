@@ -132,7 +132,7 @@ impl<'a> Arbitrary<'a> for Model {
 		);
 
 		Ok(Model {
-			version,
+			version: version.into(),
 			name: u.arbitrary()?,
 		})
 	}
@@ -273,9 +273,12 @@ impl<'a> Arbitrary<'a> for Lookup {
 					_ => unreachable!(),
 				};
 
+				let only = expr.is_some() && u.arbitrary()?;
+
 				Lookup {
 					kind: u.arbitrary()?,
 					expr,
+					only,
 					what: u.arbitrary()?,
 					cond: u.arbitrary()?,
 					split,
@@ -299,7 +302,7 @@ impl<'a> Arbitrary<'a> for Middleware {
 		name.push_str(u.arbitrary()?);
 
 		Ok(Middleware {
-			name,
+			name: name.into(),
 			args: u.arbitrary()?,
 		})
 	}
@@ -477,6 +480,7 @@ fn idiom_from_expr<'a>(
 							query_recursion_limit: 1000000,
 							files_enabled: true,
 							surrealism_enabled: true,
+							json_string_escapes: false,
 						},
 						async |p, stk| p.parse_expr_start(stk).await,
 					)
@@ -519,6 +523,7 @@ fn idiom_from_expr<'a>(
 							query_recursion_limit: 1000000,
 							files_enabled: true,
 							surrealism_enabled: true,
+							json_string_escapes: false,
 						},
 						async |p, stk| p.parse_expr_start(stk).await,
 					)

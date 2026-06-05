@@ -37,7 +37,7 @@ impl RemoveUserStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Actor, &self.base)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Actor, self.base)?;
 		// Compute the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "user name").await?;
 		// Check the statement type
@@ -46,7 +46,7 @@ impl RemoveUserStatement {
 				// Get the transaction
 				let txn = ctx.tx();
 				// Get the definition
-				let us = match txn.get_root_user(&name).await? {
+				let us = match txn.get_root_user(&name, None).await? {
 					Some(x) => x,
 					None => {
 						if self.if_exists {
@@ -73,7 +73,7 @@ impl RemoveUserStatement {
 				let txn = ctx.tx();
 				// Get the definition
 				let ns = ctx.get_ns_id(opt).await?;
-				let us = match txn.get_ns_user(ns, &name).await? {
+				let us = match txn.get_ns_user(ns, &name, None).await? {
 					Some(x) => x,
 					None => {
 						if self.if_exists {
@@ -100,7 +100,7 @@ impl RemoveUserStatement {
 				let txn = ctx.tx();
 				// Get the definition
 				let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
-				let us = match txn.get_db_user(ns, db, &name).await? {
+				let us = match txn.get_db_user(ns, db, &name, None).await? {
 					Some(x) => x,
 					None => {
 						if self.if_exists {

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod helpers;
 use helpers::*;
 use surrealdb_core::iam::Level;
@@ -5,7 +7,7 @@ use surrealdb_core::syn;
 use surrealdb_types::Value;
 
 #[macro_use]
-mod util;
+mod remove_macros;
 
 use std::collections::HashMap;
 
@@ -20,7 +22,7 @@ async fn remove_statement_table() -> Result<()> {
 		REMOVE TABLE test;
 		INFO FOR DB;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 3);
@@ -62,7 +64,7 @@ async fn remove_statement_namespace() -> Result<()> {
 			DEFINE NAMESPACE test;
 			REMOVE NAMESPACE test;
 		";
-		let dbs = new_ds("x", "x").await?;
+		let (_, dbs) = new_ds("x", "x", false).await?;
 		let ses = Session::owner();
 		let res = &mut dbs.execute(sql, &ses, None).await?;
 		assert_eq!(res.len(), 3);
@@ -83,7 +85,7 @@ async fn remove_statement_namespace() -> Result<()> {
 			DEFINE NAMESPACE test;
 			REMOVE NAMESPACE test;
 		";
-		let dbs = new_ds("x", "x").await?;
+		let (_, dbs) = new_ds("x", "x", false).await?;
 		// No namespace is selected
 		let ses = Session::owner().with_ns("test");
 		let res = &mut dbs.execute(sql, &ses, None).await?;
@@ -110,7 +112,7 @@ async fn remove_statement_database() -> Result<()> {
 			DEFINE DATABASE test;
 			REMOVE DATABASE test;
 		";
-		let dbs = new_ds("x", "x").await?;
+		let (_, dbs) = new_ds("x", "x", false).await?;
 		let ses = Session::owner().with_ns("test");
 		let res = &mut dbs.execute(sql, &ses, None).await?;
 		assert_eq!(res.len(), 3);
@@ -131,7 +133,7 @@ async fn remove_statement_database() -> Result<()> {
 			DEFINE DATABASE test;
 			REMOVE DATABASE test;
 		";
-		let dbs = new_ds("other", "other").await?;
+		let (_, dbs) = new_ds("other", "other", false).await?;
 		// No database is selected
 		let ses = Session::owner().with_ns("test").with_db("test");
 		let res = &mut dbs.execute(sql, &ses, None).await?;
@@ -156,7 +158,7 @@ async fn remove_statement_analyzer() -> Result<()> {
 		REMOVE ANALYZER english;
 		INFO FOR DB;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 3);
@@ -202,7 +204,7 @@ async fn remove_statement_index() -> Result<()> {
 		REMOVE INDEX ft_title ON book;
 		INFO FOR TABLE book;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 9);
@@ -232,7 +234,7 @@ async fn should_not_error_when_remove_table_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE TABLE IF EXISTS foo;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -252,7 +254,7 @@ async fn should_not_error_when_remove_analyzer_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE ANALYZER IF EXISTS foo;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -272,7 +274,7 @@ async fn should_not_error_when_remove_database_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE DATABASE IF EXISTS foo;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -292,7 +294,7 @@ async fn should_not_error_when_remove_event_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE EVENT IF EXISTS foo ON bar;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -312,7 +314,7 @@ async fn should_not_error_when_remove_field_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE FIELD IF EXISTS foo ON bar;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -332,7 +334,7 @@ async fn should_not_error_when_remove_function_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE FUNCTION IF EXISTS fn::foo;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -352,7 +354,7 @@ async fn should_not_error_when_remove_index_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE INDEX IF EXISTS foo ON bar;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -372,7 +374,7 @@ async fn should_not_error_when_remove_namespace_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE NAMESPACE IF EXISTS foo;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -392,7 +394,7 @@ async fn should_not_error_when_remove_param_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE PARAM IF EXISTS $foo;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -412,7 +414,7 @@ async fn should_not_error_when_remove_access_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE ACCESS IF EXISTS foo ON DB;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -432,7 +434,7 @@ async fn should_not_error_when_remove_user_if_exists() -> Result<()> {
 		USE NS test DB test;
 		REMOVE USER IF EXISTS foo ON ROOT;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);

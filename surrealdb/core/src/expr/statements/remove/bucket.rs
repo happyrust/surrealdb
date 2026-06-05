@@ -35,14 +35,14 @@ impl RemoveBucketStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Bucket, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Bucket, Base::Db)?;
 		// Compute the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "bucket name").await?;
 		// Get the transaction
 		let txn = ctx.tx();
 		// Get the definition
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
-		let Some(bu) = txn.get_db_bucket(ns, db, &name).await? else {
+		let Some(bu) = txn.get_db_bucket(ns, db, &name, None).await? else {
 			if self.if_exists {
 				return Ok(Value::None);
 			} else {

@@ -37,8 +37,6 @@ impl ForeachStatement {
 		self.range.read_only() && self.block.read_only()
 	}
 	/// Process this type returning a computed simple Value
-	///
-	/// Was marked recursive
 	#[instrument(level = "trace", name = "ForeachStatement::compute", skip_all)]
 	pub(crate) async fn compute(
 		&self,
@@ -70,7 +68,7 @@ impl ForeachStatement {
 				return Err(ControlFlow::from(anyhow::Error::new(Error::QueryTimedout(d.into()))));
 			}
 			// Duplicate context
-			let ctx = Context::new(ctx).freeze();
+			let ctx = Context::new_child(ctx).freeze();
 			// Set the current parameter
 			let key = self.param.as_str().to_owned();
 			let mut ctx = Context::unfreeze(ctx)?;

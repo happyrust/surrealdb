@@ -8,7 +8,7 @@
 //! entries stored in `IndexCountKey` for the matching COUNT index.  This is
 //! O(index entries) with no record I/O.
 //!
-//! The planner emits this operator when:
+//! The planner emits this operator (via `is_indexed_count_eligible`) when:
 //! - Fields are count-all-only
 //! - GROUP ALL is present
 //! - A WHERE clause is present
@@ -24,13 +24,13 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tracing::instrument;
 
 use crate::catalog::{DatabaseId, Index, NamespaceId, Permission};
 use crate::err::Error;
+use crate::exec::index::access_path::{BTreeAccess, IndexRef};
 use crate::exec::permission::{
-	PhysicalPermission, convert_permission_to_physical, should_check_perms,
+	PhysicalPermission, convert_permission_to_physical_runtime, should_check_perms,
 	validate_record_user_access,
 };
 use crate::exec::{
@@ -48,13 +48,8 @@ use crate::val::{Number, Object, TableName, Value};
 /// Optimized operator for `SELECT count() FROM <table> WHERE <cond> GROUP ALL`
 /// when a matching COUNT index exists.
 ///
-/// Falls back to full scan + filter + count if no matching COUNT index is found
-/// at execution time.
-///
-/// NOTE: This operator is fully implemented but not yet auto-detected by the
-/// planner because the planner cannot verify COUNT index existence at plan time.
-/// It will be wired in once plan-time catalog access is available.
-#[allow(dead_code)] // Ready for use when plan-time index detection is added.
+/// Falls back to B-tree index key counting (when a covering B-tree index is
+/// available) or full scan + filter + count if no index can service the query.
 #[derive(Debug, Clone)]
 pub struct IndexCountScan {
 	/// Expression that evaluates to the table name.
@@ -64,24 +59,26 @@ pub struct IndexCountScan {
 	/// The AST-level WHERE condition for exact matching against COUNT index
 	/// conditions.
 	pub(crate) condition: Cond,
-	/// Optional VERSION timestamp for time-travel queries.
-	pub(crate) version: Option<u64>,
+	/// Optional VERSION expression for time-travel queries.
+	pub(crate) version: Option<Arc<dyn PhysicalExpr>>,
 	/// Output field names for the count result (one per SELECT field).
 	/// For `SELECT count() as c FROM t WHERE ... GROUP ALL` this would be `["c"]`.
 	/// For `SELECT count() FROM t WHERE ... GROUP ALL` this would be `["count"]`.
 	pub(crate) field_names: Vec<String>,
+	/// Optional B-tree index access path for key-only counting when no
+	/// matching COUNT index exists.  The planner resolves this from the
+	/// same index analysis it performs for regular queries.
+	pub(crate) btree_access: Option<(IndexRef, BTreeAccess)>,
 	/// Per-operator runtime metrics for EXPLAIN ANALYZE.
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
 
 impl IndexCountScan {
-	/// Create a new IndexCountScan operator.
-	#[allow(dead_code)]
 	pub(crate) fn new(
 		source: Arc<dyn PhysicalExpr>,
 		predicate: Arc<dyn PhysicalExpr>,
 		condition: Cond,
-		version: Option<u64>,
+		version: Option<Arc<dyn PhysicalExpr>>,
 		field_names: Vec<String>,
 	) -> Self {
 		debug_assert!(!field_names.is_empty(), "IndexCountScan requires at least one field name");
@@ -91,13 +88,17 @@ impl IndexCountScan {
 			condition,
 			version,
 			field_names,
+			btree_access: None,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
 	}
-}
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
+	/// Set the B-tree index access path for key-only counting.
+	pub(crate) fn with_btree_access(mut self, access: Option<(IndexRef, BTreeAccess)>) -> Self {
+		self.btree_access = access;
+		self
+	}
+}
 impl ExecOperator for IndexCountScan {
 	fn name(&self) -> &'static str {
 		"IndexCountScan"
@@ -143,8 +144,9 @@ impl ExecOperator for IndexCountScan {
 		let source_expr = Arc::clone(&self.source);
 		let predicate_expr = Arc::clone(&self.predicate);
 		let condition = self.condition.clone();
-		let version = self.version;
+		let version = self.version.clone();
 		let field_names = self.field_names.clone();
+		let btree_access = self.btree_access.clone();
 		let ctx = ctx.clone();
 
 		let stream = async_stream::try_stream! {
@@ -152,6 +154,20 @@ impl ExecOperator for IndexCountScan {
 			let txn = ctx.txn();
 			let ns = Arc::clone(&db_ctx.ns_ctx.ns);
 			let db = Arc::clone(&db_ctx.db);
+
+			// Evaluate VERSION expression to a timestamp
+			let version: Option<u64> = match &version {
+				Some(expr) => {
+					let eval_ctx = EvalContext::from_exec_ctx(&ctx);
+					let v = expr.evaluate(eval_ctx).await?;
+					Some(
+						v.cast_to::<crate::val::Datetime>()
+							.map_err(|e| anyhow::anyhow!("{e}"))?
+							.to_version_stamp(txn.timestamp_impl().as_ref())?,
+					)
+				}
+				None => ctx.version_stamp(),
+			};
 
 			// Evaluate source expression to get the table name.
 			let eval_ctx = EvalContext::from_exec_ctx(&ctx);
@@ -169,7 +185,7 @@ impl ExecOperator for IndexCountScan {
 
 			// Verify table exists.
 			let table_def = db_ctx
-				.get_table_def(&table_name)
+				.get_table_def(&table_name, version)
 				.await
 				.context("Failed to get table")?;
 
@@ -185,7 +201,8 @@ impl ExecOperator for IndexCountScan {
 					Some(def) => def.permissions.select.clone(),
 					None => Permission::None,
 				};
-				convert_permission_to_physical(&catalog_perm, ctx.ctx()).await
+				convert_permission_to_physical_runtime(&catalog_perm, ctx.ctx())
+					.await
 					.context("Failed to convert permission")?
 			} else {
 				PhysicalPermission::Allow
@@ -218,7 +235,7 @@ impl ExecOperator for IndexCountScan {
 
 			// Look up all indexes for the table (using the execution-level cache).
 			let indexes = db_ctx
-				.get_table_indexes(&table_name)
+				.get_table_indexes(&table_name, version)
 				.await
 				.context("Failed to fetch table indexes")?;
 
@@ -240,6 +257,19 @@ impl ExecOperator for IndexCountScan {
 					db.database_id,
 					&table_name,
 					ix_def.index_id,
+				)
+				.await?;
+				yield make_count_batch(count, &field_names);
+			} else if let Some((ref ix_ref, ref access)) = btree_access {
+				// Medium path: count entries by iterating B-tree index
+				// keys only — no record value deserialization.
+				let count = count_btree_index_keys(
+					&ctx,
+					&txn,
+					ns.namespace_id,
+					db.database_id,
+					ix_ref,
+					access,
 				)
 				.await?;
 				yield make_count_batch(count, &field_names);
@@ -288,7 +318,7 @@ fn make_count_batch(count: usize, field_names: &[String]) -> ValueBatch {
 }
 
 /// Sum the delta entries in `IndexCountKey` for a given COUNT index.
-async fn sum_index_count_deltas(
+pub(crate) async fn sum_index_count_deltas(
 	ctx: &ExecutionContext,
 	txn: &crate::kvs::Transaction,
 	ns: NamespaceId,
@@ -296,26 +326,25 @@ async fn sum_index_count_deltas(
 	tb: &TableName,
 	ix: crate::catalog::IndexId,
 ) -> Result<usize, ControlFlow> {
-	use futures::StreamExt;
-
 	let range =
 		IndexCountKey::range(ns, db, tb, ix).context("Failed to compute index count key range")?;
-	let key_stream = txn.stream_keys(
-		range,
-		None, // no version
-		None, // no limit
-		0,    // no skip
-		crate::idx::planner::ScanDirection::Forward,
-	);
-	futures::pin_mut!(key_stream);
-
+	let mut cursor = txn
+		.open_keys_cursor(range, crate::idx::planner::ScanDirection::Forward, 0, None)
+		.await
+		.context("Failed to open index-count cursor")?;
 	let mut count: i64 = 0;
-	while let Some(batch_result) = key_stream.next().await {
+	loop {
 		if ctx.cancellation().is_cancelled() {
 			return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
 		}
-		let keys = batch_result.context("Failed to scan index count keys")?;
-		for key in &keys {
+		let batch = cursor
+			.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
+			.await
+			.context("Failed to scan index count keys")?;
+		if batch.is_empty() {
+			break;
+		}
+		for key in &batch {
 			let iu = IndexCountKey::decode_key(key).context("Failed to decode index count key")?;
 			if iu.pos {
 				count += iu.count as i64;
@@ -340,40 +369,37 @@ async fn count_with_filter_fallback(
 	permission: &PhysicalPermission,
 	predicate: &Arc<dyn PhysicalExpr>,
 ) -> Result<usize, ControlFlow> {
-	use futures::StreamExt;
-
 	use crate::exec::permission::PhysicalPermission;
 
 	let txn = ctx.txn();
 	let beg = record::prefix(ns_id, db_id, table_name)?;
 	let end = record::suffix(ns_id, db_id, table_name)?;
 
-	let kv_stream = txn.stream_keys_vals(
-		beg..end,
-		version,
-		None, // no limit
-		0,    // no skip
-		crate::idx::planner::ScanDirection::Forward,
-		false, // no prefetch for count scans
-	);
-	futures::pin_mut!(kv_stream);
-
+	let mut cursor = txn
+		.open_vals_cursor(beg..end, crate::idx::planner::ScanDirection::Forward, 0, version)
+		.await
+		.context("Failed to open scan cursor")?;
 	let mut count = 0usize;
-	while let Some(result) = kv_stream.next().await {
+	loop {
 		if ctx.cancellation().is_cancelled() {
 			return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
 		}
-		let entries = result.context("Failed to scan record")?;
-		for (key, val) in entries {
-			let decoded_key = crate::key::record::RecordKey::decode_key(&key)
+		let batch = cursor
+			.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
+			.await
+			.context("Failed to scan record")?;
+		if batch.is_empty() {
+			break;
+		}
+		for (key, val) in &batch {
+			let decoded_key = crate::key::record::RecordKey::decode_key(key)
 				.context("Failed to decode record key")?;
 			let rid_val = crate::val::RecordId {
 				table: decoded_key.tb.into_owned(),
 				key: decoded_key.id,
 			};
-			let mut record = crate::catalog::Record::kv_decode_value(val)
+			let record = crate::catalog::Record::kv_decode_value(val, rid_val)
 				.context("Failed to deserialize record")?;
-			record.data.def(rid_val);
 			let value = record.data;
 
 			// Check per-record permission first.
@@ -400,6 +426,167 @@ async fn count_with_filter_fallback(
 			if matches {
 				count += 1;
 			}
+		}
+	}
+
+	Ok(count)
+}
+
+/// Count matching records by iterating B-tree index keys only.
+///
+/// This is much faster than the full-scan fallback because it avoids
+/// reading and deserializing record values.  Each index entry corresponds
+/// to exactly one matching record, so we simply count entries in the
+/// appropriate key range.
+async fn count_btree_index_keys(
+	ctx: &ExecutionContext,
+	txn: &crate::kvs::Transaction,
+	ns_id: NamespaceId,
+	db_id: DatabaseId,
+	index_ref: &IndexRef,
+	access: &BTreeAccess,
+) -> Result<usize, ControlFlow> {
+	use crate::exec::index::iterator::btree::{
+		CompoundEqualIterator, CompoundRangeIterator, IndexEqualIterator, IndexRangeIterator,
+		UniqueEqualIterator, UniqueRangeIterator,
+	};
+	use crate::idx::planner::ScanDirection;
+
+	let ix = index_ref.definition();
+	let is_unique = index_ref.is_unique();
+	let mut count = 0usize;
+
+	match (access, is_unique) {
+		(BTreeAccess::Equality(value), true) => {
+			let mut iter = UniqueEqualIterator::new(ns_id, db_id, ix, value)
+				.context("Failed to create unique equal iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(BTreeAccess::Equality(value), false) => {
+			// Non-unique equality: iterate all matching entries.
+			let mut iter = IndexEqualIterator::new(ns_id, db_id, ix, value)
+				.context("Failed to create index equal iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Range {
+				from,
+				to,
+			},
+			true,
+		) => {
+			let mut iter = UniqueRangeIterator::new(
+				ns_id,
+				db_id,
+				ix,
+				from.as_ref(),
+				to.as_ref(),
+				ScanDirection::Forward,
+			)
+			.context("Failed to create unique range iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Range {
+				from,
+				to,
+			},
+			false,
+		) => {
+			let mut iter = IndexRangeIterator::new(
+				ns_id,
+				db_id,
+				ix,
+				from.as_ref(),
+				to.as_ref(),
+				ScanDirection::Forward,
+			)
+			.context("Failed to create index range iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Compound {
+				prefix,
+				range: Some(range),
+			},
+			_,
+		) => {
+			let mut iter =
+				CompoundRangeIterator::new(ns_id, db_id, ix, prefix, range, ScanDirection::Forward)
+					.context("Failed to create compound range iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn, 1000).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Compound {
+				prefix,
+				range: None,
+			},
+			_,
+		) => {
+			let mut iter =
+				CompoundEqualIterator::new(ns_id, db_id, ix, prefix, None, ScanDirection::Forward)
+					.context("Failed to create compound equal iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn, 1000).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		// FullText and Knn are not supported for counting.
+		_ => {
+			return Err(ControlFlow::Err(anyhow::anyhow!(
+				"Unsupported BTreeAccess type for index key counting"
+			)));
 		}
 	}
 

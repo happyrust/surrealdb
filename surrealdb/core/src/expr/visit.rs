@@ -12,8 +12,11 @@ use crate::expr::statements::access::{
 	AccessStatementGrant, AccessStatementPurge, AccessStatementRevoke, AccessStatementShow, Subject,
 };
 use crate::expr::statements::alter::{
-	AlterDatabaseStatement, AlterDefault, AlterFieldStatement, AlterIndexStatement, AlterKind,
-	AlterNamespaceStatement, AlterSequenceStatement, AlterSystemStatement, AlterTableStatement,
+	AlterAccessStatement, AlterAnalyzerStatement, AlterApiClause, AlterApiStatement,
+	AlterBucketStatement, AlterConfigStatement, AlterDatabaseStatement, AlterDefault,
+	AlterEventStatement, AlterFieldStatement, AlterFunctionStatement, AlterIndexStatement,
+	AlterKind, AlterModuleStatement, AlterNamespaceStatement, AlterParamStatement,
+	AlterSequenceStatement, AlterSystemStatement, AlterTableStatement, AlterUserStatement,
 };
 use crate::expr::statements::define::config::ConfigInner;
 use crate::expr::statements::define::config::api::ApiConfig;
@@ -33,11 +36,11 @@ use crate::expr::statements::{
 	DefineTableStatement, DefineUserStatement, DeleteStatement, ForeachStatement, IfelseStatement,
 	InfoStatement, InsertStatement, KillStatement, LiveFields, LiveStatement, OptionStatement,
 	OutputStatement, RelateStatement, RemoveAccessStatement, RemoveAnalyzerStatement,
-	RemoveDatabaseStatement, RemoveEventStatement, RemoveFieldStatement, RemoveFunctionStatement,
-	RemoveIndexStatement, RemoveModelStatement, RemoveModuleStatement, RemoveNamespaceStatement,
-	RemoveParamStatement, RemoveStatement, RemoveTableStatement, RemoveUserStatement,
-	SelectStatement, SetStatement, ShowStatement, SleepStatement, UpdateStatement, UpsertStatement,
-	UseStatement,
+	RemoveConfigStatement, RemoveDatabaseStatement, RemoveEventStatement, RemoveFieldStatement,
+	RemoveFunctionStatement, RemoveIndexStatement, RemoveModelStatement, RemoveModuleStatement,
+	RemoveNamespaceStatement, RemoveParamStatement, RemoveStatement, RemoveTableStatement,
+	RemoveUserStatement, SelectStatement, SetStatement, ShowStatement, SleepStatement,
+	UpdateStatement, UpsertStatement, UseStatement,
 };
 use crate::expr::{
 	AccessType, Block, ClosureExpr, Data, Expr, Field, Fields, Function, FunctionCall, Idiom,
@@ -350,9 +353,58 @@ implement_visitor! {
 			AlterStatement::Namespace(a)=>{ this.visit_alter_namespace(a)?; },
 			AlterStatement::Database(a)=>{ this.visit_alter_database(a)?; },
 			AlterStatement::Table(a)=>{ this.visit_alter_table(a)?; },
+			AlterStatement::Event(a)=>{ this.visit_alter_event(a)?; },
 			AlterStatement::Index(a) => { this.visit_alter_index(a)?; },
 			AlterStatement::Sequence(a) => { this.visit_alter_sequence(a)?; },
 			AlterStatement::Field(a) => { this.visit_alter_field(a)?; },
+			AlterStatement::Param(a) => { this.visit_alter_param(a)?; },
+			AlterStatement::Bucket(a) => { this.visit_alter_bucket(a)?; },
+			AlterStatement::Config(a) => { this.visit_alter_config(a)?; },
+			AlterStatement::Analyzer(a) => { this.visit_alter_analyzer(a)?; },
+			AlterStatement::Function(a) => { this.visit_alter_function(a)?; },
+			AlterStatement::Access(a) => { this.visit_alter_access(a)?; },
+			AlterStatement::User(a) => { this.visit_alter_user(a)?; },
+			AlterStatement::Api(a) => { this.visit_alter_api(a)?; },
+			AlterStatement::Module(a) => { this.visit_alter_module(a)?; },
+		}
+		Ok(())
+	}
+
+	fn visit_alter_module(this, a: &AlterModuleStatement){
+		if let Some(ref p) = a.permissions {
+			this.visit_permission(p)?;
+		}
+		Ok(())
+	}
+
+	fn visit_alter_user(this, a: &AlterUserStatement){
+		this.visit_expr(&a.name)?;
+		Ok(())
+	}
+
+	fn visit_alter_api(this, a: &AlterApiStatement){
+		for clause in &a.clauses {
+			match clause {
+				AlterApiClause::ForAny { fallback, .. } => {
+					if let AlterKind::Set(x) = fallback {
+						this.visit_expr(x)?;
+					}
+				}
+				AlterApiClause::SetAction(action) => {
+					this.visit_expr(&action.action)?;
+				}
+				AlterApiClause::DropAction { .. } => {}
+			}
+		}
+		Ok(())
+	}
+
+	fn visit_alter_access(this, a: &AlterAccessStatement){
+		this.visit_expr(&a.name)?;
+		match a.authenticate {
+			AlterKind::None |
+			AlterKind::Drop => {},
+			AlterKind::Set(ref x) => this.visit_expr(x)?,
 		}
 		Ok(())
 	}
@@ -370,22 +422,85 @@ implement_visitor! {
 	}
 
 	fn visit_alter_table(this, a: &AlterTableStatement){
+		this.visit_expr(&a.name)?;
 		if let Some(p) = a.permissions.as_ref(){
 			this.visit_permissions(p)?;
 		}
 		Ok(())
 	}
 
+	fn visit_alter_event(this, a: &AlterEventStatement){
+		this.visit_expr(&a.name)?;
+		this.visit_expr(&a.what)?;
+		match a.when {
+			AlterKind::None |
+			AlterKind::Drop => {},
+			AlterKind::Set(ref x) => this.visit_expr(x)?,
+		}
+		match a.then {
+			AlterKind::None |
+			AlterKind::Drop => {},
+			AlterKind::Set(ref v) => {
+				for x in v.iter() {
+					this.visit_expr(x)?;
+				}
+			},
+		}
+		Ok(())
+	}
+
 	fn visit_alter_index(this, a: &AlterIndexStatement){
+		this.visit_expr(&a.name)?;
+		this.visit_expr(&a.table)?;
 		Ok(())
 	}
 
 	fn visit_alter_sequence(this, a: &AlterSequenceStatement){
+		this.visit_expr(&a.name)?;
+		if let Some(ref t) = a.timeout {
+			this.visit_expr(t)?;
+		}
+		Ok(())
+	}
+
+	fn visit_alter_param(this, a: &AlterParamStatement){
+		if let Some(ref x) = a.value {
+			this.visit_expr(x)?;
+		}
+		if let Some(ref p) = a.permissions {
+			this.visit_permission(p)?;
+		}
+		Ok(())
+	}
+
+	fn visit_alter_bucket(this, a: &AlterBucketStatement){
+		this.visit_expr(&a.name)?;
+		if let Some(ref p) = a.permissions {
+			this.visit_permission(p)?;
+		}
+		Ok(())
+	}
+
+	fn visit_alter_config(this, a: &AlterConfigStatement){
+		this.visit_config_inner(&a.inner)?;
+		Ok(())
+	}
+
+	fn visit_alter_analyzer(this, a: &AlterAnalyzerStatement){
+		this.visit_expr(&a.name)?;
+		Ok(())
+	}
+
+	fn visit_alter_function(this, a: &AlterFunctionStatement){
+		if let Some(ref p) = a.permissions {
+			this.visit_permission(p)?;
+		}
 		Ok(())
 	}
 
 	fn visit_alter_field(this, a: &AlterFieldStatement){
-		this.visit_idiom(&a.name)?;
+		this.visit_expr(&a.name)?;
+		this.visit_expr(&a.what)?;
 
 		match a.value {
 			AlterKind::None |
@@ -560,6 +675,9 @@ implement_visitor! {
 			RemoveStatement::Module(r) => {
 				this.visit_remove_module(r)?;
 			},
+			RemoveStatement::Config(r) => {
+				this.visit_remove_config(r)?;
+			},
 		}
 		Ok(())
 	}
@@ -579,6 +697,10 @@ implement_visitor! {
 	}
 
 	fn visit_remove_module(this, r: &RemoveModuleStatement){
+		Ok(())
+	}
+
+	fn visit_remove_config(this, r: &RemoveConfigStatement){
 		Ok(())
 	}
 
@@ -683,8 +805,8 @@ implement_visitor! {
 
 	fn visit_info(this, i: &InfoStatement){
 		match i{
-			InfoStatement::Root(_) |
-			InfoStatement::Ns(_) => {}
+			InfoStatement::Root(_, expr) |
+			InfoStatement::Ns(_, expr) |
 			InfoStatement::Db(_, expr) => {
 				if let Some(e) = expr.as_ref(){
 					this.visit_expr(e)?;
@@ -1758,9 +1880,58 @@ implement_visitor_mut! {
 			AlterStatement::Namespace(a)=>{ this.visit_mut_alter_namespace(a)?;},
 			AlterStatement::Database(a)=>{ this.visit_mut_alter_database(a)?;},
 			AlterStatement::Table(a)=>{ this.visit_mut_alter_table(a)?;},
+			AlterStatement::Event(a)=>{ this.visit_mut_alter_event(a)?;},
 			AlterStatement::Index(a)=>{ this.visit_mut_alter_index(a)?;},
 			AlterStatement::Sequence(a) => { this.visit_mut_alter_sequence(a)?; },
 			AlterStatement::Field(a) => { this.visit_mut_alter_field(a)?; },
+			AlterStatement::Param(a) => { this.visit_mut_alter_param(a)?; },
+			AlterStatement::Bucket(a) => { this.visit_mut_alter_bucket(a)?; },
+			AlterStatement::Config(a) => { this.visit_mut_alter_config(a)?; },
+			AlterStatement::Analyzer(a) => { this.visit_mut_alter_analyzer(a)?; },
+			AlterStatement::Function(a) => { this.visit_mut_alter_function(a)?; },
+			AlterStatement::Access(a) => { this.visit_mut_alter_access(a)?; },
+			AlterStatement::User(a) => { this.visit_mut_alter_user(a)?; },
+			AlterStatement::Api(a) => { this.visit_mut_alter_api(a)?; },
+			AlterStatement::Module(a) => { this.visit_mut_alter_module(a)?; },
+		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_module(this, a: &mut AlterModuleStatement){
+		if let Some(ref mut p) = a.permissions {
+			this.visit_mut_permission(p)?;
+		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_user(this, a: &mut AlterUserStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		Ok(())
+	}
+
+	fn visit_mut_alter_api(this, a: &mut AlterApiStatement){
+		for clause in &mut a.clauses {
+			match clause {
+				AlterApiClause::ForAny { fallback, .. } => {
+					if let AlterKind::Set(x) = fallback {
+						this.visit_mut_expr(x)?;
+					}
+				}
+				AlterApiClause::SetAction(action) => {
+					this.visit_mut_expr(&mut action.action)?;
+				}
+				AlterApiClause::DropAction { .. } => {}
+			}
+		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_access(this, a: &mut AlterAccessStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		match a.authenticate {
+			AlterKind::None |
+			AlterKind::Drop => {},
+			AlterKind::Set(ref mut x) => this.visit_mut_expr(x)?,
 		}
 		Ok(())
 	}
@@ -1778,22 +1949,85 @@ implement_visitor_mut! {
 	}
 
 	fn visit_mut_alter_table(this, a: &mut AlterTableStatement){
+		this.visit_mut_expr(&mut a.name)?;
 		if let Some(p) = a.permissions.as_mut(){
 			this.visit_mut_permissions(p)?;
 		}
 		Ok(())
 	}
 
+	fn visit_mut_alter_event(this, a: &mut AlterEventStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		this.visit_mut_expr(&mut a.what)?;
+		match a.when {
+			AlterKind::None |
+			AlterKind::Drop => {},
+			AlterKind::Set(ref mut x) => this.visit_mut_expr(x)?,
+		}
+		match a.then {
+			AlterKind::None |
+			AlterKind::Drop => {},
+			AlterKind::Set(ref mut v) => {
+				for x in v.iter_mut() {
+					this.visit_mut_expr(x)?;
+				}
+			},
+		}
+		Ok(())
+	}
+
 	fn visit_mut_alter_index(this, a: &mut AlterIndexStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		this.visit_mut_expr(&mut a.table)?;
+		Ok(())
+	}
+
+	fn visit_mut_alter_param(this, a: &mut AlterParamStatement){
+		if let Some(ref mut x) = a.value {
+			this.visit_mut_expr(x)?;
+		}
+		if let Some(ref mut p) = a.permissions {
+			this.visit_mut_permission(p)?;
+		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_bucket(this, a: &mut AlterBucketStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		if let Some(ref mut p) = a.permissions {
+			this.visit_mut_permission(p)?;
+		}
+		Ok(())
+	}
+
+	fn visit_mut_alter_config(this, a: &mut AlterConfigStatement){
+		this.visit_mut_config_inner(&mut a.inner)?;
+		Ok(())
+	}
+
+	fn visit_mut_alter_analyzer(this, a: &mut AlterAnalyzerStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		Ok(())
+	}
+
+	fn visit_mut_alter_function(this, a: &mut AlterFunctionStatement){
+		if let Some(ref mut p) = a.permissions {
+			this.visit_mut_permission(p)?;
+		}
 		Ok(())
 	}
 
 	fn visit_mut_alter_sequence(this, a: &mut AlterSequenceStatement){
+		this.visit_mut_expr(&mut a.name)?;
+		if let Some(ref mut t) = a.timeout {
+			this.visit_mut_expr(t)?;
+		}
 		Ok(())
 	}
 
 	fn visit_mut_alter_field(this, a: &mut AlterFieldStatement){
-		this.visit_mut_idiom(&mut a.name)?;
+		this.visit_mut_expr(&mut a.name)?;
+		this.visit_mut_expr(&mut a.what)?;
 
 		match a.value {
 			AlterKind::None |
@@ -1968,6 +2202,9 @@ implement_visitor_mut! {
 			RemoveStatement::Module(r) => {
 				this.visit_mut_remove_module(r)?;
 			},
+			RemoveStatement::Config(r) => {
+				this.visit_mut_remove_config(r)?;
+			},
 		}
 		Ok(())
 	}
@@ -1987,6 +2224,10 @@ implement_visitor_mut! {
 	}
 
 	fn visit_mut_remove_module(this, r: &mut RemoveModuleStatement){
+		Ok(())
+	}
+
+	fn visit_mut_remove_config(this, r: &mut RemoveConfigStatement){
 		Ok(())
 	}
 
@@ -2091,8 +2332,8 @@ implement_visitor_mut! {
 
 	fn visit_mut_info(this, i: &mut InfoStatement){
 		match i{
-			InfoStatement::Root(_) |
-			InfoStatement::Ns(_) => {}
+			InfoStatement::Root(_, expr) |
+			InfoStatement::Ns(_, expr) |
 			InfoStatement::Db(_, expr) => {
 				if let Some(e) = expr.as_mut(){
 					this.visit_mut_expr(e)?;
@@ -2251,8 +2492,7 @@ implement_visitor_mut! {
 	fn visit_mut_config_inner(this, d: &mut ConfigInner){
 		match d {
 			ConfigInner::GraphQL(graph_qlconfig) => {
-				// TODO: Reintroduce once graphql is fixed.
-				//this.visit_mut_graphql_config(graph_qlconfig)?;
+				this.visit_mut_graphql_config(graph_qlconfig)?;
 			},
 			ConfigInner::Api(api_config) => {
 				this.visit_mut_api_config(api_config)?;
@@ -2261,6 +2501,10 @@ implement_visitor_mut! {
 				this.visit_mut_default_config(default_config)?;
 			},
 		}
+		Ok(())
+	}
+
+	fn visit_mut_graphql_config(this, d: &mut GraphQLConfig){
 		Ok(())
 	}
 

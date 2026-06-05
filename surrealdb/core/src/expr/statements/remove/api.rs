@@ -35,7 +35,7 @@ impl RemoveApiStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Api, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Api, Base::Db)?;
 		// Compute the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "api name").await?;
 		// Get the transaction
@@ -43,7 +43,7 @@ impl RemoveApiStatement {
 		// Get the definition
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 		// Check if the api exists
-		let Some(ap) = txn.get_db_api(ns, db, &name).await? else {
+		let Some(ap) = txn.get_db_api(ns, db, &name, None).await? else {
 			if self.if_exists {
 				return Ok(Value::None);
 			} else {

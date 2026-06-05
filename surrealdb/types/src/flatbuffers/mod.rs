@@ -4,11 +4,13 @@ mod kind;
 mod misc;
 mod primitives;
 mod record;
+mod surrealism;
 mod table;
 mod value;
 
 use anyhow::Context;
 
+pub use self::surrealism::*;
 use crate::{Kind, SurrealValue, Value};
 
 /// Trait for converting a type to a flatbuffers builder type.
@@ -76,8 +78,8 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		Array, Bytes, Datetime, Duration, File, Geometry, Number, Range, RecordId, Regex, Table,
-		Uuid, object,
+		Array, Bytes, Datetime, Duration, File, Geometry, Number, Object, Range, RecordId,
+		RecordIdKey, Regex, Table, Uuid, object,
 	};
 
 	#[rstest]
@@ -113,6 +115,19 @@ mod tests {
 	// RecordId
 	#[case::record_id(Value::RecordId(RecordId::new("test_table", 42)))]
 	#[case::record_id(Value::RecordId(RecordId::new("test_table", "test_key")))]
+	#[case::record_id(Value::RecordId(RecordId::new(
+		"test_table", 
+		RecordIdKey::Object(Object(std::collections::BTreeMap::from([
+			("key".to_string(), Value::String("value".to_string()))
+		])))
+	)))]
+	#[case::record_id(Value::RecordId(RecordId::new(
+		"test_table", 
+		RecordIdKey::Array(Array(vec![
+			Value::Number(Number::Int(1)),
+			Value::Number(Number::Int(2)),
+		]))
+	)))]
 	// File
 	#[case::file(Value::File(File::new("test_file", "test_file.txt")))]
 	// Range

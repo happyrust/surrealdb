@@ -1,4 +1,5 @@
 use anyhow::Result;
+use surrealdb_strand::Strand;
 
 use crate::catalog::providers::DatabaseProvider;
 use crate::ctx::FrozenContext;
@@ -9,7 +10,7 @@ use crate::iam::{Action, ResourceKind};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct RemoveParamStatement {
-	pub name: String,
+	pub name: Strand,
 	pub if_exists: bool,
 }
 
@@ -17,12 +18,12 @@ impl RemoveParamStatement {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Parameter, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Parameter, Base::Db)?;
 		// Get the transaction
 		let txn = ctx.tx();
 		// Get the definition
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
-		let pa = match txn.get_db_param(ns, db, &self.name).await {
+		let pa = match txn.get_db_param(ns, db, &self.name, None).await {
 			Ok(x) => x,
 			Err(e) => {
 				if self.if_exists && matches!(e.downcast_ref(), Some(Error::PaNotFound { .. })) {

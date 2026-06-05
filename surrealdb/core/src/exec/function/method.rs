@@ -196,10 +196,11 @@ impl MethodRegistry {
 /// Helper to look up a function from the registry, panicking if not found.
 /// Since these are all builtins, a missing function indicates a registration bug.
 fn get(funcs: &FunctionRegistry, name: &str) -> Arc<dyn ScalarFunction> {
-	funcs
-		.get(name)
-		.unwrap_or_else(|| panic!("Expected builtin function '{}' to be registered", name))
-		.clone()
+	Arc::clone(
+		funcs
+			.get(name)
+			.unwrap_or_else(|| panic!("Expected builtin function '{}' to be registered", name)),
+	)
 }
 
 /// Build the method registry from the function registry.
@@ -267,6 +268,7 @@ pub fn build_method_registry(funcs: &FunctionRegistry) -> MethodRegistry {
 	// Universal methods (available on all value types)
 	// =====================================================================
 	m.register_generic("chain", get(funcs, "value::chain"));
+	m.register_generic("expect", get(funcs, "value::expect"));
 	m.register_generic("diff", get(funcs, "value::diff"));
 	m.register_generic("patch", get(funcs, "value::patch"));
 	m.register_generic("repeat", get(funcs, "array::repeat"));
@@ -535,6 +537,8 @@ pub fn build_method_registry(funcs: &FunctionRegistry) -> MethodRegistry {
 	// Set methods
 	// =====================================================================
 	m.register_typed("add", ValueKind::Set, get(funcs, "set::add"));
+	m.register_typed("all", ValueKind::Set, get(funcs, "set::all"));
+	m.register_typed("any", ValueKind::Set, get(funcs, "set::any"));
 	m.register_typed("at", ValueKind::Set, get(funcs, "set::at"));
 	m.register_typed("complement", ValueKind::Set, get(funcs, "set::complement"));
 	m.register_typed("contains", ValueKind::Set, get(funcs, "set::contains"));
@@ -651,6 +655,13 @@ pub fn build_method_registry(funcs: &FunctionRegistry) -> MethodRegistry {
 	m.register_typed("week", ValueKind::Datetime, get(funcs, "time::week"));
 	m.register_typed("yday", ValueKind::Datetime, get(funcs, "time::yday"));
 	m.register_typed("year", ValueKind::Datetime, get(funcs, "time::year"));
+	m.register_typed("set_year", ValueKind::Datetime, get(funcs, "time::set_year"));
+	m.register_typed("set_month", ValueKind::Datetime, get(funcs, "time::set_month"));
+	m.register_typed("set_day", ValueKind::Datetime, get(funcs, "time::set_day"));
+	m.register_typed("set_hour", ValueKind::Datetime, get(funcs, "time::set_hour"));
+	m.register_typed("set_minute", ValueKind::Datetime, get(funcs, "time::set_minute"));
+	m.register_typed("set_second", ValueKind::Datetime, get(funcs, "time::set_second"));
+	m.register_typed("set_nanosecond", ValueKind::Datetime, get(funcs, "time::set_nanosecond"));
 
 	// =====================================================================
 	// File methods

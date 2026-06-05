@@ -13,7 +13,7 @@ impl Parser<'_> {
 			t!("fn") => {
 				self.pop_peek();
 				expected!(self, t!("::"));
-				let mut name = self.parse_ident()?;
+				let mut name = self.parse_ident()?.into_string();
 				while self.eat(t!("::")) {
 					name.push_str("::");
 					name.push_str(self.parse_ident_str()?);
@@ -31,9 +31,14 @@ impl Parser<'_> {
 				}
 
 				expected!(self, t!("::"));
-				let name = self.parse_ident()?;
+				let name = self.parse_ident()?.into_string();
 				let sub = if self.eat(t!("::")) {
-					Some(self.parse_ident()?)
+					let mut sub = self.parse_ident()?.into_string();
+					while self.eat(t!("::")) {
+						sub.push_str("::");
+						sub.push_str(self.parse_ident_str()?);
+					}
+					Some(sub)
 				} else {
 					None
 				};
@@ -50,9 +55,9 @@ impl Parser<'_> {
 				}
 
 				expected!(self, t!("::"));
-				let org = self.parse_ident()?;
+				let org = self.parse_ident()?.into_string();
 				expected!(self, t!("::"));
-				let pkg = self.parse_ident()?;
+				let pkg = self.parse_ident()?.into_string();
 				expected!(self, t!("<"));
 				let major = self.parse_version_digits()?;
 				expected!(self, t!("."));
@@ -61,7 +66,12 @@ impl Parser<'_> {
 				let patch = self.parse_version_digits()?;
 				expected!(self, t!(">"));
 				let sub = if self.eat(t!("::")) {
-					Some(self.parse_ident()?)
+					let mut sub = self.parse_ident()?.into_string();
+					while self.eat(t!("::")) {
+						sub.push_str("::");
+						sub.push_str(self.parse_ident_str()?);
+					}
+					Some(sub)
 				} else {
 					None
 				};
@@ -79,7 +89,7 @@ impl Parser<'_> {
 				self.pop_peek();
 				expected!(self, t!("::"));
 
-				let mut name = self.parse_ident()?;
+				let mut name = self.parse_ident()?.into_string();
 				while self.eat(t!("::")) {
 					name.push_str("::");
 					name.push_str(self.parse_ident_str()?);
@@ -89,12 +99,12 @@ impl Parser<'_> {
 				let version = format!("{}.{}.{}", major, minor, patch);
 
 				Function::Model(Model {
-					name,
-					version,
+					name: name.into(),
+					version: version.into(),
 				})
 			}
 			TokenKind::Identifier => {
-				let mut name = self.parse_ident()?;
+				let mut name = self.parse_ident()?.into_string();
 				while self.eat(t!("::")) {
 					name.push_str("::");
 					name.push_str(self.parse_ident_str()?)
@@ -126,7 +136,7 @@ impl Parser<'_> {
 		stk: &mut Stk,
 	) -> ParseResult<FunctionCall> {
 		expected!(self, t!("::"));
-		let mut name = self.parse_ident()?;
+		let mut name = self.parse_ident()?.into_string();
 		while self.eat(t!("::")) {
 			name.push_str("::");
 			name.push_str(self.parse_ident_str()?)
@@ -156,9 +166,14 @@ impl Parser<'_> {
 		}
 
 		expected!(self, t!("::"));
-		let name = self.parse_ident()?;
+		let name = self.parse_ident()?.into_string();
 		let sub = if self.eat(t!("::")) {
-			Some(self.parse_ident()?)
+			let mut sub = self.parse_ident()?.into_string();
+			while self.eat(t!("::")) {
+				sub.push_str("::");
+				sub.push_str(self.parse_ident_str()?);
+			}
+			Some(sub)
 		} else {
 			None
 		};
@@ -184,9 +199,9 @@ impl Parser<'_> {
 		}
 
 		expected!(self, t!("::"));
-		let org = self.parse_ident()?;
+		let org = self.parse_ident()?.into_string();
 		expected!(self, t!("::"));
-		let pkg = self.parse_ident()?;
+		let pkg = self.parse_ident()?.into_string();
 		expected!(self, t!("<"));
 		let major = self.parse_version_digits()?;
 		expected!(self, t!("."));
@@ -195,7 +210,12 @@ impl Parser<'_> {
 		let patch = self.parse_version_digits()?;
 		expected!(self, t!(">"));
 		let sub = if self.eat(t!("::")) {
-			Some(self.parse_ident()?)
+			let mut sub = self.parse_ident()?.into_string();
+			while self.eat(t!("::")) {
+				sub.push_str("::");
+				sub.push_str(self.parse_ident_str()?);
+			}
+			Some(sub)
 		} else {
 			None
 		};
@@ -271,7 +291,7 @@ impl Parser<'_> {
 	pub(super) async fn parse_model(&mut self, stk: &mut Stk) -> ParseResult<FunctionCall> {
 		expected!(self, t!("::"));
 
-		let mut name = self.parse_ident()?;
+		let mut name = self.parse_ident()?.into_string();
 		while self.eat(t!("::")) {
 			name.push_str("::");
 			name.push_str(self.parse_ident_str()?)
@@ -296,8 +316,8 @@ impl Parser<'_> {
 		}
 
 		let func = Function::Model(Model {
-			name,
-			version: format!("{}.{}.{}", major, minor, patch),
+			name: name.into(),
+			version: format!("{}.{}.{}", major, minor, patch).into(),
 		});
 
 		Ok(FunctionCall {

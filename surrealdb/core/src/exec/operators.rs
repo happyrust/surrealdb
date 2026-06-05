@@ -24,6 +24,7 @@ mod split;
 mod timeout;
 mod union;
 mod unwrap_exactly_one;
+mod version_scope;
 
 pub use aggregate::{
 	Aggregate, AggregateExprInfo, AggregateField, ExtractedAggregate, aggregate_field_name,
@@ -49,13 +50,13 @@ pub use r#return::ReturnPlan;
 // Scan operators (storage I/O)
 pub use scan::CountScan;
 pub use scan::{
-	DynamicScan, EdgeTableSpec, FullTextScan, GraphEdgeScan, GraphScanOutput, IndexScan, KnnScan,
-	RecordIdScan, ReferenceScan, ReferenceScanOutput, TableScan, UnionIndexScan,
+	DynamicScan, EdgeTableSpec, EmptyScan, FullTextScan, GraphEdgeScan, GraphScanOutput, IndexScan,
+	KnnScan, RecordIdScan, ReferenceScan, ReferenceScanOutput, TableScan, UnionIndexScan,
 };
 pub use sequence::SequencePlan;
 pub use sleep::SleepPlan;
 #[cfg(all(storage, not(target_family = "wasm")))]
-pub use sort::ExternalSort;
+pub use sort::{ExternalSort, ExternalSortByKey};
 pub use sort::{
 	OrderByField, RandomShuffle, Sort, SortByKey, SortDirection, SortKey, SortTopK, SortTopKByKey,
 };
@@ -64,3 +65,4 @@ pub use split::Split;
 pub use timeout::Timeout;
 pub use union::Union;
 pub use unwrap_exactly_one::UnwrapExactlyOne;
+pub use version_scope::VersionScope;

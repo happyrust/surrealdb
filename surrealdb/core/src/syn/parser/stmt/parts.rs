@@ -1,6 +1,7 @@
 //! Contains parsing code for smaller common parts of statements.
 
 use reblessive::Stk;
+use surrealdb_strand::Strand;
 use surrealdb_types::ToSql;
 
 use crate::sql::changefeed::ChangeFeed;
@@ -16,6 +17,7 @@ use crate::syn::parser::{ParseResult, Parser};
 use crate::syn::token::{DistanceKind, Span, TokenKind, VectorTypeKind, t};
 use crate::types::PublicDuration;
 
+#[derive(Clone, Copy)]
 pub(crate) enum MissingKind {
 	Split,
 	Order,
@@ -170,6 +172,13 @@ impl Parser<'_> {
 		idiom: &Idiom,
 		idiom_span: Span,
 	) -> ParseResult<()> {
+		let is_group = matches!(kind, MissingKind::Group);
+
+		// ORDER BY on `SELECT VALUE ...` runs on the full row before VALUE projection.
+		if matches!(kind, MissingKind::Order) && matches!(fields, Fields::Value(_)) {
+			return Ok(());
+		}
+
 		match fields {
 			Fields::Value(field) => {
 				if let Some(alias) = &field.alias
@@ -180,12 +189,13 @@ impl Parser<'_> {
 
 				match &field.expr {
 					Expr::Idiom(x) => {
-						if idiom == x {
+						if idiom == x || (is_group && idiom_is_prefix(idiom, x)) {
 							return Ok(());
 						}
 					}
 					v => {
-						if *idiom == v.to_idiom() {
+						let vi = v.to_idiom();
+						if *idiom == vi || (is_group && idiom_is_prefix(idiom, &vi)) {
 							return Ok(());
 						}
 					}
@@ -206,12 +216,13 @@ impl Parser<'_> {
 
 					match &field.expr {
 						Expr::Idiom(x) => {
-							if idiom == x {
+							if idiom == x || (is_group && idiom_is_prefix(idiom, x)) {
 								return Ok(());
 							}
 						}
 						v => {
-							if *idiom == v.to_idiom() {
+							let vi = v.to_idiom();
+							if *idiom == vi || (is_group && idiom_is_prefix(idiom, &vi)) {
 								return Ok(());
 							}
 						}
@@ -424,12 +435,9 @@ impl Parser<'_> {
 		}
 	}
 
-	// TODO(gguillemas): Deprecated in 2.0.0. Kept for backward compatibility. Drop
-	// it in 3.0.0.
-	/// Parses a base
+	/// Parses a base.
 	///
-	/// So either `NAMESPACE`, `DATABASE`, `ROOT`, or `SCOPE` if `scope_allowed`
-	/// is true.
+	/// Either `NAMESPACE`, `DATABASE`, or `ROOT`.
 	///
 	/// # Parser state
 	/// Expects the next keyword to be a base.
@@ -440,7 +448,7 @@ impl Parser<'_> {
 			t!("DATABASE") => Ok(Base::Db),
 			t!("ROOT") => Ok(Base::Root),
 			_ => {
-				unexpected!(self, next, "'NAMEPSPACE', 'DATABASE' or 'ROOT'")
+				unexpected!(self, next, "'NAMESPACE', 'DATABASE' or 'ROOT'")
 			}
 		}
 	}
@@ -504,9 +512,9 @@ impl Parser<'_> {
 		let fields = self.parse_fields(stk).await?;
 		let fields_span = before_fields.covers(self.recent_span());
 		expected!(self, t!("FROM"));
-		let mut from = vec![self.parse_ident()?];
+		let mut from: Vec<crate::val::TableName> = vec![self.parse_ident_str()?.into()];
 		while self.eat(t!(",")) {
-			from.push(self.parse_ident()?);
+			from.push(self.parse_ident_str()?.into());
 		}
 
 		let cond = self.try_parse_condition(stk).await?;
@@ -527,9 +535,11 @@ impl Parser<'_> {
 				let dist = match k {
 					DistanceKind::Chebyshev => Distance::Chebyshev,
 					DistanceKind::Cosine => Distance::Cosine,
+					DistanceKind::CosineNormalized => Distance::CosineNormalized,
 					DistanceKind::Euclidean => Distance::Euclidean,
 					DistanceKind::Manhattan => Distance::Manhattan,
 					DistanceKind::Hamming => Distance::Hamming,
+					DistanceKind::InnerProduct => Distance::InnerProduct,
 					DistanceKind::Jaccard => Distance::Jaccard,
 
 					DistanceKind::Minkowski => {
@@ -549,26 +559,29 @@ impl Parser<'_> {
 		match next.kind {
 			TokenKind::VectorType(x) => Ok(match x {
 				VectorTypeKind::F64 => VectorType::F64,
+				VectorTypeKind::F16 => VectorType::F16,
 				VectorTypeKind::F32 => VectorType::F32,
 				VectorTypeKind::I64 => VectorType::I64,
 				VectorTypeKind::I32 => VectorType::I32,
 				VectorTypeKind::I16 => VectorType::I16,
+				VectorTypeKind::I8 => VectorType::I8,
+				VectorTypeKind::U8 => VectorType::U8,
 			}),
 			_ => unexpected!(self, next, "a vector type"),
 		}
 	}
 
-	pub fn parse_custom_function_name(&mut self) -> ParseResult<String> {
+	pub fn parse_custom_function_name(&mut self) -> ParseResult<Strand> {
 		expected!(self, t!("fn"));
 		expected!(self, t!("::"));
-		let mut name = self.parse_ident()?;
+		let mut name = self.parse_ident()?.into_string();
 		while self.eat(t!("::")) {
-			let part = self.parse_ident()?;
+			let part = self.parse_ident()?.into_string();
 			name.push_str("::");
-			name.push_str(part.as_str());
+			name.push_str(&part);
 		}
 		// Safety: Parser guarentees no null bytes.
-		Ok(name)
+		Ok(name.into())
 	}
 	pub(super) fn try_parse_explain(&mut self) -> ParseResult<Option<Explain>> {
 		Ok(self.eat(t!("EXPLAIN")).then(|| Explain(self.eat(t!("FULL")))))
@@ -586,9 +599,9 @@ impl Parser<'_> {
 				With::NoIndex
 			}
 			t!("INDEX") => {
-				let mut index = vec![self.parse_ident()?];
+				let mut index = vec![self.parse_ident()?.into_string()];
 				while self.eat(t!(",")) {
-					index.push(self.parse_ident()?);
+					index.push(self.parse_ident()?.into_string());
 				}
 				With::Index(index)
 			}
@@ -596,4 +609,13 @@ impl Parser<'_> {
 		};
 		Ok(Some(with))
 	}
+}
+
+/// Check whether `prefix` is a strict prefix of `full`. For GROUP BY
+/// validation this allows `GROUP BY in` when the SELECT contains `in.name`,
+/// since the selected sub-path is functionally dependent on the group key.
+fn idiom_is_prefix(prefix: &Idiom, full: &Idiom) -> bool {
+	let pp = &prefix.0;
+	let fp = &full.0;
+	pp.len() < fp.len() && fp.starts_with(pp)
 }

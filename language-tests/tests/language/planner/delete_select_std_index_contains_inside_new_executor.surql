@@ -1,5 +1,8 @@
 /**
 
+[env]
+planner-strategy = ["all-ro"]
+
 [test]
 
 [[test.results]]
@@ -10,7 +13,7 @@ value = "[{ email: 'email@domain.com', id: test:1 }]"
 
 [[test.results]]
 value = '''"SelectProject [ctx: Db] [projections: *] {rows: 1}
-    TableScan [ctx: Db] [table: test, direction: Forward, predicate: email CONTAINS 'domain.com'] {rows: 1}
+    TableScan [ctx: Db] [table: test, direction: Forward, predicate: email CONTAINS 'domain.com', pre_decode_filter: yes] {rows: 1}
 
 Total rows: 1"'''
 
@@ -19,7 +22,7 @@ value = "[{ email: 'email@domain.com', id: test:1 }]"
 
 [[test.results]]
 value = '''"SelectProject [ctx: Db] [projections: *] {rows: 1}
-    TableScan [ctx: Db] [table: test, direction: Forward, predicate: 'domain.com' INSIDE email] {rows: 1}
+    TableScan [ctx: Db] [table: test, direction: Forward, predicate: 'domain.com' INSIDE email, pre_decode_filter: yes] {rows: 1}
 
 Total rows: 1"'''
 
@@ -28,7 +31,7 @@ value = "[{ email: 'email@domain.com', id: test:1 }]"
 
 [[test.results]]
 value = '''"SelectProject [ctx: Db] [projections: *] {rows: 1}
-    TableScan [ctx: Db] [table: test, direction: Forward, predicate: email CONTAINS 'domain.com'] {rows: 1}
+    TableScan [ctx: Db] [table: test, direction: Forward, predicate: email CONTAINS 'domain.com', pre_decode_filter: yes] {rows: 1}
 
 Total rows: 1"'''
 

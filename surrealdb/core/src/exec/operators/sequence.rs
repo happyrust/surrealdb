@@ -11,17 +11,16 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::stream;
 use surrealdb_types::{SqlFormat, ToSql};
 
-use crate::ctx::{Context, FrozenContext};
+use crate::ctx::FrozenContext;
 use crate::err::Error;
 use crate::exec::context::{ContextLevel, ExecutionContext};
 use crate::exec::plan_or_compute::{block_required_context, collect_stream, legacy_compute};
 use crate::exec::planner::try_plan_expr;
 use crate::exec::{
-	AccessMode, CardinalityHint, ExecOperator, FlowResult, OperatorMetrics, ValueBatch,
+	AccessMode, BoxFut, CardinalityHint, ExecOperator, FlowResult, OperatorMetrics, ValueBatch,
 	ValueBatchStream,
 };
 use crate::expr::{Block, ControlFlow, ControlFlowExt, Expr};
@@ -56,9 +55,6 @@ impl SequencePlan {
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for SequencePlan {
 	fn name(&self) -> &'static str {
 		"Sequence"
@@ -103,16 +99,22 @@ impl ExecOperator for SequencePlan {
 		self.block.0.iter().any(|expr| matches!(expr, Expr::Let(_)))
 	}
 
-	async fn output_context(&self, input: &ExecutionContext) -> Result<ExecutionContext, Error> {
-		let (_result, final_ctx) =
-			execute_block_with_context(&self.block, input).await.map_err(|ctrl| match ctrl {
-				ControlFlow::Break | ControlFlow::Continue | ControlFlow::Return(_) => {
-					// BREAK/CONTINUE/RETURN at top-level LET binding context is invalid
-					Error::InvalidControlFlow
-				}
-				ControlFlow::Err(e) => Error::Thrown(e.to_string()),
-			})?;
-		Ok(final_ctx)
+	fn output_context<'a>(
+		&'a self,
+		input: &'a ExecutionContext,
+	) -> BoxFut<'a, Result<ExecutionContext, Error>> {
+		Box::pin(async move {
+			let (_result, final_ctx) = execute_block_with_context(&self.block, input)
+				.await
+				.map_err(|ctrl| match ctrl {
+					ControlFlow::Break | ControlFlow::Continue | ControlFlow::Return(_) => {
+						// BREAK/CONTINUE/RETURN at top-level LET binding context is invalid
+						Error::InvalidControlFlow
+					}
+					ControlFlow::Err(e) => Error::Thrown(e.to_string()),
+				})?;
+			Ok(final_ctx)
+		})
 	}
 
 	fn children(&self) -> Vec<&Arc<dyn ExecOperator>> {
@@ -144,19 +146,17 @@ async fn execute_block_with_context(
 	let mut current_ctx = initial_ctx.clone();
 	let mut result = Value::None;
 
-	// Track a mutable frozen context for legacy compute fallback
-	let mut legacy_ctx: Option<FrozenContext> = None;
-
 	for expr in block.0.iter() {
 		// Check for cancellation between statements
 		if current_ctx.cancellation().is_cancelled() {
 			return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
 		}
 
-		let frozen_ctx = current_ctx.ctx().clone();
+		let frozen_ctx = Arc::clone(current_ctx.ctx());
+		let auth = current_ctx.options().map(|o| Arc::clone(&o.auth));
 
 		// Try to plan the expression with current context
-		match try_plan_expr!(expr, &frozen_ctx, current_ctx.txn()) {
+		match try_plan_expr!(expr, &frozen_ctx, current_ctx.txn(), auth) {
 			Ok(plan) => {
 				if plan.mutates_context() {
 					current_ctx = plan.output_context(&current_ctx).await?;
@@ -173,11 +173,17 @@ async fn execute_block_with_context(
 				}
 			}
 			Err(e @ (Error::PlannerUnsupported(_) | Error::PlannerUnimplemented(_))) => {
-				if let Error::PlannerUnimplemented(msg) = &e {
-					tracing::warn!("PlannerUnimplemented fallback in sequence: {msg}");
+				match &e {
+					Error::PlannerUnimplemented(msg) => {
+						tracing::warn!("PlannerUnimplemented fallback in sequence: {msg}");
+					}
+					Error::PlannerUnsupported(msg) => {
+						tracing::debug!("PlannerUnsupported fallback in sequence: {msg}",);
+					}
+					_ => {}
 				}
 				// Fallback to legacy compute path
-				let (opt, frozen) = get_legacy_context_cached(&current_ctx, &mut legacy_ctx)
+				let (opt, frozen) = legacy_context_for_fallback(&current_ctx)
 					.context("Legacy compute fallback context unavailable")?;
 
 				if let Expr::Let(set_stmt) = expr {
@@ -185,12 +191,6 @@ async fn execute_block_with_context(
 
 					// Update context with the new variable
 					current_ctx = current_ctx.with_param(set_stmt.name.clone(), value.clone());
-					// Update the legacy context too
-					if let Some(ref mut ctx) = legacy_ctx {
-						let mut new_ctx = Context::new(ctx);
-						new_ctx.add_value(set_stmt.name.clone(), Arc::new(value));
-						*ctx = new_ctx.freeze();
-					}
 					result = Value::None;
 				} else {
 					result = legacy_compute(expr, &frozen, opt, None).await?;
@@ -203,22 +203,18 @@ async fn execute_block_with_context(
 	Ok((result, current_ctx))
 }
 
-/// Get the Options and FrozenContext for legacy compute fallback, with caching.
+/// Options and frozen context for [`legacy_compute`] when the planner falls back.
 ///
-/// Sequence needs a cached legacy context because LET statements may update it
-/// incrementally across iterations of the block.
-fn get_legacy_context_cached<'a>(
-	exec_ctx: &'a ExecutionContext,
-	cached_ctx: &mut Option<FrozenContext>,
-) -> Result<(&'a crate::dbs::Options, FrozenContext), Error> {
+/// Always clones from [`ExecutionContext`]: LET bindings from the planned path
+/// (`with_param` / `output_context`) must be visible to legacy `Expr::compute`
+/// (issue #7131).
+fn legacy_context_for_fallback(
+	exec_ctx: &ExecutionContext,
+) -> Result<(&crate::dbs::Options, FrozenContext), Error> {
 	let options = exec_ctx.options().ok_or_else(|| {
 		Error::Internal("Options not available for legacy compute fallback".into())
 	})?;
-
-	let frozen = cached_ctx.clone().unwrap_or_else(|| exec_ctx.ctx().clone());
-	*cached_ctx = Some(frozen.clone());
-
-	Ok((options, frozen))
+	Ok((options, Arc::clone(exec_ctx.ctx())))
 }
 
 impl ToSql for SequencePlan {

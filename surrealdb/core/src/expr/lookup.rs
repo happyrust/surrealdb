@@ -20,6 +20,7 @@ use crate::val::{RecordId, RecordIdKey, RecordIdKeyRange, TableName};
 pub(crate) struct Lookup {
 	pub(crate) kind: LookupKind,
 	pub(crate) expr: Option<Fields>,
+	pub(crate) only: bool,
 	pub(crate) what: Vec<LookupSubject>,
 	pub(crate) cond: Option<Cond>,
 	pub(crate) split: Option<Splits>,
@@ -213,8 +214,8 @@ impl ComputedLookupSubject {
 					table,
 					..
 				} => Ok((
-					crate::key::graph::ftprefix(ns, db, tb, id, dir, table)?,
-					crate::key::graph::ftsuffix(ns, db, tb, id, dir, table)?,
+					crate::key::graph::ftprefix(ns, db, tb, id, *dir, table)?,
+					crate::key::graph::ftsuffix(ns, db, tb, id, *dir, table)?,
 				)),
 				// Scan a specific range
 				Self::Range {
@@ -224,26 +225,30 @@ impl ComputedLookupSubject {
 				} => {
 					let beg = match &range.start {
 						Bound::Unbounded => {
-							crate::key::graph::ftprefix(ns, db, tb, id, dir, table)?
+							crate::key::graph::ftprefix(ns, db, tb, id, *dir, table)?
 						}
 						Bound::Included(v) => crate::key::graph::new(
 							ns,
 							db,
 							tb,
 							id,
-							dir,
+							*dir,
 							&RecordId {
 								table: table.clone(),
 								key: v.clone(),
 							},
 						)
 						.encode_key()?,
+						// Append `0xff` to skip past any new-format key for
+						// this fk that embeds a target vertex after the
+						// legacy bytes; see `eval_graph_bound` in the
+						// streaming scan operator for the same logic.
 						Bound::Excluded(v) => crate::key::graph::new(
 							ns,
 							db,
 							tb,
 							id,
-							dir,
+							*dir,
 							&RecordId {
 								table: table.clone(),
 								key: v.to_owned(),
@@ -251,33 +256,35 @@ impl ComputedLookupSubject {
 						)
 						.encode_key()
 						.map(|mut v| {
-							v.push(0x00);
+							v.push(0xff);
 							v
 						})?,
 					};
 					// Prepare the range end key
 					let end = match &range.end {
 						Bound::Unbounded => {
-							crate::key::graph::ftsuffix(ns, db, tb, id, dir, table)?
+							crate::key::graph::ftsuffix(ns, db, tb, id, *dir, table)?
 						}
 						Bound::Excluded(v) => crate::key::graph::new(
 							ns,
 							db,
 							tb,
 							id,
-							dir,
+							*dir,
 							&RecordId {
 								table: table.clone(),
 								key: v.to_owned(),
 							},
 						)
 						.encode_key()?,
+						// Append `0xff` to include any new-format key for
+						// this fk (target bytes follow the legacy encoding).
 						Bound::Included(v) => crate::key::graph::new(
 							ns,
 							db,
 							tb,
 							id,
-							dir,
+							*dir,
 							&RecordId {
 								table: table.clone(),
 								key: v.to_owned(),
@@ -285,7 +292,7 @@ impl ComputedLookupSubject {
 						)
 						.encode_key()
 						.map(|mut v| {
-							v.push(0x00);
+							v.push(0xff);
 							v
 						})?,
 					};

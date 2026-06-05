@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use tracing::instrument;
 
@@ -37,9 +36,6 @@ impl Filter {
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for Filter {
 	fn name(&self) -> &'static str {
 		"Filter"
@@ -80,12 +76,17 @@ impl ExecOperator for Filter {
 		self.input.output_ordering()
 	}
 
+	fn constant_output_fields(&self) -> Vec<crate::exec::field_path::FieldPath> {
+		self.input.constant_output_fields()
+	}
+
 	#[instrument(name = "Filter::execute", level = "trace", skip_all)]
 	fn execute(&self, ctx: &ExecutionContext) -> FlowResult<ValueBatchStream> {
 		let input_stream = buffer_stream(
 			self.input.execute(ctx)?,
 			self.input.access_mode(),
 			self.input.cardinality_hint(),
+			ctx.root().ctx.config.operator_buffer_size,
 		);
 		let predicate = Arc::clone(&self.predicate);
 
@@ -93,7 +94,7 @@ impl ExecOperator for Filter {
 		let ctx = ctx.clone();
 
 		let filtered = input_stream.filter_map(move |batch_result| {
-			let predicate = predicate.clone();
+			let predicate = Arc::clone(&predicate);
 
 			let exec_ctx = ctx.clone();
 

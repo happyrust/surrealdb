@@ -72,6 +72,7 @@ SurrealDB is used for data-intensive systems such as applications requiring mult
 **Key features of SurrealDB include:**
 
 - **Reduces development time**: SurrealDB simplifies your database and API stack by removing the need for most server-side components, allowing you to build secure, performant apps faster and cheaper.
+- **Multi-model**: native multi-model support for document, graph, relational (enforcing schema and schemaless), time-series, geospatial and retrieval (full-text, vector, hybrid). This is offered natively through SurrealQL, SurrealDB's SQL-like intuitive query language.
 - **Real-time collaborative API backend service:** SurrealDB functions as both a database and an API backend service, enabling real-time collaboration.
 - **Support for multiple querying languages:** SurrealDB supports SQL querying from client devices, GraphQL, ACID transactions, WebSocket connections, structured and unstructured data, graph querying, full-text and vector indexing, and geospatial querying.
 - **Granular access control**: SurrealDB provides row-level permissions-based access control, giving you the ability to manage data access with precision.
@@ -82,33 +83,16 @@ View the [features](https://surrealdb.com/features), the latest [releases](https
 
 <h2><img height="20" src="./img/contents.svg">&nbsp;&nbsp;Contents</h2>
 
-- [Features](#features)
-- [Documentation](#documentation)
-- [Getting started](#getting-started)
-	- [Server side code](#server-side-code)
-	- [Client side apps](#client-side-apps)
-- [SurrealDB Cloud](#surrealdb-cloud)
-- [Installation](#installation)
-	- [Install on macOS](#install-on-macos)
-	- [Install on Linux](#install-on-linux)
-	- [Install on Windows](#install-on-windows)
-	- [Run using Docker](#run-using-docker)
-- [Quick look](#quick-look)
-- [Why SurrealDB](#why-surrealdb)
-	- [Database, API, and permissions](#database-api-and-permissions)
-	- [Tables, documents, and graph](#tables-documents-and-graph)
-	- [Advanced inter-document relations](#advanced-inter-document-relations-and-analysis-no-joins-no-pain)
-	- [Simple schema definition](#simple-schema-definition-for-frontend-and-backend-development)
-	- [Connect directly from web-browsers](#connect-and-query-directly-from-web-browsers-and-client-devices)
-	- [Multiple different query methods](#query-the-database-with-the-tools-you-want)
-	- [Realtime live queries and data changes](#realtime-live-queries-and-data-changes-direct-to-application)
-	- [Scale effortlessly for high-availability](#scale-effortlessly-to-hundreds-of-nodes-for-high-availability-and-scalability)
-	- [Extend your database with JavaScript](#extend-your-database-with-javascript-functions)
-	- [Designed to be embedded or in the cloud](#designed-to-be-embedded-or-to-run-distributed-in-the-cloud)
-- [Community](#community)
-- [Contributing](#contributing)
-- [Security](#security)
-- [License](#license)
+- [Database, API, and permissions](#database-api-and-permissions)
+- [Tables, documents, and graph](#tables-documents-and-graph)
+- [Advanced inter-document relations and analysis. No JOINs. No pain.](#advanced-inter-document-relations-and-analysis-no-joins-no-pain)
+- [Simple schema definition for frontend and backend development](#simple-schema-definition-for-frontend-and-backend-development)
+- [Connect and query directly from web-browsers and client devices](#connect-and-query-directly-from-web-browsers-and-client-devices)
+- [Query the database with the tools you want](#query-the-database-with-the-tools-you-want)
+- [Realtime live queries and data changes direct to application](#realtime-live-queries-and-data-changes-direct-to-application)
+- [Scale effortlessly to hundreds of nodes for high-availability and scalability](#scale-effortlessly-to-hundreds-of-nodes-for-high-availability-and-scalability)
+- [Extend your database with JavaScript functions](#extend-your-database-with-javascript-functions)
+- [Designed to be embedded or to run distributed in the cloud](#designed-to-be-embedded-or-to-run-distributed-in-the-cloud)
 
 <h2><img height="20" src="./img/features.svg">&nbsp;&nbsp;Features</h2>
 
@@ -123,6 +107,7 @@ View the [features](https://surrealdb.com/features), the latest [releases](https
 - [x] Simple schema definition for frontend and backend development
 - [x] Connect and query directly from web-browsers and client devices
 - [x] Use embedded JavaScript functions for custom advanced functionality
+- [x] MCP (Model Context Protocol) server for LLM and AI-agent integration
 
 <h2><img height="20" src="./img/documentation.svg">&nbsp;&nbsp;Documentation</h2>
 

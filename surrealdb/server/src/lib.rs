@@ -10,6 +10,7 @@
 //! <a href="https://crates.io/crates/surrealdb">the Rust SDK</a>.
 //! </section>
 
+#![recursion_limit = "256"]
 // Temporarily allow deprecated items until version 3.0 for backward compatibility
 #![allow(deprecated)]
 #![deny(clippy::mem_forget)]
@@ -27,24 +28,41 @@ mod gql;
 /// Make `ntw` public so embedders can access RouterFactory and related networking definitions
 /// when running SurrealDB as a library.
 pub mod ntw;
+/// Observability wiring: community Prometheus registry, `/metrics` handler,
+/// and the allowlists controlling what may leave the server unauthenticated.
+pub mod observe;
 /// Make `rpc` public so embedders can access RpcState and related router definitions
 /// when running SurrealDB as a library.
 pub mod rpc;
-mod telemetry;
+pub mod telemetry;
+/// Process-wide rustls `CryptoProvider` installation. Public so embedders and
+/// downstream binaries (e.g. the Enterprise cluster transport) can install
+/// the same provider — including the FIPS-validated provider when built with
+/// `feature = "fips"` — instead of duplicating the install logic.
+pub mod tls;
 
 use std::future::Future;
 use std::process::ExitCode;
 
 pub use cli::{Config, ConfigCheck, ConfigCheckRequirements};
-/// Re-export `RouterFactory` for convenience so embedders can `use surreal::RouterFactory`.
+/// Re-export `RouterFactory` for convenience so embedders can `use
+/// surrealdb_server::RouterFactory`.
 #[doc(inline)]
 pub use ntw::RouterFactory;
-/// Re-export `RpcState` for convenience so embedders can `use surreal::RpcState`.
+/// Re-export `RouterOptions` for convenience so embedders can `use
+/// surrealdb_server::RouterOptions`.
+#[doc(inline)]
+pub use ntw::RouterOptions;
+/// Re-export `SurrealRouter` for convenience so embedders can `use
+/// surrealdb_server::SurrealRouter`.
+#[doc(inline)]
+pub use ntw::SurrealRouter;
+/// Re-export `RpcState` for convenience so embedders can `use surrealdb_server::RpcState`.
 #[doc(inline)]
 pub use rpc::RpcState;
 #[doc(inline)]
 pub use surrealdb as sdk;
-/// Re-export `core` for convenience so embedders can `use surreal::core::...`.
+/// Re-export `core` for convenience so embedders can `use surrealdb_server::core::...`.
 #[doc(inline)]
 pub use surrealdb_core as core;
 use surrealdb_core::buc::BucketStoreProvider;
@@ -65,7 +83,13 @@ use surrealdb_core::kvs::TransactionBuilderFactory;
 ///   - `TransactionBuilderFactory` (selects/validates the datastore backend)
 ///   - `RouterFactory` (constructs the HTTP router)
 ///   - `ConfigCheck` (validates configuration before initialization)
-pub fn init<C: TransactionBuilderFactory + RouterFactory + ConfigCheck + BucketStoreProvider>(
+pub fn init<
+	C: TransactionBuilderFactory
+		+ RouterFactory
+		+ ConfigCheck
+		+ BucketStoreProvider
+		+ observe::ObservabilityProvider,
+>(
 	composer: C,
 ) -> ExitCode {
 	with_enough_stack(cli::init::<C>(composer))

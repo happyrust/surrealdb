@@ -1,4 +1,7 @@
 /**
+[env]
+planner-strategy = ["all-ro"]
+
 [test]
 reason = "Test IN and INSIDE operators with standard, unique, and compound indexes (new executor)"
 
@@ -58,8 +61,7 @@ value = "[{ apprenantUid: '00013483-fedd-43e3-a94e-80728d896f6e' }]"
 
 [[test.results]]
 value = '''"SelectProject [ctx: Db] [projections: apprenantUid] {rows: 1}
-    Filter [ctx: Db] [predicate: apprenantUid INSIDE ['00013483-fedd-43e3-a94e-80728d896f6e']] {rows: 1}
-        IndexScan [ctx: Db] [index: apprenantUid, access: = '00013483-fedd-43e3-a94e-80728d896f6e', direction: Forward] {rows: 1}
+    IndexScan [ctx: Db] [index: apprenantUid, access: = '00013483-fedd-43e3-a94e-80728d896f6e', direction: Forward] {rows: 1}
 
 Total rows: 1"'''
 
@@ -80,7 +82,10 @@ value = "[{ account: accounts:3, id: test:3, type: 'password', value: 'notAValid
 
 [[test.results]]
 value = '''"SelectProject [ctx: Db] [projections: *] {rows: 1}
-    TableScan [ctx: Db] [table: test, direction: Forward, predicate: account = accounts:1 AND type INSIDE ['password', 'firebasePassword']] {rows: 1}
+    Filter [ctx: Db] [predicate: account = accounts:1 AND type INSIDE ['password', 'firebasePassword']] {rows: 1}
+        UnionIndexScan [ctx: Db] [table: test, branches: 2] {rows: 3}
+            IndexScan [ctx: Db] [index: idx_type_value, access: ['password'], direction: Forward] {rows: 3}
+            IndexScan [ctx: Db] [index: idx_type_value, access: ['firebasePassword'], direction: Forward] {rows: 0}
 
 Total rows: 1"'''
 
