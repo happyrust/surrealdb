@@ -930,7 +930,7 @@ mod tests {
 			panic!("expected string result");
 		};
 
-		let reencoded = super::e3d_hash((code.clone(),)).unwrap();
+		let reencoded = super::e3d_hash((code.to_string(),)).unwrap();
 		assert_eq!(reencoded, Value::from(0x1076_84CAu32));
 
 		// ensure hash function accepts the decoded string
