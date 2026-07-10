@@ -153,7 +153,7 @@ pub mod url {
 	}
 }
 
-	pub mod uint64 {
+pub mod uint64 {
 
 	use anyhow::Result;
 
@@ -181,135 +181,132 @@ pub mod url {
 
 	fn parse_str(s: &str) -> Option<i64> {
 		let raw = strip_wrappers(s);
-		let mut parts = raw.split(|c| c == '_' || c == '/');
+		let mut parts = raw.split(['_', '/']);
 		let hi = parts.next()?.parse::<u64>().ok()?;
 		let lo = parts.next()?.parse::<u64>().ok()?;
 		combine(hi, lo)
 	}
 
-		fn parse_value(v: &Value) -> Option<i64> {
-			match v {
-				Value::String(s) => parse_str(s.as_str()),
-				Value::Array(Array(items)) if items.len() == 2 => {
-					let hi = items[0].clone().cast_to::<i64>().ok()?;
-					let lo = items[1].clone().cast_to::<i64>().ok()?;
-					if hi < 0 || lo < 0 {
-						return None;
-					}
-					combine(hi as u64, lo as u64)
+	fn parse_value(v: &Value) -> Option<i64> {
+		match v {
+			Value::String(s) => parse_str(s.as_str()),
+			Value::Array(Array(items)) if items.len() == 2 => {
+				let hi = items[0].clone().cast_to::<i64>().ok()?;
+				let lo = items[1].clone().cast_to::<i64>().ok()?;
+				if hi < 0 || lo < 0 {
+					return None;
 				}
-				_ => None,
+				combine(hi as u64, lo as u64)
 			}
+			_ => None,
 		}
+	}
 
-		pub fn pair_to_u64((val,): (Value,)) -> Result<Value> {
-			Ok(parse_value(&val).map(Value::from).unwrap_or(Value::None))
-		}
+	pub fn pair_to_u64((val,): (Value,)) -> Result<Value> {
+		Ok(parse_value(&val).map(Value::from).unwrap_or(Value::None))
+	}
 
-		pub fn pairs_to_u64((val,): (Value,)) -> Result<Value> {
-			match val {
-				Value::Array(Array(items)) => Ok(Value::Array(Array(
-					items
-						.iter()
-						.map(|v| parse_value(v).map(Value::from).unwrap_or(Value::None))
-						.collect(),
-				))),
-				_ => Ok(Value::None),
-			}
+	pub fn pairs_to_u64((val,): (Value,)) -> Result<Value> {
+		match val {
+			Value::Array(Array(items)) => Ok(Value::Array(Array(
+				items
+					.iter()
+					.map(|v| parse_value(v).map(Value::from).unwrap_or(Value::None))
+					.collect(),
+			))),
+			_ => Ok(Value::None),
 		}
+	}
 
-		fn number_to_parts(n: i64) -> Option<(u64, u64)> {
-			if n < 0 {
-				return None;
-			}
-			let v = n as u64;
-			let hi = v >> 32;
-			let lo = v & LO_MAX;
-			if hi > HI_MAX {
-				return None;
-			}
-			Some((hi, lo))
+	fn number_to_parts(n: i64) -> Option<(u64, u64)> {
+		if n < 0 {
+			return None;
 		}
+		let v = n as u64;
+		let hi = v >> 32;
+		let lo = v & LO_MAX;
+		if hi > HI_MAX {
+			return None;
+		}
+		Some((hi, lo))
+	}
 
-		pub fn u64_to_pair_str((val,): (Value,)) -> Result<Value> {
-			let out = val
-				.cast_to::<i64>()
-				.ok()
-				.and_then(number_to_parts)
-				.map(|(hi, lo)| format!("{hi}_{lo}"))
-				.map(Value::from)
-				.unwrap_or(Value::None);
-			Ok(out)
-		}
+	pub fn u64_to_pair_str((val,): (Value,)) -> Result<Value> {
+		let out = val
+			.cast_to::<i64>()
+			.ok()
+			.and_then(number_to_parts)
+			.map(|(hi, lo)| format!("{hi}_{lo}"))
+			.map(Value::from)
+			.unwrap_or(Value::None);
+		Ok(out)
+	}
 
-		pub fn u64s_to_pair_str((val,): (Value,)) -> Result<Value> {
-			match val {
-				Value::Array(Array(items)) => Ok(Value::Array(Array(
-					items
-						.iter()
-						.map(|v| {
-							v.clone().cast_to::<i64>()
-								.ok()
-								.and_then(number_to_parts)
-								.map(|(hi, lo)| format!("{hi}_{lo}"))
-								.map(Value::from)
-								.unwrap_or(Value::None)
-						})
-						.collect(),
-				))),
-				_ => Ok(Value::None),
-			}
+	pub fn u64s_to_pair_str((val,): (Value,)) -> Result<Value> {
+		match val {
+			Value::Array(Array(items)) => Ok(Value::Array(Array(
+				items
+					.iter()
+					.map(|v| {
+						v.clone()
+							.cast_to::<i64>()
+							.ok()
+							.and_then(number_to_parts)
+							.map(|(hi, lo)| format!("{hi}_{lo}"))
+							.map(Value::from)
+							.unwrap_or(Value::None)
+					})
+					.collect(),
+			))),
+			_ => Ok(Value::None),
 		}
+	}
 
 	#[cfg(test)]
 	mod tests {
-			use super::*;
+		use super::*;
 
-			#[test]
-			fn parse_string_underscore() {
-				let v = pair_to_u64((Value::from("24383_73962"),)).unwrap();
-				assert_eq!(v, Value::from(((24383u64 << 32) | 73962) as i64));
-			}
+		#[test]
+		fn parse_string_underscore() {
+			let v = pair_to_u64((Value::from("24383_73962"),)).unwrap();
+			assert_eq!(v, Value::from(((24383u64 << 32) | 73962) as i64));
+		}
 
-			#[test]
-			fn parse_array_pair() {
-				let v = pair_to_u64((Value::Array(Array(vec![Value::from(1), Value::from(2)])),)).unwrap();
-				assert_eq!(v, Value::from(((1u64 << 32) | 2) as i64));
-			}
+		#[test]
+		fn parse_array_pair() {
+			let v =
+				pair_to_u64((Value::Array(Array(vec![Value::from(1), Value::from(2)])),)).unwrap();
+			assert_eq!(v, Value::from(((1u64 << 32) | 2) as i64));
+		}
 
-			#[test]
-			fn parse_many_mixed() {
-				let input = Value::Array(Array(vec![
-					Value::from("1/2"),
-					Value::Array(Array(vec![Value::from(3), Value::from(4)])),
-				]));
-				let out = pairs_to_u64((input,)).unwrap();
-				assert_eq!(
-					out,
-					Value::Array(Array(vec![
-						Value::from(((1u64 << 32) | 2) as i64),
-						Value::from(((3u64 << 32) | 4) as i64),
-					]))
-				);
-			}
-
-			#[test]
-			fn to_string_single() {
-				let v = u64_to_pair_str((Value::from(((5u64 << 32) | 6) as i64),)).unwrap();
-				assert_eq!(v, Value::from("5_6"));
-			}
-
-			#[test]
-			fn to_string_many_mixed() {
-				let input = Value::Array(Array(vec![
+		#[test]
+		fn parse_many_mixed() {
+			let input = Value::Array(Array(vec![
+				Value::from("1/2"),
+				Value::Array(Array(vec![Value::from(3), Value::from(4)])),
+			]));
+			let out = pairs_to_u64((input,)).unwrap();
+			assert_eq!(
+				out,
+				Value::Array(Array(vec![
 					Value::from(((1u64 << 32) | 2) as i64),
-					Value::from(-1),
-				]));
-				let out = u64s_to_pair_str((input,)).unwrap();
-				assert_eq!(
-					out,
-					Value::Array(Array(vec![Value::from("1_2"), Value::None]))
-				);
-			}
+					Value::from(((3u64 << 32) | 4) as i64),
+				]))
+			);
+		}
+
+		#[test]
+		fn to_string_single() {
+			let v = u64_to_pair_str((Value::from(((5u64 << 32) | 6) as i64),)).unwrap();
+			assert_eq!(v, Value::from("5_6"));
+		}
+
+		#[test]
+		fn to_string_many_mixed() {
+			let input =
+				Value::Array(Array(vec![Value::from(((1u64 << 32) | 2) as i64), Value::from(-1)]));
+			let out = u64s_to_pair_str((input,)).unwrap();
+			assert_eq!(out, Value::Array(Array(vec![Value::from("1_2"), Value::None])));
 		}
 	}
+}

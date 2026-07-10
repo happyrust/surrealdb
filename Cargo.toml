@@ -115,7 +115,6 @@ bitflags = "2.11.1"
 blake3 = "1.8.4"
 boxcar = "0.2.14"
 bytes = "1.11.1"
-candle-core = "0.9.1"
 castaway = "0.2.4"
 chrono = { version = "0.4.44", default-features = false }
 ciborium = "0.2.2"
@@ -294,12 +293,6 @@ surrealdb = { workspace = true, features = [
 ] }
 surrealdb-core.workspace = true
 surrealdb-server.workspace = true
-
-# Optional crates
-pprof = { workspace = true, features = [
-    "flamegraph",
-    "prost-codec",
-], optional = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal", "user"] }
@@ -490,7 +483,6 @@ unnecessary_to_owned = "warn"
 # Warning or denying this lint can cause unexpected errors.
 unused_async = "allow"
 
-
 # Checks for `.unwrap()` or `.unwrap_err()` calls on Results and `.unwrap()` call on `Option`s.
 # https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used
 unwrap_used = "warn"
@@ -498,8 +490,6 @@ unwrap_used = "warn"
 # Checks for the use of bindings with a single leading underscore.
 # https://rust-lang.github.io/rust-clippy/master/index.html#used_underscore_binding
 used_underscore_binding = "warn"
-
-
 
 # Profiles
 
