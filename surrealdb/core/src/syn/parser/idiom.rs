@@ -1,4 +1,5 @@
 use reblessive::Stk;
+use surrealdb_strand::Strand;
 
 use super::basic::NumberToken;
 use super::mac::{expected, unexpected};
@@ -9,7 +10,6 @@ use crate::sql::operator::BinaryOperator;
 use crate::sql::part::{DestructurePart, Recurse, RecurseInstruction};
 use crate::sql::{Dir, Expr, Field, Fields, Idiom, Literal, Lookup, Param, Part};
 use crate::syn::error::bail;
-use crate::syn::lexer::compound::{self, Numeric};
 use crate::syn::token::{Span, TokenKind, t};
 
 fn matches_inclusive_idiom(expr: &Expr) -> bool {
@@ -40,7 +40,11 @@ impl Parser<'_> {
 		if self.eat(t!("VALUE")) {
 			let expr = stk.run(|ctx| self.parse_expr_field(ctx)).await?;
 			let alias = if self.eat(t!("AS")) {
-				Some(self.parse_basic_idiom()?)
+				// When using `SELECT VALUE ... AS ...`, only parse an alias if it is a valid
+				// identifier. It does not make sense to alias as a multi-part idiom because the
+				// alias will be not be projected.
+				let ident = self.parse_ident_str()?.into();
+				Some(Idiom(vec![Part::Field(ident)]))
 			} else {
 				None
 			};
@@ -114,7 +118,7 @@ impl Parser<'_> {
 					self.pop_peek();
 					let lookup =
 						stk.run(|stk| self.parse_lookup(stk, LookupKind::Graph(Dir::Out))).await?;
-					res.push(Part::Graph(lookup))
+					res.push(Part::Graph(Box::new(lookup)))
 				}
 				t!("<") => {
 					if let Some(peek) = self.peek_whitespace1() {
@@ -125,21 +129,21 @@ impl Parser<'_> {
 								.run(|stk| self.parse_lookup(stk, LookupKind::Reference))
 								.await?;
 
-							res.push(Part::Graph(lookup))
+							res.push(Part::Graph(Box::new(lookup)))
 						} else if peek.kind == t!("-") {
 							self.pop_peek();
 							self.pop_peek();
 							let lookup = stk
 								.run(|stk| self.parse_lookup(stk, LookupKind::Graph(Dir::In)))
 								.await?;
-							res.push(Part::Graph(lookup))
+							res.push(Part::Graph(Box::new(lookup)))
 						} else if peek.kind == t!("->") {
 							self.pop_peek();
 							self.pop_peek();
 							let lookup = stk
 								.run(|stk| self.parse_lookup(stk, LookupKind::Graph(Dir::Both)))
 								.await?;
-							res.push(Part::Graph(lookup))
+							res.push(Part::Graph(Box::new(lookup)))
 						} else {
 							break;
 						}
@@ -185,7 +189,7 @@ impl Parser<'_> {
 				t!("->") => {
 					self.pop_peek();
 					let x = self.parse_lookup(stk, LookupKind::Graph(Dir::Out)).await?;
-					res.push(Part::Graph(x))
+					res.push(Part::Graph(Box::new(x)))
 				}
 				t!("<") => {
 					if let Some(peek) = self.peek_whitespace1() {
@@ -193,18 +197,18 @@ impl Parser<'_> {
 							self.pop_peek();
 							self.pop_peek();
 							let lookup = self.parse_lookup(stk, LookupKind::Reference).await?;
-							res.push(Part::Graph(lookup))
+							res.push(Part::Graph(Box::new(lookup)))
 						} else if peek.kind == t!("-") {
 							self.pop_peek();
 							self.pop_peek();
 							let lookup = self.parse_lookup(stk, LookupKind::Graph(Dir::In)).await?;
-							res.push(Part::Graph(lookup))
+							res.push(Part::Graph(Box::new(lookup)))
 						} else if peek.kind == t!("->") {
 							self.pop_peek();
 							self.pop_peek();
 							let lookup =
 								self.parse_lookup(stk, LookupKind::Graph(Dir::Both)).await?;
-							res.push(Part::Graph(lookup))
+							res.push(Part::Graph(Box::new(lookup)))
 						} else {
 							break;
 						}
@@ -226,7 +230,7 @@ impl Parser<'_> {
 				self.pop_peek();
 				let lookup =
 					stk.run(|ctx| self.parse_lookup(ctx, LookupKind::Graph(Dir::Out))).await?;
-				Part::Graph(lookup)
+				Part::Graph(Box::new(lookup))
 			}
 			t!("<") => {
 				let t = self.pop_peek();
@@ -239,9 +243,9 @@ impl Parser<'_> {
 				} else {
 					unexpected!(self, t, "either `<-` `<->` or `->`")
 				};
-				Part::Graph(lookup)
+				Part::Graph(Box::new(lookup))
 			}
-			_ => Part::Field(self.parse_ident()?),
+			_ => Part::Field(self.parse_ident_str()?.into()),
 		};
 		let start = vec![start];
 		self.parse_remaining_idiom(stk, start).await
@@ -267,7 +271,7 @@ impl Parser<'_> {
 				stk.run(|ctx| self.parse_curly_part(ctx)).await?
 			}
 			_ => {
-				let ident = self.parse_ident()?;
+				let ident = self.parse_ident_str()?.into();
 				if self.eat(t!("(")) {
 					self.parse_function_part(stk, ident).await?
 				} else {
@@ -286,7 +290,7 @@ impl Parser<'_> {
 				Part::All
 			}
 			_ => {
-				let ident = self.parse_ident()?;
+				let ident = self.parse_ident_str()?.into();
 				Part::Field(ident)
 			}
 		};
@@ -296,7 +300,7 @@ impl Parser<'_> {
 	pub(super) async fn parse_function_part(
 		&mut self,
 		stk: &mut Stk,
-		name: String,
+		name: Strand,
 	) -> ParseResult<Part> {
 		let args = self.parse_function_args(stk).await?;
 		Ok(Part::Method(name, args))
@@ -318,7 +322,7 @@ impl Parser<'_> {
 				break;
 			}
 
-			let field = self.parse_ident()?;
+			let field: Strand = self.parse_ident_str()?.into();
 			let part = match self.peek_kind() {
 				t!(":") => {
 					self.pop_peek();
@@ -388,12 +392,12 @@ impl Parser<'_> {
 		stk: &mut Stk,
 	) -> ParseResult<Option<RecurseInstruction>> {
 		let instruction = if self.eat(t!("+")) {
-			let kind = self.parse_ident()?;
+			let kind = self.parse_ident()?.into_string();
 			if kind.eq_ignore_ascii_case("path") {
 				let mut inclusive = false;
 				loop {
 					if self.eat(t!("+")) {
-						let kind = self.parse_ident()?;
+						let kind = self.parse_ident()?.into_string();
 						if kind.eq_ignore_ascii_case("inclusive") {
 							inclusive = true
 						} else {
@@ -410,7 +414,7 @@ impl Parser<'_> {
 				let mut inclusive = false;
 				loop {
 					if self.eat(t!("+")) {
-						let kind = self.parse_ident()?;
+						let kind = self.parse_ident()?.into_string();
 						if kind.eq_ignore_ascii_case("inclusive") {
 							inclusive = true
 						} else {
@@ -471,7 +475,7 @@ impl Parser<'_> {
 				let mut inclusive = false;
 				loop {
 					if self.eat(t!("+")) {
-						let kind = self.parse_ident()?;
+						let kind = self.parse_ident()?.into_string();
 						if kind.eq_ignore_ascii_case("inclusive") {
 							inclusive = true
 						} else {
@@ -549,7 +553,7 @@ impl Parser<'_> {
 	/// restrictive. Flatten, graphs, conditions and indexing by param is not
 	/// allowed.
 	pub(super) fn parse_basic_idiom(&mut self) -> ParseResult<Idiom> {
-		let start = self.parse_ident()?;
+		let start: Strand = self.parse_ident_str()?.into();
 		let mut parts = vec![Part::Field(start)];
 		loop {
 			let token = self.peek();
@@ -599,76 +603,6 @@ impl Parser<'_> {
 			};
 			parts.push(part);
 		}
-		Ok(Idiom(parts))
-	}
-
-	/// Parse a local idiom.
-	///
-	/// Basic idioms differ from local idioms in that they are more restrictive.
-	/// Only field, all and number indexing is allowed. Flatten is also allowed
-	/// but only at the end.
-	pub(super) fn parse_local_idiom(&mut self) -> ParseResult<Idiom> {
-		let start = self.parse_ident()?;
-		let mut parts = vec![Part::Field(start)];
-		loop {
-			let token = self.peek();
-			let part = match token.kind {
-				t!(".") => {
-					self.pop_peek();
-					self.parse_basic_dot_part()?
-				}
-				t!("[") => {
-					self.pop_peek();
-					let token = self.peek();
-					let res = match token.kind {
-						t!("*") => {
-							self.pop_peek();
-							Part::All
-						}
-						TokenKind::Digits | t!("+") => {
-							let next = self.next();
-							let number = self.lex_compound(next, compound::numeric)?;
-							let number = match number.value {
-								Numeric::Duration(_) => {
-									bail!("Unexpected token `duration` expected a number", @number.span );
-								}
-								Numeric::Integer(x) => {
-									Expr::Literal(Literal::Integer(x.into_int(number.span)?))
-								}
-								Numeric::Float(x) => Expr::Literal(Literal::Float(x)),
-								Numeric::Decimal(x) => Expr::Literal(Literal::Decimal(x)),
-							};
-							Part::Value(number)
-						}
-						t!("-") => {
-							if let Some(peek_digit) = self.peek_whitespace1()
-								&& let TokenKind::Digits = peek_digit.kind
-							{
-								let span = self.recent_span().covers(peek_digit.span);
-								bail!("Unexpected token `-` expected $, *, or a number", @span => "index in a local idiom can't be negative");
-							}
-							unexpected!(self, token, "$, * or a number");
-						}
-						_ => unexpected!(self, token, "$, * or a number"),
-					};
-					self.expect_closing_delimiter(t!("]"), token.span)?;
-					res
-				}
-				_ => break,
-			};
-
-			parts.push(part);
-		}
-
-		if self.eat(t!("...")) {
-			let token = self.peek();
-			if let t!(".") | t!("[") = token.kind {
-				bail!("Unexpected token `...` expected a local idiom to end.",
-					@token.span => "Flattening can only be done at the end of a local idiom")
-			}
-			parts.push(Part::Flatten);
-		}
-
 		Ok(Idiom(parts))
 	}
 
@@ -904,7 +838,7 @@ mod tests {
 
 	/// creates a field part
 	fn f(s: &str) -> Part {
-		Part::Field(s.to_owned())
+		Part::Field(s.into())
 	}
 
 	/// creates a field part
@@ -1042,26 +976,26 @@ mod tests {
 			out,
 			Expr::Idiom(Idiom(vec![
 				Part::Start(Expr::Literal(Literal::RecordId(RecordIdLit {
-					table: "person".to_owned(),
-					key: RecordIdKeyLit::String("test".to_owned())
+					table: "person".into(),
+					key: RecordIdKeyLit::String("test".into())
 				}))),
 				f("friend"),
-				Part::Graph(Lookup {
+				Part::Graph(Box::new(Lookup {
 					kind: LookupKind::Graph(Dir::Out),
 					what: vec![LookupSubject::Table {
-						table: "like".to_owned(),
+						table: "like".into(),
 						referencing_field: None
 					}],
 					..Default::default()
-				}),
-				Part::Graph(Lookup {
+				})),
+				Part::Graph(Box::new(Lookup {
 					kind: LookupKind::Graph(Dir::Out),
 					what: vec![LookupSubject::Table {
-						table: "person".to_owned(),
+						table: "person".into(),
 						referencing_field: None
 					}],
 					..Default::default()
-				}),
+				})),
 			]))
 		);
 	}
@@ -1194,7 +1128,7 @@ mod tests {
 			out,
 			Expr::Idiom(Idiom(vec![
 				Part::Start(Expr::Literal(Literal::RecordId(RecordIdLit {
-					table: "test".to_owned(),
+					table: "test".into(),
 					key: RecordIdKeyLit::Number(1),
 				}))),
 				f("foo"),
@@ -1210,10 +1144,10 @@ mod tests {
 			out,
 			Expr::Idiom(Idiom(vec![
 				Part::Start(Expr::Literal(Literal::RecordId(RecordIdLit {
-					table: "test".to_owned(),
+					table: "test".into(),
 					key: RecordIdKeyLit::Number(1),
 				}))),
-				Part::Value(Expr::Literal(Literal::String("foo".to_owned()))),
+				Part::Value(Expr::Literal(Literal::String(Strand::new_static("foo")))),
 			]))
 		);
 	}
@@ -1226,7 +1160,7 @@ mod tests {
 			out,
 			Expr::Idiom(Idiom(vec![
 				Part::Start(Expr::Literal(Literal::RecordId(RecordIdLit {
-					table: "test".to_owned(),
+					table: "test".into(),
 					key: RecordIdKeyLit::Number(1),
 				}))),
 				Part::All

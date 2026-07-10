@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -7,14 +8,18 @@ use clap::Args;
 use rand::Rng;
 use surrealdb::opt::capabilities::Capabilities as SdkCapabilities;
 use surrealdb_core::buc::BucketStoreProvider;
+use surrealdb_core::channel::Receiver;
+use surrealdb_core::cnf::ConfigMap;
 use surrealdb_core::kvs::{Datastore, TransactionBuilderFactory};
+use surrealdb_core::observe::ExecutionObserver;
+use surrealdb_types::Notification;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Config;
 use crate::core::dbs::capabilities::{
-	ArbitraryQueryTarget, Capabilities, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget,
-	RouteTarget, Targets,
+	ArbitraryQueryTarget, Capabilities, EvalQueryTarget, ExperimentalTarget, FuncTarget,
+	MethodTarget, NetTarget, RouteTarget, Targets,
 };
 use crate::core::dbs::{NewPlannerStrategy, Session};
 
@@ -33,6 +38,12 @@ pub struct StartCommandDbsOptions {
 	#[arg(env = "SURREAL_TRANSACTION_TIMEOUT", long)]
 	#[arg(value_parser = super::cli::validator::duration)]
 	transaction_timeout: Option<Duration>,
+	#[arg(
+		help = "The maximum duration that each built-in startup datastore operation can retry for"
+	)]
+	#[arg(env = "SURREAL_STARTUP_OPERATION_TIMEOUT", long, default_value = "60s")]
+	#[arg(value_parser = super::cli::validator::duration)]
+	startup_operation_timeout: Duration,
 	#[arg(help = "Whether to allow unauthenticated access", help_heading = "Authentication")]
 	#[arg(env = "SURREAL_UNAUTHENTICATED", long = "unauthenticated")]
 	#[arg(default_value_t = false)]
@@ -77,6 +88,10 @@ pub struct StartCommandDbsOptions {
 	#[arg(env = "SURREAL_NO_DEFAULTS", long = "no-defaults", conflicts_with_all = ["default_namespace", "default_database"])]
 	#[arg(default_value_t = false)]
 	no_defaults: bool,
+	#[arg(help = "Load Surrealism modules lazily on first use instead of eagerly at startup")]
+	#[arg(env = "SURREAL_LAZY_SURREALISM", long = "lazy-surrealism")]
+	#[arg(default_value_t = false)]
+	lazy_surrealism: bool,
 }
 
 #[derive(Args, Debug)]
@@ -133,6 +148,21 @@ User groups must be one of "guest", "record" or "system".
 	#[arg(default_missing_value_os = "", num_args = 0..)]
 	#[arg(value_parser = super::cli::validator::query_arbitrary_targets)]
 	allow_arbitrary_query: Option<Targets<ArbitraryQueryTarget>>,
+
+	#[arg(
+		help = "Allow the eval::* functions to be invoked by certain user groups. Denied for everyone by default.",
+		long_help = r#"Allow the eval::surql / eval::gql functions to be invoked by certain user groups. Provide a comma-separated list of user groups to allow. This is an additive gate on top of arbitrary-query: an eval invocation must also satisfy the arbitrary-query capability.
+Specifically denied user groups prevail over any other allowed user group.
+User groups must be one of "guest", "record" or "system".
+Denied for everyone by default (even under --allow-all); must be explicitly enabled.
+"#
+	)]
+	#[arg(env = "SURREAL_CAPS_ALLOW_EVAL_QUERY", long)]
+	// If the arg is provided without value, then assume it's "", which gets parsed into
+	// Targets::All
+	#[arg(default_missing_value_os = "", num_args = 0..)]
+	#[arg(value_parser = super::cli::validator::eval_query_targets)]
+	allow_eval_query: Option<Targets<EvalQueryTarget>>,
 
 	#[arg(
 		help = "Allow all outbound network connections except for network targets that are specifically denied. Alternatively, you can provide a comma-separated list of network targets to allow",
@@ -225,6 +255,20 @@ User groups must be one of "guest", "record" or "system".
 	#[arg(default_missing_value_os = "", num_args = 0..)]
 	#[arg(value_parser = super::cli::validator::query_arbitrary_targets)]
 	deny_arbitrary_query: Option<Targets<ArbitraryQueryTarget>>,
+
+	#[arg(
+		help = "Deny the eval::* functions for certain user groups except when specifically allowed.",
+		long_help = r#"Deny the eval::surql / eval::gql functions for certain user groups. Provide a comma-separated list of user groups to deny.
+Specifically denied user groups prevail over any allowed user group.
+User groups must be one of "guest", "record" or "system".
+"#
+	)]
+	#[arg(env = "SURREAL_CAPS_DENY_EVAL_QUERY", long)]
+	// If the arg is provided without value, then assume it's "", which gets parsed into
+	// Targets::All
+	#[arg(default_missing_value_os = "", num_args = 0..)]
+	#[arg(value_parser = super::cli::validator::eval_query_targets)]
+	deny_eval_query: Option<Targets<EvalQueryTarget>>,
 
 	#[arg(
 		help = "Deny all outbound network connections except for network targets that are specifically allowed. Alternatively, you can provide a comma-separated list of network targets to deny",
@@ -494,6 +538,22 @@ impl DbsCapabilities {
 		self.allow_arbitrary_query.clone().unwrap_or(Targets::All) // arbitrary queries are enabled by default for the server
 	}
 
+	fn get_allow_eval_query(&self) -> Targets<EvalQueryTarget> {
+		// If there was a general deny for eval queries, we allow only the
+		// specific eval query subjects that are explicitly allowed.
+		if let Some(Targets::All) = self.deny_eval_query {
+			match &self.allow_eval_query {
+				Some(t @ Targets::Some(_)) => return t.clone(),
+				_ => return Targets::None,
+			}
+		}
+
+		// Unlike arbitrary queries, eval is NOT enabled by `--allow-all`: it must
+		// be explicitly enabled per subject group. If nothing was provided, eval
+		// is denied for everyone (Targets::None).
+		self.allow_eval_query.clone().unwrap_or(Targets::None)
+	}
+
 	fn get_deny_funcs(&self) -> Targets<FuncTarget> {
 		// Allowed functions already consider a global deny and a general deny for
 		// functions On top of what is explicitly allowed, we deny what is
@@ -567,12 +627,21 @@ impl DbsCapabilities {
 		}
 	}
 
+	fn get_deny_eval_query(&self) -> Targets<EvalQueryTarget> {
+		// On top of what is explicitly allowed, we deny what is specifically denied.
+		if let Some(t @ Targets::Some(_)) = &self.deny_eval_query {
+			t.clone()
+		} else {
+			Targets::None
+		}
+	}
+
 	pub fn into_cli_capabilities(self) -> Capabilities {
-		merge_capabilities(SdkCapabilities::all().into(), self)
+		merge_capabilities(SdkCapabilities::all().into(), &self)
 	}
 }
 
-fn merge_capabilities(initial: Capabilities, caps: DbsCapabilities) -> Capabilities {
+fn merge_capabilities(initial: Capabilities, caps: &DbsCapabilities) -> Capabilities {
 	initial
 		.with_scripting(caps.get_scripting())
 		.with_guest_access(caps.get_allow_guests())
@@ -588,39 +657,39 @@ fn merge_capabilities(initial: Capabilities, caps: DbsCapabilities) -> Capabilit
 		.without_experimental(caps.get_deny_experimental())
 		.with_arbitrary_query(caps.get_allow_arbitrary_query())
 		.without_arbitrary_query(caps.get_deny_arbitrary_query())
+		.with_eval_query(caps.get_allow_eval_query())
+		.without_eval_query(caps.get_deny_eval_query())
 		.with_planner_strategy(caps.planner_strategy)
 }
 
 impl From<DbsCapabilities> for Capabilities {
 	fn from(caps: DbsCapabilities) -> Self {
-		merge_capabilities(Default::default(), caps)
+		merge_capabilities(Default::default(), &caps)
 	}
 }
 
-/// Retry an async operation until it succeeds or a timeout is reached.
+/// Retry an async operation until it succeeds or the configured timeout is reached.
 /// This is required for operations that rely on remote or distributed KV store
 /// that may not be immediately available.
-///
-/// # Parameters
-/// - `operation_name`: Name of the operation for logging purposes
-/// - `f`: The async function to retry
-///
-/// # Returns
-/// The result of the operation if successful within the timeout
-async fn retry_with_timeout<F, Fut, T, E>(operation_name: &str, f: F) -> Result<T, anyhow::Error>
+async fn retry_with_timeout<F, Fut, T, E>(
+	operation_name: &str,
+	timeout_duration: Duration,
+	f: F,
+) -> Result<T, anyhow::Error>
 where
 	F: Fn() -> Fut,
 	Fut: Future<Output = Result<T, E>>,
 	E: std::fmt::Display + std::fmt::Debug,
 {
-	retry_with_timeout_check(operation_name, f, |_| false).await
+	retry_with_timeout_check(operation_name, timeout_duration, f, |_| false).await
 }
 
-/// Retry an async operation until it succeeds, a timeout is reached, or a
-/// permanent (non-transient) error is detected.
+/// Retry an async operation until it succeeds, the configured timeout is reached,
+/// or a permanent error is detected.
 ///
 /// # Parameters
 /// - `operation_name`: Name of the operation for logging purposes
+/// - `timeout_duration`: Total retry budget for this operation
 /// - `f`: The async function to retry
 /// - `is_permanent`: Predicate that returns `true` if an error is permanent and should not be
 ///   retried (e.g. storage version mismatch)
@@ -629,6 +698,7 @@ where
 /// The result of the operation if successful within the timeout
 async fn retry_with_timeout_check<F, Fut, T, E, P>(
 	operation_name: &str,
+	timeout_duration: Duration,
 	f: F,
 	is_permanent: P,
 ) -> Result<T, anyhow::Error>
@@ -638,7 +708,6 @@ where
 	E: std::fmt::Display + std::fmt::Debug,
 	P: Fn(&E) -> bool,
 {
-	let timeout_duration = Duration::from_secs(60);
 	let start = Instant::now();
 	let mut attempt = 0;
 
@@ -689,7 +758,7 @@ where
 				// Jitter adds randomness (0.5 to 1.5x) to prevent thundering herd
 				let base_backoff = Duration::from_millis(100 * 2u64.pow((attempt - 1).min(5)));
 				let base_backoff = base_backoff.min(Duration::from_secs(5));
-				let jitter = rand::thread_rng().gen_range(0.5..=1.5);
+				let jitter = rand::rng().random_range(0.5..=1.5);
 				let backoff = base_backoff.mul_f64(jitter);
 				sleep(backoff).await;
 			}
@@ -706,6 +775,9 @@ where
 }
 
 #[instrument(level = "trace", target = "surreal::dbs", skip_all)]
+// The return tuple is the established shape of this internal startup
+// entrypoint; the pending import is just one more element on it.
+#[allow(clippy::type_complexity)]
 /// Initialise the database server
 ///
 /// Creates and configures the datastore with the provided options.
@@ -721,10 +793,12 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 	composer: C,
 	opt: &Config,
 	canceller: CancellationToken,
+	observer: Arc<dyn ExecutionObserver>,
 	#[cfg_attr(not(storage), allow(unused_variables))] StartCommandDbsOptions {
 		strict_mode,
 		query_timeout,
 		transaction_timeout,
+		startup_operation_timeout,
 		unauthenticated,
 		capabilities,
 		temporary_directory,
@@ -735,8 +809,10 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 		default_namespace,
 		default_database,
 		no_defaults,
+		#[cfg_attr(not(feature = "surrealism"), allow(unused_variables))]
+		lazy_surrealism,
 	}: StartCommandDbsOptions,
-) -> Result<Datastore> {
+) -> Result<(Datastore, Receiver<Notification>, C::RouterState, PendingStartup)> {
 	// Warn about the strict mode flag being unused.
 	if let Some(true) = strict_mode {
 		warn!(
@@ -751,6 +827,7 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 	if let Some(v) = transaction_timeout {
 		debug!("Maximum transaction processing timeout is {v:?}");
 	}
+	debug!("Startup operation timeout is {startup_operation_timeout:?}");
 	// Log whether authentication is disabled
 	if unauthenticated {
 		warn!(
@@ -776,23 +853,48 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 	let capabilities = capabilities.into();
 	// Log the specified server capabilities
 	debug!("Server capabilities: {capabilities}");
+
+	let (send, recv) =
+		surrealdb_core::channel::bounded(surrealdb_core::cnf::NOTIFICATIONS_CHANNEL_SIZE);
+
+	let config = ConfigMap::from_env();
 	// Parse and setup the desired kv datastore
-	let dbs = Datastore::new_with_factory::<C>(composer, &opt.path, canceller)
-		.await?
-		.with_notifications()
+	let builder = Datastore::builder()
+		.with_config(config)
+		// Mirror the tokio runtime worker count the server built itself
+		// with (see `cnf::RUNTIME_WORKER_THREADS`) into the datastore
+		// config so the RocksDB engine sizes its inline-blocking permit
+		// cap from the actual executor width.
+		.with_runtime_worker_threads(*crate::cnf::RUNTIME_WORKER_THREADS)
 		.with_query_timeout(query_timeout)
 		.with_transaction_timeout(transaction_timeout)
-		.with_auth_enabled(!unauthenticated)
+		.with_auth(!unauthenticated)
 		.with_capabilities(capabilities)
-		.with_slow_log(slow_log_threshold, slow_log_param_allow, slow_log_param_deny);
+		.with_notify(send)
+		.with_shutdown_cancel(canceller)
+		.with_observer(observer);
+
 	#[cfg(storage)]
-	let dbs = dbs.with_temporary_directory(temporary_directory);
+	let builder = builder.with_temporary_directory(temporary_directory);
+
+	let builder = if let Some(slow_log_threshold) = slow_log_threshold {
+		builder.with_slow_log(slow_log_threshold, slow_log_param_allow, slow_log_param_deny)
+	} else {
+		builder
+	};
+
+	#[cfg(feature = "surrealism")]
+	let builder = builder.with_lazy_surrealism(lazy_surrealism);
+
+	let (dbs, router_state) =
+		builder.build_with_factory_path_and_router_state::<C>(&opt.path, composer).await?;
 	// Ensure the storage version is up to date to prevent corruption.
 	// OutdatedStorageVersion is a permanent condition (the data on disk is from
 	// an older version), so retrying it would waste time and delay pod restarts
 	// in Kubernetes environments where operators need fast failure feedback.
 	let (_, is_new) = retry_with_timeout_check(
 		"check_version",
+		startup_operation_timeout,
 		|| async { dbs.check_version().await },
 		|e| e.to_string().contains("out-of-date"),
 	)
@@ -802,49 +904,239 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 		let default_namespace = default_namespace.unwrap_or_else(|| "main".to_string());
 		let default_database = default_database.unwrap_or_else(|| "main".to_string());
 		// Initialise defaults
-		retry_with_timeout("initialise_defaults", || async {
+		retry_with_timeout("initialise_defaults", startup_operation_timeout, || async {
 			dbs.initialise_defaults(&default_namespace, &default_database).await
 		})
 		.await?;
 	}
-	// Import file at start, if provided
-	if let Some(file) = import_file {
-		// Log the startup import path
-		info!(target: TARGET, file = ?file, "Importing data from file");
-		// Read the full file contents
-		let sql = fs::read_to_string(file)?;
-		// Execute the SurrealQL file
-		retry_with_timeout("startup", || async { dbs.startup(&sql, &Session::owner()).await })
-			.await?;
+	// Defer the startup import so the caller can bind the HTTP listener first and
+	// run it concurrently (see [`finish_startup`]). A large or slow import no
+	// longer blocks the listener, so a pathological import cannot starve the
+	// liveness probe at startup.
+	//
+	// Credentials are created synchronously here when there is *no* import, so a
+	// plain server is fully ready the instant it starts serving (no readiness
+	// window for clients that don't poll `/ready`). When an import *is* present,
+	// credential creation is deferred to run after it, preserving the historical
+	// ordering: an import that supplies root users still suppresses creation of
+	// the CLI bootstrap user.
+	let credentials = opt.user.clone().zip(opt.pass.clone());
+	let deferred_credentials = match &import_file {
+		Some(_) => credentials,
+		None => {
+			if let Some((user, pass)) = &credentials {
+				info!(target: TARGET, user = %user, "Initialising credentials");
+				retry_with_timeout("initialise_credentials", startup_operation_timeout, || async {
+					dbs.initialise_credentials(user, pass).await
+				})
+				.await?;
+			}
+			None
+		}
+	};
+	let pending_startup = PendingStartup {
+		import_file,
+		credentials: deferred_credentials,
+		timeout: startup_operation_timeout,
+	};
+	// Bootstrap the datastore
+	retry_with_timeout("Insert node", startup_operation_timeout, || async {
+		dbs.insert_node().await
+	})
+	.await?;
+	retry_with_timeout("Expire nodes", startup_operation_timeout, || async {
+		dbs.expire_nodes().await
+	})
+	.await?;
+	retry_with_timeout("Remove nodes", startup_operation_timeout, || async {
+		dbs.remove_nodes().await
+	})
+	.await?;
+	// All ok
+	Ok((dbs, recv, router_state, pending_startup))
+}
+
+/// Startup work deferred out of [`init`] so the caller can bind the HTTP
+/// listener first and run it concurrently (via [`finish_startup`]). While this
+/// is running the instance is not yet ready to serve queries (see the readiness
+/// gate in `ntw`).
+pub(crate) struct PendingStartup {
+	/// SurrealQL file to import on startup, if one was provided.
+	import_file: Option<PathBuf>,
+	/// Root credentials (user, pass) to create if no root user already exists.
+	credentials: Option<(String, String)>,
+	/// Per-operation retry budget (from `SURREAL_STARTUP_OPERATION_TIMEOUT`).
+	timeout: Duration,
+}
+
+impl PendingStartup {
+	/// Whether there is any deferred work to run. When `false`, the caller can
+	/// mark the instance ready before binding (no startup window).
+	pub(crate) fn has_work(&self) -> bool {
+		self.import_file.is_some() || self.credentials.is_some()
 	}
-	// Setup initial server auth credentials
-	if let (Some(user), Some(pass)) = (opt.user.as_ref(), opt.pass.as_ref()) {
-		// Log the initialisation of credentials
-		info!(target: TARGET, user = %user, "Initialising credentials");
-		// Initialise the credentials
-		retry_with_timeout("initialise_credentials", || async {
-			dbs.initialise_credentials(user, pass).await
+}
+
+/// Run the deferred startup work: execute the import file (if any), then
+/// initialise the root credentials (if provided).
+///
+/// The import runs *before* credential initialisation so that an import which
+/// supplies root users suppresses creation of the CLI bootstrap user, matching
+/// the historical (pre-early-bind) ordering.
+pub(crate) async fn finish_startup(ds: &Datastore, pending: &PendingStartup) -> Result<()> {
+	// Import the startup file, discarding the per-statement results.
+	if let Some(file) = &pending.import_file {
+		info!(target: TARGET, file = ?file, "Importing data from file");
+		let sql = fs::read_to_string(file)?;
+		retry_with_timeout("startup", pending.timeout, || async {
+			ds.startup(&sql, &Session::owner()).await
 		})
 		.await?;
 	}
-	// Bootstrap the datastore
-	retry_with_timeout("Insert node", || async { dbs.insert_node().await }).await?;
-	retry_with_timeout("Expire nodes", || async { dbs.expire_nodes().await }).await?;
-	retry_with_timeout("Remove nodes", || async { dbs.remove_nodes().await }).await?;
-	// All ok
-	Ok(dbs)
+	// Create the CLI-provided root user if no root user exists yet.
+	if let Some((user, pass)) = &pending.credentials {
+		info!(target: TARGET, user = %user, "Initialising credentials");
+		retry_with_timeout("initialise_credentials", pending.timeout, || async {
+			ds.initialise_credentials(user, pass).await
+		})
+		.await?;
+	}
+	Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+	use std::ffi::OsString;
 	use std::str::FromStr;
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
+	use clap::Parser;
+	use serial_test::serial;
 	use surrealdb_types::ToSql;
 	use test_log::test;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	use super::*;
+
+	const STARTUP_OPERATION_TIMEOUT_ENV: &str = "SURREAL_STARTUP_OPERATION_TIMEOUT";
+
+	struct EnvGuard {
+		key: &'static str,
+		old: Option<OsString>,
+	}
+
+	impl EnvGuard {
+		fn set(key: &'static str, value: &str) -> Self {
+			let old = std::env::var_os(key);
+			// SAFETY: These tests mutate a single process environment variable and are
+			// serialized so no other test in this module observes the temporary value.
+			unsafe {
+				std::env::set_var(key, value);
+			}
+			Self {
+				key,
+				old,
+			}
+		}
+
+		fn remove(key: &'static str) -> Self {
+			let old = std::env::var_os(key);
+			// SAFETY: These tests mutate a single process environment variable and are
+			// serialized so no other test in this module observes the temporary value.
+			unsafe {
+				std::env::remove_var(key);
+			}
+			Self {
+				key,
+				old,
+			}
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			// SAFETY: The guard restores the serialized test's temporary environment change.
+			unsafe {
+				match &self.old {
+					Some(value) => std::env::set_var(self.key, value),
+					None => std::env::remove_var(self.key),
+				}
+			}
+		}
+	}
+
+	#[derive(Parser, Debug)]
+	struct TestCli {
+		#[command(flatten)]
+		dbs: StartCommandDbsOptions,
+	}
+
+	#[test]
+	#[serial]
+	fn startup_operation_timeout_defaults_to_sixty_seconds() {
+		let _guard = EnvGuard::remove(STARTUP_OPERATION_TIMEOUT_ENV);
+		let cli = TestCli::try_parse_from(["surrealdb"]).unwrap();
+		assert_eq!(cli.dbs.startup_operation_timeout, Duration::from_secs(60));
+	}
+
+	#[test]
+	fn startup_operation_timeout_can_be_set_from_cli() {
+		let cli =
+			TestCli::try_parse_from(["surrealdb", "--startup-operation-timeout", "10m"]).unwrap();
+		assert_eq!(cli.dbs.startup_operation_timeout, Duration::from_secs(10 * 60));
+	}
+
+	#[test]
+	#[serial]
+	fn startup_operation_timeout_can_be_set_from_env() {
+		let _guard = EnvGuard::set(STARTUP_OPERATION_TIMEOUT_ENV, "75s");
+		let cli = TestCli::try_parse_from(["surrealdb"]).unwrap();
+		assert_eq!(cli.dbs.startup_operation_timeout, Duration::from_secs(75));
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn startup_retry_times_out_attempt_without_retrying() {
+		let attempts = Arc::new(AtomicUsize::new(0));
+
+		let err = retry_with_timeout("test operation", Duration::from_millis(10), || {
+			let attempts = Arc::clone(&attempts);
+			async move {
+				attempts.fetch_add(1, Ordering::SeqCst);
+				sleep(Duration::from_millis(50)).await;
+				Ok::<_, &'static str>(())
+			}
+		})
+		.await
+		.unwrap_err();
+
+		assert!(err.to_string().contains("timed out after 1 attempts"));
+		assert_eq!(attempts.load(Ordering::SeqCst), 1);
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn startup_retry_returns_permanent_errors_immediately() {
+		let attempts = Arc::new(AtomicUsize::new(0));
+
+		let err = retry_with_timeout_check(
+			"test operation",
+			Duration::from_millis(100),
+			|| {
+				let attempts = Arc::clone(&attempts);
+				async move {
+					attempts.fetch_add(1, Ordering::SeqCst);
+					Err::<(), _>("permanent")
+				}
+			},
+			|e| *e == "permanent",
+		)
+		.await
+		.unwrap_err();
+
+		assert_eq!(err.to_string(), "permanent");
+		assert_eq!(attempts.load(Ordering::SeqCst), 1);
+	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_capabilities() {
@@ -897,11 +1189,15 @@ mod tests {
 			//
 			// 0 - Functions and Networking are allowed
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::All),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::All),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				format!("RETURN http::get('{}')", server1.uri()),
 				true,
@@ -910,10 +1206,11 @@ mod tests {
 			//
 			// 1 - Scripting is allowed
 			(
-				Datastore::new("memory")
+				Datastore::builder()
+					.with_capabilities(Capabilities::default().with_scripting(true))
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_capabilities(Capabilities::default().with_scripting(true)),
+					.unwrap(),
 				Session::owner(),
 				"RETURN function() { return '1' }".to_string(),
 				true,
@@ -922,10 +1219,11 @@ mod tests {
 			//
 			// 2 - Scripting is not allowed
 			(
-				Datastore::new("memory")
+				Datastore::builder()
+					.with_capabilities(Capabilities::default().with_scripting(false))
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_capabilities(Capabilities::default().with_scripting(false)),
+					.unwrap(),
 				Session::owner(),
 				"RETURN function() { return '1' }".to_string(),
 				false,
@@ -934,11 +1232,12 @@ mod tests {
 			//
 			// 3 - Anonymous actor when guest access is allowed and auth is enabled, succeeds
 			(
-				Datastore::new("memory")
+				Datastore::builder()
+					.with_capabilities(Capabilities::default().with_guest_access(true))
+					.with_auth(true)
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_auth_enabled(true)
-					.with_capabilities(Capabilities::default().with_guest_access(true)),
+					.unwrap(),
 				Session::default(),
 				"RETURN 1".to_string(),
 				true,
@@ -948,11 +1247,12 @@ mod tests {
 			// 4 - Anonymous actor when guest access is not allowed and auth is enabled, throws
 			// error
 			(
-				Datastore::new("memory")
+				Datastore::builder()
+					.with_capabilities(Capabilities::default().with_guest_access(false))
+					.with_auth(true)
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_auth_enabled(true)
-					.with_capabilities(Capabilities::default().with_guest_access(false)),
+					.unwrap(),
 				Session::default(),
 				"RETURN 1".to_string(),
 				false,
@@ -961,11 +1261,12 @@ mod tests {
 			//
 			// 5 - Anonymous actor when guest access is not allowed and auth is disabled, succeeds
 			(
-				Datastore::new("memory")
+				Datastore::builder()
+					.with_auth(false)
+					.with_capabilities(Capabilities::default().with_guest_access(false))
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_auth_enabled(false)
-					.with_capabilities(Capabilities::default().with_guest_access(false)),
+					.unwrap(),
 				Session::default(),
 				"RETURN 1".to_string(),
 				true,
@@ -975,11 +1276,12 @@ mod tests {
 			// 6 - Authenticated user when guest access is not allowed and auth is enabled,
 			// succeeds
 			(
-				Datastore::new("memory")
+				Datastore::builder()
+					.with_auth(true)
+					.with_capabilities(Capabilities::default().with_guest_access(false))
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_auth_enabled(true)
-					.with_capabilities(Capabilities::default().with_guest_access(false)),
+					.unwrap(),
 				Session::viewer(),
 				"RETURN 1".to_string(),
 				true,
@@ -987,9 +1289,13 @@ mod tests {
 			),
 			// 7 - Specific experimental feature enabled
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default().with_experimental(ExperimentalTarget::Files.into()),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default().with_experimental(ExperimentalTarget::Files.into()),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner().with_ns("test").with_db("test"),
 				"DEFINE BUCKET test BACKEND \"memory\";".to_string(),
 				true,
@@ -997,9 +1303,14 @@ mod tests {
 			),
 			// 8 - Specific experimental feature disabled
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default().without_experimental(ExperimentalTarget::Files.into()),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.without_experimental(ExperimentalTarget::Files.into()),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner().with_ns("test").with_db("test"),
 				"DEFINE BUCKET test BACKEND \"memory\";".to_string(),
 				false,
@@ -1008,15 +1319,19 @@ mod tests {
 			//
 			// 9 - Some functions are not allowed
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::Some(
-							[FuncTarget::from_str("string::*").unwrap()].into(),
-						))
-						.without_functions(Targets::<FuncTarget>::Some(
-							[FuncTarget::from_str("string::len").unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::Some(
+								[FuncTarget::from_str("string::*").unwrap()].into(),
+							))
+							.without_functions(Targets::<FuncTarget>::Some(
+								[FuncTarget::from_str("string::len").unwrap()].into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				"RETURN string::len('a')".to_string(),
 				false,
@@ -1024,15 +1339,19 @@ mod tests {
 			),
 			// 10 -
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::Some(
-							[FuncTarget::from_str("string::*").unwrap()].into(),
-						))
-						.without_functions(Targets::<FuncTarget>::Some(
-							[FuncTarget::from_str("string::len").unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::Some(
+								[FuncTarget::from_str("string::*").unwrap()].into(),
+							))
+							.without_functions(Targets::<FuncTarget>::Some(
+								[FuncTarget::from_str("string::len").unwrap()].into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				"RETURN string::lowercase('A')".to_string(),
 				true,
@@ -1040,15 +1359,19 @@ mod tests {
 			),
 			// 11 -
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::Some(
-							[FuncTarget::from_str("string::*").unwrap()].into(),
-						))
-						.without_functions(Targets::<FuncTarget>::Some(
-							[FuncTarget::from_str("string::len").unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::Some(
+								[FuncTarget::from_str("string::*").unwrap()].into(),
+							))
+							.without_functions(Targets::<FuncTarget>::Some(
+								[FuncTarget::from_str("string::len").unwrap()].into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				"RETURN time::now()".to_string(),
 				false,
@@ -1057,20 +1380,25 @@ mod tests {
 			//
 			// 12 - Some net targets are not allowed
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::Some(
-							[
-								NetTarget::from_str(&server1.address().to_string()).unwrap(),
-								NetTarget::from_str(&server2.address().to_string()).unwrap(),
-							]
-							.into(),
-						))
-						.without_network_targets(Targets::<NetTarget>::Some(
-							[NetTarget::from_str(&server1.address().to_string()).unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::Some(
+								[
+									NetTarget::from_str(&server1.address().to_string()).unwrap(),
+									NetTarget::from_str(&server2.address().to_string()).unwrap(),
+								]
+								.into(),
+							))
+							.without_network_targets(Targets::<NetTarget>::Some(
+								[NetTarget::from_str(&server1.address().to_string()).unwrap()]
+									.into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				format!("RETURN http::get('{}')", server1.uri()),
 				false,
@@ -1078,20 +1406,25 @@ mod tests {
 			),
 			// 13 -
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::Some(
-							[
-								NetTarget::from_str(&server1.address().to_string()).unwrap(),
-								NetTarget::from_str(&server2.address().to_string()).unwrap(),
-							]
-							.into(),
-						))
-						.without_network_targets(Targets::<NetTarget>::Some(
-							[NetTarget::from_str(&server1.address().to_string()).unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::Some(
+								[
+									NetTarget::from_str(&server1.address().to_string()).unwrap(),
+									NetTarget::from_str(&server2.address().to_string()).unwrap(),
+								]
+								.into(),
+							))
+							.without_network_targets(Targets::<NetTarget>::Some(
+								[NetTarget::from_str(&server1.address().to_string()).unwrap()]
+									.into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				"RETURN http::get('http://1.1.1.1')".to_string(),
 				false,
@@ -1099,20 +1432,25 @@ mod tests {
 			),
 			// 14 -
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::Some(
-							[
-								NetTarget::from_str(&server1.address().to_string()).unwrap(),
-								NetTarget::from_str(&server2.address().to_string()).unwrap(),
-							]
-							.into(),
-						))
-						.without_network_targets(Targets::<NetTarget>::Some(
-							[NetTarget::from_str(&server1.address().to_string()).unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::Some(
+								[
+									NetTarget::from_str(&server1.address().to_string()).unwrap(),
+									NetTarget::from_str(&server2.address().to_string()).unwrap(),
+								]
+								.into(),
+							))
+							.without_network_targets(Targets::<NetTarget>::Some(
+								[NetTarget::from_str(&server1.address().to_string()).unwrap()]
+									.into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				format!("RETURN http::get('{}')", server2.uri()),
 				true,
@@ -1120,16 +1458,22 @@ mod tests {
 			),
 			(
 				// 15 - Ensure redirect fails
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::Some(
-							[NetTarget::from_str(&server3.address().to_string()).unwrap()].into(),
-						))
-						.without_network_targets(Targets::<NetTarget>::Some(
-							[NetTarget::from_str(&server1.address().to_string()).unwrap()].into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::Some(
+								[NetTarget::from_str(&server3.address().to_string()).unwrap()]
+									.into(),
+							))
+							.without_network_targets(Targets::<NetTarget>::Some(
+								[NetTarget::from_str(&server1.address().to_string()).unwrap()]
+									.into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				format!("RETURN http::get('{}/redirect')", server3.uri()),
 				false,
@@ -1140,11 +1484,15 @@ mod tests {
 			),
 			(
 				// 16 - Ensure connecting via localhost succeed
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::All),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::All),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				format!("RETURN http::get('http://localhost:{}/test')", server1.address().port()),
 				true,
@@ -1153,18 +1501,22 @@ mod tests {
 			// - 17
 			(
 				// Ensure connecting via localhost is denied when all IPs are blocked
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::All)
-						.without_network_targets(Targets::<NetTarget>::Some(
-							[
-								NetTarget::from_str("127.0.0.1/0").unwrap(),
-								NetTarget::from_str("::/0").unwrap(),
-							]
-							.into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::All)
+							.without_network_targets(Targets::<NetTarget>::Some(
+								[
+									NetTarget::from_str("127.0.0.1/0").unwrap(),
+									NetTarget::from_str("::/0").unwrap(),
+								]
+								.into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				format!("RETURN http::get('http://localhost:{}')", server1.address().port()),
 				false,
@@ -1172,34 +1524,38 @@ mod tests {
 			),
 			// 18 - Ensure redirect succeed
 			(
-				Datastore::new("memory").await.unwrap().with_capabilities(
-					Capabilities::default()
-						.with_functions(Targets::<FuncTarget>::All)
-						.with_network_targets(Targets::<NetTarget>::Some(
-							[NetTarget::from_str("github.com").unwrap()].into(),
-						))
-						.without_network_targets(Targets::<NetTarget>::Some(
-							[
-								NetTarget::from_str("0.0.0.0/8").unwrap(),
-								NetTarget::from_str("10.0.0.0/8").unwrap(),
-								NetTarget::from_str("10.18.0.0/16").unwrap(),
-								NetTarget::from_str("10.2.0.0/16").unwrap(),
-								NetTarget::from_str("100.64.0.0/10").unwrap(),
-								NetTarget::from_str("127.0.0.0/8").unwrap(),
-								NetTarget::from_str("169.254.0.0/16").unwrap(),
-								NetTarget::from_str("172.16.0.0/12").unwrap(),
-								NetTarget::from_str("172.20.0.0/16").unwrap(),
-								NetTarget::from_str("192.0.0.0/24").unwrap(),
-								NetTarget::from_str("192.168.0.0/16").unwrap(),
-								NetTarget::from_str("192.88.99.0/24").unwrap(),
-								NetTarget::from_str("198.18.0.0/15").unwrap(),
-								NetTarget::from_str("::1/128").unwrap(),
-								NetTarget::from_str("fc00::/7").unwrap(),
-								NetTarget::from_str("fc00::/8").unwrap(),
-							]
-							.into(),
-						)),
-				),
+				Datastore::builder()
+					.with_capabilities(
+						Capabilities::default()
+							.with_functions(Targets::<FuncTarget>::All)
+							.with_network_targets(Targets::<NetTarget>::Some(
+								[NetTarget::from_str("github.com").unwrap()].into(),
+							))
+							.without_network_targets(Targets::<NetTarget>::Some(
+								[
+									NetTarget::from_str("0.0.0.0/8").unwrap(),
+									NetTarget::from_str("10.0.0.0/8").unwrap(),
+									NetTarget::from_str("10.18.0.0/16").unwrap(),
+									NetTarget::from_str("10.2.0.0/16").unwrap(),
+									NetTarget::from_str("100.64.0.0/10").unwrap(),
+									NetTarget::from_str("127.0.0.0/8").unwrap(),
+									NetTarget::from_str("169.254.0.0/16").unwrap(),
+									NetTarget::from_str("172.16.0.0/12").unwrap(),
+									NetTarget::from_str("172.20.0.0/16").unwrap(),
+									NetTarget::from_str("192.0.0.0/24").unwrap(),
+									NetTarget::from_str("192.168.0.0/16").unwrap(),
+									NetTarget::from_str("192.88.99.0/24").unwrap(),
+									NetTarget::from_str("198.18.0.0/15").unwrap(),
+									NetTarget::from_str("::1/128").unwrap(),
+									NetTarget::from_str("fc00::/7").unwrap(),
+									NetTarget::from_str("fc00::/8").unwrap(),
+								]
+								.into(),
+							)),
+					)
+					.build_with_path("memory")
+					.await
+					.unwrap(),
 				Session::owner(),
 				// This will be redirected to: https://github.com/surrealdb/surrealdb/pull/6293
 				"RETURN http::get('https://github.com/surrealdb/surrealdb/issues/6293')"
@@ -1248,20 +1604,24 @@ mod tests {
 	fn test_dbs_capabilities_target_all() {
 		let caps = DbsCapabilities {
 			allow_all: false,
+			#[cfg(feature = "scripting")]
 			allow_scripting: false,
 			allow_guests: false,
 			allow_funcs: None,
 			allow_experimental: Some(Targets::All),
 			allow_arbitrary_query: Some(Targets::All),
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: None,
 			deny_all: false,
+			#[cfg(feature = "scripting")]
 			deny_scripting: false,
 			deny_guests: false,
 			deny_funcs: None,
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: None,
@@ -1269,6 +1629,43 @@ mod tests {
 		};
 		assert_eq!(caps.get_allow_experimental(), Targets::All);
 		assert_eq!(caps.get_allow_arbitrary_query(), Targets::All);
+	}
+
+	#[test]
+	fn test_dbs_capabilities_eval_query_denied_by_default() {
+		// Even with allow_all set, eval is denied unless explicitly enabled, and
+		// arbitrary-query (which it is also gated by) stays enabled.
+		let mut caps = DbsCapabilities {
+			allow_all: true,
+			#[cfg(feature = "scripting")]
+			allow_scripting: false,
+			allow_guests: false,
+			allow_funcs: None,
+			allow_experimental: None,
+			allow_arbitrary_query: None,
+			allow_eval_query: None,
+			allow_net: None,
+			allow_rpc: None,
+			allow_http: None,
+			deny_all: false,
+			#[cfg(feature = "scripting")]
+			deny_scripting: false,
+			deny_guests: false,
+			deny_funcs: None,
+			deny_experimental: None,
+			deny_arbitrary_query: None,
+			deny_eval_query: None,
+			deny_net: None,
+			deny_rpc: None,
+			deny_http: None,
+			planner_strategy: NewPlannerStrategy::default(),
+		};
+		assert_eq!(caps.get_allow_arbitrary_query(), Targets::All);
+		assert_eq!(caps.get_allow_eval_query(), Targets::None, "eval is not enabled by allow_all");
+
+		// Explicitly enabling a subject group turns it on.
+		caps.allow_eval_query = Some(Targets::from(EvalQueryTarget::System));
+		assert_eq!(caps.get_allow_eval_query(), Targets::from(EvalQueryTarget::System));
 	}
 
 	#[test]
@@ -1283,6 +1680,7 @@ mod tests {
 			allow_funcs: Some(Targets::All),
 			allow_experimental: None,
 			allow_arbitrary_query: None,
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: None,
@@ -1293,6 +1691,7 @@ mod tests {
 			deny_funcs: Some(Targets::All),
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: None,
@@ -1314,6 +1713,7 @@ mod tests {
 			allow_funcs: None,
 			allow_experimental: None,
 			allow_arbitrary_query: None,
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: Some(Targets::All),
@@ -1324,6 +1724,7 @@ mod tests {
 			deny_funcs: None,
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: Some(Targets::All),
@@ -1345,6 +1746,7 @@ mod tests {
 			allow_funcs: Some(Targets::None),
 			allow_experimental: None,
 			allow_arbitrary_query: None,
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: None,
@@ -1355,6 +1757,7 @@ mod tests {
 			deny_funcs: Some(Targets::All),
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: None,

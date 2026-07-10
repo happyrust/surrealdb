@@ -2,6 +2,7 @@ use std::ops::Deref;
 
 use anyhow::Result;
 use reblessive::tree::Stk;
+use surrealdb_strand::Strand;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use super::AlterKind;
@@ -16,7 +17,7 @@ use crate::val::Value;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct AlterParamStatement {
-	pub name: String,
+	pub name: Strand,
 	pub if_exists: bool,
 	pub value: Option<Expr>,
 	pub comment: AlterKind<String>,
@@ -32,12 +33,12 @@ impl AlterParamStatement {
 		opt: &Options,
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
-		opt.is_allowed(Action::Edit, ResourceKind::Parameter, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Parameter, Base::Db)?;
 		let (_, _) = opt.ns_db()?;
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 		let txn = ctx.tx();
 
-		let mut pa = match txn.get_db_param(ns, db, &self.name).await {
+		let mut pa = match txn.get_db_param(ns, db, &self.name, None).await {
 			Ok(v) => v.deref().clone(),
 			Err(e) => {
 				if self.if_exists {
@@ -62,7 +63,7 @@ impl AlterParamStatement {
 		}
 
 		let key = crate::key::database::pa::new(ns, db, &self.name);
-		txn.set(&key, &pa, None).await?;
+		txn.set(&key, &pa).await?;
 		txn.clear_cache();
 		Ok(Value::None)
 	}

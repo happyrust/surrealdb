@@ -41,14 +41,14 @@ impl DefineEventStatement {
 		);
 
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Event, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Event, Base::Db)?;
 		// Get the NS and DB
 		let (ns_name, db_name) = opt.ns_db()?;
 		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
 		// Fetch the transaction
 		let txn = ctx.tx();
 		// Check if the definition exists
-		if txn.get_tb_event(ns, db, &target_table, &name).await.is_ok() {
+		if txn.get_tb_event(ns, db, &target_table, &name, None).await.is_ok() {
 			match self.kind {
 				DefineKind::Default => {
 					if !opt.import {
@@ -63,7 +63,7 @@ impl DefineEventStatement {
 		}
 
 		// Ensure the table exists
-		let tb = txn.get_or_add_tb(Some(ctx), ns_name, db_name, &target_table).await?;
+		let tb = txn.get_or_add_tb(Some(ctx), ns_name, db_name, &target_table, None).await?;
 
 		let comment = stk
 			.run(|stk| self.comment.compute(stk, ctx, opt, doc))
@@ -76,7 +76,7 @@ impl DefineEventStatement {
 		txn.set(
 			&key,
 			&EventDefinition {
-				name: name.clone(),
+				name: name.clone().into(),
 				target_table: target_table.clone(),
 				when: self.when.clone(),
 				then: self.then.clone(),
@@ -84,7 +84,6 @@ impl DefineEventStatement {
 				comment,
 				kind: self.event_kind.clone(),
 			},
-			None,
 		)
 		.await?;
 
@@ -93,13 +92,7 @@ impl DefineEventStatement {
 			cache_events_ts: Uuid::now_v7(),
 			..tb.as_ref().clone()
 		};
-
 		txn.put_tb(ns_name, db_name, &tb).await?;
-
-		// Clear the cache
-		if let Some(cache) = ctx.get_cache() {
-			cache.clear_tb(ns, db, &target_table);
-		}
 		// Clear the cache
 		txn.clear_cache();
 		// Ok all good

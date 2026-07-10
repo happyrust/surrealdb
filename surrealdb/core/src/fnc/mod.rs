@@ -18,6 +18,7 @@ pub mod count;
 pub mod crypto;
 pub mod duration;
 pub mod encoding;
+pub mod eval;
 pub mod file;
 pub mod geo;
 pub mod http;
@@ -88,8 +89,10 @@ pub async fn run(
 		|| name.eq("type::field")
 		|| name.eq("type::fields")
 		|| name.eq("value::diff")
+		|| name.eq("value::expect")
 		|| name.eq("value::patch")
 		|| name.eq("sequence::nextval")
+		|| name.starts_with("eval::")
 		|| name.starts_with("api")
 		|| name.starts_with("http")
 		|| name.starts_with("search")
@@ -591,6 +594,9 @@ pub async fn asynchronous(
 		"api::res::header" => api::res::header((stk, ctx, opt, doc)).await,
 		"api::res::headers" => api::res::headers((stk, ctx, opt, doc)).await,
 		//
+		"eval::surql" => eval::surql((stk, ctx, opt, doc)).await,
+		"eval::gql" => eval::gql((stk, ctx, opt, doc)).await,
+		//
 		"array::all" => array::all((stk, ctx, Some(opt), doc)).await,
 		"array::any" => array::any((stk, ctx, Some(opt), doc)).await,
 		"array::every" => array::all((stk, ctx, Some(opt), doc)).await,
@@ -659,12 +665,13 @@ pub async fn asynchronous(
 		"type::fields" => r#type::fields((stk, ctx, Some(opt), doc)).await,
 		//
 		"value::diff" => value::diff.await,
+		"value::expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 		"value::patch" => value::patch.await,
 		"schema::table::exists" => schema::table::exists((ctx, Some(opt))).await,
 	)
 }
 
-/// Attempts to run any synchronous function.
+/// Attempts to run any function using method syntax.
 pub async fn idiom(
 	stk: &mut Stk,
 	ctx: &FrozenContext,
@@ -687,13 +694,25 @@ pub async fn idiom(
 				"add" => set::add,
 				"all" => set::all((stk, ctx, Some(opt), doc)).await,
 				"any" => set::any((stk, ctx, Some(opt), doc)).await,
+				"at" => set::at,
 				"complement" => set::complement,
 				"contains" => set::contains,
 				"difference" => set::difference,
+				"filter" => set::filter((stk, ctx, Some(opt), doc)).await,
+				"find" => set::find((stk, ctx, Some(opt), doc)).await,
+				"first" => set::first,
+				"flatten" => set::flatten,
+				"fold" => set::fold((stk, ctx, Some(opt), doc)).await,
+				"join" => set::join,
 				"intersect" => set::intersect,
-				"is_empty" => set::is_empty,
+				"last" => set::last,
 				"len" => set::len,
+				"map" => set::map((stk, ctx, Some(opt), doc)).await,
+				"max" => set::max,
+				"min" => set::min,
+				"reduce" => set::reduce((stk, ctx, Some(opt), doc)).await,
 				"remove" => set::remove,
+				"slice" => set::slice,
 				"union" => set::union,
 				//
 				"type_of" => r#type::type_of,
@@ -704,6 +723,7 @@ pub async fn idiom(
 				"is_datetime" => r#type::is::datetime,
 				"is_decimal" => r#type::is::decimal,
 				"is_duration" => r#type::is::duration,
+				"is_empty" => set::is_empty,
 				"is_float" => r#type::is::float,
 				"is_geometry" => r#type::is::geometry,
 				"is_int" => r#type::is::int,
@@ -742,6 +762,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -885,6 +906,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -947,6 +969,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1017,6 +1040,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1086,6 +1110,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1152,6 +1177,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1221,6 +1247,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1301,6 +1328,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1416,6 +1444,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 			)
@@ -1501,6 +1530,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1575,6 +1605,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1636,6 +1667,7 @@ pub async fn idiom(
 				"to_uuid" => r#type::uuid,
 				//
 				"chain" => value::chain((stk, ctx, Some(opt), doc)).await,
+				"expect" => value::expect((stk, ctx, Some(opt), doc)).await,
 				"diff" => value::diff.await,
 				"patch" => value::patch.await,
 				//
@@ -1756,6 +1788,7 @@ fn idiom_name_to_normal(kind: &str, name: &str) -> String {
 mod tests {
 	use regex::Regex;
 
+	use crate::cnf::CommonConfig;
 	use crate::dbs::Capabilities;
 	use crate::sql::{Expr, Function};
 
@@ -1790,8 +1823,11 @@ mod tests {
 			let (quote, _) = line.split_once("=>").unwrap();
 			let name = quote.trim().trim_matches('"');
 
-			let res =
-				crate::syn::expr_with_capabilities(&format!("{}()", name), &Capabilities::all());
+			let res = crate::syn::expr_with_capabilities(
+				&format!("{}()", name),
+				&Capabilities::all(),
+				&CommonConfig::default(),
+			);
 
 			if let Ok(Expr::FunctionCall(call)) = res {
 				match call.receiver {
@@ -1813,10 +1849,11 @@ mod tests {
 				let name = name.replace("::", ".");
 				let sql =
 					format!("RETURN function() {{ return typeof surrealdb.functions.{name}; }}");
-				let dbs = crate::kvs::Datastore::new("memory")
+				let dbs = crate::kvs::Datastore::builder()
+					.with_capabilities(Capabilities::all())
+					.build_with_path("memory")
 					.await
-					.unwrap()
-					.with_capabilities(Capabilities::all());
+					.unwrap();
 				let ses = crate::dbs::Session::owner().with_ns("test").with_db("test");
 				let res = &mut dbs.execute(&sql, &ses, None).await.unwrap();
 				let tmp = res.remove(0).result.unwrap();

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod helpers;
 use anyhow::Result;
 use helpers::new_ds;
@@ -31,7 +33,7 @@ async fn concurrency() -> Result<()> {
 	/// Returns `true` if `limit` futures are concurrently executed.
 	async fn test_limit(limit: usize) -> Result<bool> {
 		let sql = query(limit, MILLIS);
-		let dbs = new_ds("test", "test").await?;
+		let (_, dbs) = new_ds("test", "test", false).await?;
 		let ses = Session::owner().with_ns("test").with_db("test");
 		let res = dbs.execute(&sql, &ses, None).await;
 

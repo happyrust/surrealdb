@@ -21,14 +21,14 @@ impl RemoveModuleStatement {
 	/// Process this type returning a computed simple Value
 	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Module, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Module, Base::Db)?;
 		// Get the transaction
 		let txn = ctx.tx();
 		// Get the definition
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 		let storage_name = self.name.get_storage_name();
 		#[cfg_attr(not(feature = "surrealism"), allow(unused_variables))]
-		let md = match txn.get_db_module(ns, db, &storage_name).await {
+		let md = match txn.get_db_module(ns, db, &storage_name, None).await {
 			Ok(x) => x,
 			Err(e) => {
 				if self.if_exists && matches!(e.downcast_ref(), Some(Error::MdNotFound { .. })) {

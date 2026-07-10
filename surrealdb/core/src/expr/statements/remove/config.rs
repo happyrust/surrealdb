@@ -19,10 +19,11 @@ impl RemoveConfigStatement {
 	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
 		let base = self.kind.base();
 		// Allowed to run?
-		opt.is_allowed(
+		ctx.is_allowed(
+			opt,
 			Action::Edit,
 			ResourceKind::Config(self.kind.clone()),
-			&base.clone().into(),
+			base.clone().into(),
 		)?;
 		let cg = match &self.kind {
 			ConfigKind::GraphQL => "graphql",
@@ -47,7 +48,7 @@ impl RemoveConfigStatement {
 			}
 			Base::Db => {
 				let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
-				if txn.get_db_config(ns, db, cg).await?.is_none() {
+				if txn.get_db_config(ns, db, cg, None).await?.is_none() {
 					if self.if_exists {
 						return Ok(Value::None);
 					} else {

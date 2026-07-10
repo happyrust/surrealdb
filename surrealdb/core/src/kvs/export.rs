@@ -4,19 +4,17 @@ use anyhow::Result;
 use async_channel::Sender;
 use surrealdb_types::{SurrealValue, ToSql};
 
-use super::Transaction;
+use super::{KVValue, Transaction};
 use crate::catalog::providers::{
 	ApiProvider, AuthorisationProvider, BucketProvider, DatabaseProvider, TableProvider,
 	UserProvider,
 };
 use crate::catalog::{DatabaseId, NamespaceId, Record, TableDefinition};
-use crate::cnf::EXPORT_BATCH_SIZE;
 use crate::err::Error;
 use crate::expr::paths::{IN, OUT};
 use crate::expr::statements::define::{DefineAccessStatement, DefineUserStatement};
 use crate::expr::{Base, DefineAnalyzerStatement};
 use crate::key::record;
-use crate::kvs::KVValue;
 use crate::sql::statements::OptionStatement;
 
 #[derive(Clone, Debug, SurrealValue)]
@@ -79,9 +77,10 @@ pub enum TableConfig {
 	Exclude(ExcludedTables),
 }
 
-// TODO: This should probably be removed
-// This is not a good from implementation,
-// It is not direct: What true and false mean when converted to a table config?
+// `From<bool>` exists so the SDK's `ExportBuilder::tables(impl Into<TableConfig>)`
+// accepts `tables(true)` / `tables(false)` directly. The semantics are
+// documented at the call site (`surrealdb/src/method/export.rs::tables`):
+// `true` selects all tables, `false` selects none.
 impl From<bool> for TableConfig {
 	fn from(value: bool) -> Self {
 		match value {
@@ -142,9 +141,9 @@ impl<F: fmt::Write> fmt::Write for InlineCommentWriter<'_, F> {
 			'\r' => self.0.write_str("\\r"),
 			// NEL/Next Line
 			'\u{0085}' => self.0.write_str("\\u{0085}"),
-			// line seperator
+			// line separator
 			'\u{2028}' => self.0.write_str("\\u{2028}"),
-			// Paragraph seperator
+			// Paragraph separator
 			'\u{2029}' => self.0.write_str("\\u{2029}"),
 			_ => self.0.write_char(c),
 		}
@@ -165,9 +164,10 @@ impl Transaction {
 		ns: &str,
 		db: &str,
 		cfg: Config,
+		batch_size: u32,
 		chn: Sender<Vec<u8>>,
 	) -> Result<()> {
-		let db = self.get_db_by_name(ns, db).await?.ok_or_else(|| {
+		let db = self.get_db_by_name(ns, db, None).await?.ok_or_else(|| {
 			anyhow::Error::new(Error::DbNotFound {
 				name: db.to_owned(),
 			})
@@ -176,7 +176,7 @@ impl Transaction {
 		// Output USERS, ACCESSES, PARAMS, FUNCTIONS, ANALYZERS
 		self.export_metadata(&cfg, &chn, db.namespace_id, db.database_id).await?;
 		// Output TABLES
-		self.export_tables(&cfg, &chn, db.namespace_id, db.database_id).await?;
+		self.export_tables(&cfg, &chn, db.namespace_id, db.database_id, batch_size).await?;
 		Ok(())
 	}
 
@@ -192,7 +192,7 @@ impl Transaction {
 
 		// Output USERS
 		if cfg.users {
-			let users = self.all_db_users(ns, db).await?;
+			let users = self.all_db_users(ns, db, None).await?;
 			self.export_section(
 				"USERS",
 				users.iter().map(|x| DefineUserStatement::from_definition(Base::Db, x)),
@@ -203,7 +203,7 @@ impl Transaction {
 
 		// Output ACCESSES
 		if cfg.accesses {
-			let accesses = self.all_db_accesses(ns, db).await?;
+			let accesses = self.all_db_accesses(ns, db, None).await?;
 			self.export_section(
 				"ACCESSES",
 				accesses
@@ -216,19 +216,19 @@ impl Transaction {
 
 		// Output PARAMS
 		if cfg.params {
-			let params = self.all_db_params(ns, db).await?;
+			let params = self.all_db_params(ns, db, None).await?;
 			self.export_section("PARAMS", params.iter(), chn).await?;
 		}
 
 		// Output FUNCTIONS
 		if cfg.functions {
-			let functions = self.all_db_functions(ns, db).await?;
+			let functions = self.all_db_functions(ns, db, None).await?;
 			self.export_section("FUNCTIONS", functions.iter(), chn).await?;
 		}
 
 		// Output ANALYZERS
 		if cfg.analyzers {
-			let analyzers = self.all_db_analyzers(ns, db).await?;
+			let analyzers = self.all_db_analyzers(ns, db, None).await?;
 			self.export_section(
 				"ANALYZERS",
 				analyzers.iter().map(DefineAnalyzerStatement::from_definition),
@@ -239,31 +239,31 @@ impl Transaction {
 
 		// Output APIS
 		if cfg.apis {
-			let apis = self.all_db_apis(ns, db).await?;
+			let apis = self.all_db_apis(ns, db, None).await?;
 			self.export_section("APIS", apis.iter(), chn).await?;
 		}
 
 		// Output BUCKETS
 		if cfg.buckets {
-			let buckets = self.all_db_buckets(ns, db).await?;
+			let buckets = self.all_db_buckets(ns, db, None).await?;
 			self.export_section("BUCKETS", buckets.iter(), chn).await?;
 		}
 
 		// Output MODULES
 		if cfg.modules {
-			let modules = self.all_db_modules(ns, db).await?;
+			let modules = self.all_db_modules(ns, db, None).await?;
 			self.export_section("MODULES", modules.iter(), chn).await?;
 		}
 
 		// Output CONFIGS
 		if cfg.configs {
-			let configs = self.all_db_configs(ns, db).await?;
+			let configs = self.all_db_configs(ns, db, None).await?;
 			self.export_section("CONFIGS", configs.iter(), chn).await?;
 		}
 
 		// Output SEQUENCES
 		if cfg.sequences {
-			let sequences = self.all_db_sequences(ns, db).await?;
+			let sequences = self.all_db_sequences(ns, db, None).await?;
 			self.export_section("SEQUENCES", sequences.iter(), chn).await?;
 		}
 
@@ -302,6 +302,7 @@ impl Transaction {
 		chn: &Sender<Vec<u8>>,
 		ns: NamespaceId,
 		db: DatabaseId,
+		batch_size: u32,
 	) -> Result<()> {
 		// Check if tables are included in the export config
 		if !cfg.tables.is_any() {
@@ -328,7 +329,7 @@ impl Transaction {
 			self.export_table_structure(ns, db, table, chn).await?;
 			// Then export the table data if its desired
 			if cfg.records {
-				self.export_table_data(ns, db, table, chn).await?;
+				self.export_table_data(ns, db, table, chn, batch_size).await?;
 			}
 		}
 
@@ -348,20 +349,24 @@ impl Transaction {
 		chn.send(bytes!("")).await?;
 		chn.send(bytes!(format!("{};", table.to_sql()))).await?;
 		chn.send(bytes!("")).await?;
-		// Export all table field definitions for this table
+		// Export all table field definitions with OVERWRITE to ensure
+		// idempotent re-import (relation tables auto-generate in/out fields,
+		// and array types generate sub-field definitions that would conflict).
 		let fields = self.all_tb_fields(ns, db, &table.name, None).await?;
 		for field in fields.iter() {
-			chn.send(bytes!(format!("{};", field.to_sql()))).await?;
+			let mut stmt = field.to_sql_definition();
+			stmt.kind = crate::sql::statements::define::DefineKind::Overwrite;
+			chn.send(bytes!(format!("{};", stmt.to_sql()))).await?;
 		}
 		chn.send(bytes!("")).await?;
 		// Export all table index definitions for this table
-		let indexes = self.all_tb_indexes(ns, db, &table.name).await?;
+		let indexes = self.all_tb_indexes(ns, db, &table.name, None).await?;
 		for index in indexes.iter() {
 			chn.send(bytes!(format!("{};", index.to_sql()))).await?;
 		}
 		chn.send(bytes!("")).await?;
 		// Export all table event definitions for this table
-		let events = self.all_tb_events(ns, db, &table.name).await?;
+		let events = self.all_tb_events(ns, db, &table.name, None).await?;
 		for event in events.iter() {
 			chn.send(bytes!(format!("{};", event.to_sql()))).await?;
 		}
@@ -376,6 +381,7 @@ impl Transaction {
 		db: DatabaseId,
 		table: &TableDefinition,
 		chn: &Sender<Vec<u8>>,
+		batch_size: u32,
 	) -> Result<()> {
 		chn.send(bytes!("-- ------------------------------")).await?;
 		chn.send(bytes!(format!("-- TABLE DATA: {}", InlineCommentDisplay(&table.name)))).await?;
@@ -387,7 +393,7 @@ impl Transaction {
 		let mut next = Some(beg..end);
 
 		while let Some(rng) = next {
-			let batch = self.batch_keys_vals(rng, *EXPORT_BATCH_SIZE, None).await?;
+			let batch = self.batch_keys_vals(rng, batch_size, None).await?;
 			next = batch.next;
 			// If there are no values, return early.
 			if batch.result.is_empty() {
@@ -411,26 +417,15 @@ impl Transaction {
 	///
 	/// # Arguments
 	///
-	/// * `k` - The record key.
-	/// * `record` - The record to be processed.
+	/// * `record` - The record to be processed. The `id` field must already be present in `data`
+	///   (this is the case when the record was produced by [`Record::kv_decode_value_with_id`]).
 	/// * `records_relate` - A mutable reference to a string buffer for graph edge records.
 	/// * `records_normal` - A mutable reference to a string buffer for normal records.
-	fn process_record(
-		k: record::RecordKey,
-		mut record: Record,
-		records_relate: &mut String,
-		records_normal: &mut String,
-	) {
-		// Inject the id field into the document before processing.
-		let rid = crate::val::RecordId {
-			table: k.tb.into_owned(),
-			key: k.id,
-		};
-		record.data.def(rid);
+	fn process_record(record: &Record, records_relate: &mut String, records_normal: &mut String) {
 		// Match on the value to determine if it is a graph edge record or a normal record.
 		if record.is_edge()
-			&& let crate::val::Value::RecordId(_) = record.data.pick(&*IN)
-			&& let crate::val::Value::RecordId(_) = record.data.pick(&*OUT)
+			&& let crate::val::Value::RecordId(_) = record.data.pick(&IN)
+			&& let crate::val::Value::RecordId(_) = record.data.pick(&OUT)
 		{
 			// If the value is a graph edge record (indicated by EDGE, IN, and OUT fields):
 			// Write the value to the records_relate string.
@@ -477,9 +472,13 @@ impl Transaction {
 		// Process each regular value.
 		for (k, v) in regular_values {
 			let k = record::RecordKey::decode_key(&k)?;
-			let v = Record::kv_decode_value(v)?;
+			let rid = crate::val::RecordId {
+				table: k.tb.into_owned(),
+				key: k.id,
+			};
+			let v = Record::kv_decode_value(&v, rid)?;
 			// Process the value and categorize it into records_relate or records_normal.
-			Self::process_record(k, v, &mut records_relate, &mut records_normal);
+			Self::process_record(&v, &mut records_relate, &mut records_normal);
 		}
 
 		// If there are normal records, generate and send the INSERT SQL command.

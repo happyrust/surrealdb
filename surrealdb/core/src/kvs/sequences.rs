@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rand::{Rng, thread_rng};
+use rand::Rng;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -33,7 +33,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 use web_time::Instant;
 
-use crate::catalog::providers::DatabaseProvider;
+use crate::catalog::providers::{DatabaseProvider, NamespaceProvider, TableProvider};
 use crate::catalog::{DatabaseId, IndexId, NamespaceId, TableId};
 use crate::ctx::Context;
 use crate::err::Error;
@@ -210,7 +210,7 @@ impl Sequences {
 	/// This method is called when a namespace is deleted to remove all cached
 	/// sequence state for databases within that namespace.
 	pub(crate) async fn namespace_removed(&self, tx: &Transaction, ns: NamespaceId) -> Result<()> {
-		for db in tx.all_db(ns).await?.iter() {
+		for db in tx.all_db(ns, None).await?.iter() {
 			self.database_removed(tx, ns, db.database_id).await?;
 		}
 		Ok(())
@@ -226,7 +226,7 @@ impl Sequences {
 		ns: NamespaceId,
 		db: DatabaseId,
 	) -> Result<()> {
-		for sqs in tx.all_db_sequences(ns, db).await?.iter() {
+		for sqs in tx.all_db_sequences(ns, db, None).await?.iter() {
 			self.sequence_removed(ns, db, &sqs.name).await;
 		}
 		Ok(())
@@ -267,13 +267,13 @@ impl Sequences {
 		if let Some(s) = sequence {
 			return s.lock().await.next(self, ctx, &seq, batch).await;
 		}
-		let s = match self.sequences.write().await.entry(seq.clone()) {
-			Entry::Occupied(e) => e.get().clone(),
+		let s = match self.sequences.write().await.entry(Arc::clone(&seq)) {
+			Entry::Occupied(e) => Arc::clone(e.get()),
 			Entry::Vacant(e) => {
 				let s = Arc::new(Mutex::new(
 					Sequence::load(ctx, self, &seq, start, batch, timeout).await?,
 				));
-				e.insert(s).clone()
+				Arc::clone(e.insert(s))
 			}
 		};
 		s.lock().await.next(self, ctx, &seq, batch).await
@@ -371,7 +371,7 @@ impl Sequences {
 		db: DatabaseId,
 		sq: &str,
 	) -> Result<i64> {
-		let seq = tx.get_db_sequence(ns, db, sq).await?;
+		let seq = tx.get_db_sequence(ns, db, sq, None).await?;
 		let domain = Arc::new(SequenceDomain::new_user(ns, db, sq));
 		self.next_val(ctx, domain, seq.start, seq.batch, seq.timeout).await
 	}
@@ -445,6 +445,10 @@ impl Sequence {
 		let mut st: SequenceState = if let Some(v) = tx.get(&state_key, None).await? {
 			revision::from_slice(&v)?
 		} else {
+			// First boot for this sequence: bump the configured start past any IDs
+			// already issued via the catalog so we never reuse live namespace,
+			// database, table, or index identifiers.
+			let start = Self::seed_start_from_catalog(&tx, seq, start).await?;
 			SequenceState {
 				next: start,
 			}
@@ -460,6 +464,45 @@ impl Sequence {
 			st,
 			timeout,
 		})
+	}
+
+	/// Raises `start` to one past the highest catalog-assigned ID for domains
+	/// backed by the namespace, database, table, or index catalogs; other
+	/// domains keep `start` unchanged.
+	async fn seed_start_from_catalog(
+		tx: &Transaction,
+		seq: &SequenceDomain,
+		start: i64,
+	) -> Result<i64> {
+		// `start` is a lower bound; the scan only increases it when catalog rows exist.
+		let mut seeded = start;
+		match seq {
+			SequenceDomain::NameSpacesIds => {
+				for ns in tx.all_ns(None).await?.iter() {
+					seeded = seeded.max(ns.namespace_id.0 as i64 + 1);
+				}
+			}
+			SequenceDomain::DatabasesIds(ns) => {
+				for db in tx.all_db(*ns, None).await?.iter() {
+					seeded = seeded.max(db.database_id.0 as i64 + 1);
+				}
+			}
+			SequenceDomain::TablesIds(ns, db) => {
+				for tb in tx.all_tb(*ns, *db, None).await?.iter() {
+					seeded = seeded.max(tb.table_id.0 as i64 + 1);
+				}
+			}
+			SequenceDomain::IndexIds(ns, db, tb) => {
+				for ix in tx.all_tb_indexes(*ns, *db, tb, None).await?.iter() {
+					seeded = seeded.max(ix.index_id.0 as i64 + 1);
+				}
+			}
+			// FullText doc IDs and user-defined sequences are not backed by the
+			// catalog id-allocation scheme, so there are no pre-existing IDs to
+			// avoid colliding with.
+			SequenceDomain::FullTextDocIds(_) | SequenceDomain::UserName(..) => {}
+		}
+		Ok(seeded)
 	}
 
 	/// Gets the next ID from this sequence.
@@ -492,7 +535,7 @@ impl Sequence {
 			self.tf.transaction(TransactionType::Write, LockType::Optimistic, sqs.clone()).await?;
 
 		// Execute operations and ensure transaction is cancelled on error
-		match tx.set(&self.state_key, &revision::to_vec(&self.st)?, None).await {
+		match tx.set(&self.state_key, &revision::to_vec(&self.st)?).await {
 			Ok(_) => {
 				tx.commit().await?;
 				Ok(v)
@@ -555,7 +598,7 @@ impl Sequence {
 				return Ok(r);
 			}
 			// exponential backoff with full jitter
-			let sleep_ms = thread_rng().gen_range(1..=tempo);
+			let sleep_ms = rand::rng().random_range(1..=tempo);
 			sleep(Duration::from_millis(sleep_ms)).await;
 			if tempo < MAX_BACKOFF {
 				tempo *= 2;
@@ -615,7 +658,7 @@ impl Sequence {
 				owner: sqs.nid,
 			})?;
 			let batch_key = seq.new_batch_key(next_start)?;
-			tx.set(&batch_key, &bv, None).await?;
+			tx.set(&batch_key, &bv).await?;
 			Ok::<(i64, i64), anyhow::Error>((next_start, next_to))
 		}
 		.await;
@@ -630,5 +673,146 @@ impl Sequence {
 				Err(e)
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::catalog::providers::{DatabaseProvider, NamespaceProvider, TableProvider};
+	use crate::catalog::{
+		DatabaseDefinition, DatabaseId, Index, IndexDefinition, IndexId, NamespaceDefinition,
+		NamespaceId, TableDefinition, TableId,
+	};
+	use crate::kvs::sequences::{Sequence, SequenceDomain};
+	use crate::kvs::{Datastore, LockType, TransactionType};
+	use crate::val::TableName;
+
+	#[tokio::test]
+	async fn seed_start_from_catalog_uses_max_existing_id() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let ns_id = NamespaceId(7);
+		let db_id = DatabaseId(11);
+		let tb_name: TableName = "tb".into();
+
+		let tx = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+		tx.put_ns(NamespaceDefinition {
+			namespace_id: ns_id,
+			name: "ns".into(),
+			comment: None,
+		})
+		.await
+		.unwrap();
+		tx.put_db(
+			"ns",
+			DatabaseDefinition {
+				namespace_id: ns_id,
+				database_id: db_id,
+				name: "db".into(),
+				comment: None,
+				changefeed: None,
+				strict: false,
+			},
+		)
+		.await
+		.unwrap();
+		tx.put_tb("ns", "db", &TableDefinition::new(ns_id, db_id, TableId(13), tb_name.clone()))
+			.await
+			.unwrap();
+		tx.put_tb_index(
+			ns_id,
+			db_id,
+			&tb_name,
+			&IndexDefinition {
+				index_id: IndexId(17),
+				name: "ix".into(),
+				table_name: tb_name.clone(),
+				cols: vec![],
+				index: Index::Idx,
+				comment: None,
+				prepare_remove: false,
+			},
+		)
+		.await
+		.unwrap();
+		tx.commit().await.unwrap();
+
+		let tx = ds.transaction(TransactionType::Read, LockType::Optimistic).await.unwrap();
+
+		// Seeds past the highest existing ID in each catalog domain.
+		assert_eq!(
+			Sequence::seed_start_from_catalog(&tx, &SequenceDomain::NameSpacesIds, 0)
+				.await
+				.unwrap(),
+			8
+		);
+		assert_eq!(
+			Sequence::seed_start_from_catalog(&tx, &SequenceDomain::DatabasesIds(ns_id), 0)
+				.await
+				.unwrap(),
+			12
+		);
+		assert_eq!(
+			Sequence::seed_start_from_catalog(&tx, &SequenceDomain::TablesIds(ns_id, db_id), 0)
+				.await
+				.unwrap(),
+			14
+		);
+		assert_eq!(
+			Sequence::seed_start_from_catalog(
+				&tx,
+				&SequenceDomain::IndexIds(ns_id, db_id, tb_name.clone()),
+				0,
+			)
+			.await
+			.unwrap(),
+			18
+		);
+
+		// `start` is a lower bound: a higher caller-supplied value wins.
+		assert_eq!(
+			Sequence::seed_start_from_catalog(&tx, &SequenceDomain::NameSpacesIds, 100)
+				.await
+				.unwrap(),
+			100
+		);
+
+		// Empty catalog scopes leave `start` unchanged.
+		assert_eq!(
+			Sequence::seed_start_from_catalog(
+				&tx,
+				&SequenceDomain::DatabasesIds(NamespaceId(999)),
+				3,
+			)
+			.await
+			.unwrap(),
+			3
+		);
+
+		tx.cancel().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn seed_start_from_catalog_returns_start_on_empty_store() {
+		let ds = Datastore::new("memory").await.unwrap();
+		let tx = ds.transaction(TransactionType::Read, LockType::Optimistic).await.unwrap();
+
+		assert_eq!(
+			Sequence::seed_start_from_catalog(&tx, &SequenceDomain::NameSpacesIds, 0)
+				.await
+				.unwrap(),
+			0
+		);
+		assert_eq!(
+			Sequence::seed_start_from_catalog(
+				&tx,
+				&SequenceDomain::DatabasesIds(NamespaceId(0)),
+				0,
+			)
+			.await
+			.unwrap(),
+			0
+		);
+
+		tx.cancel().await.unwrap();
 	}
 }

@@ -23,13 +23,13 @@ pub(crate) struct AlterModuleStatement {
 impl AlterModuleStatement {
 	#[instrument(level = "trace", name = "AlterModuleStatement::compute", skip_all)]
 	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
-		opt.is_allowed(Action::Edit, ResourceKind::Module, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Module, Base::Db)?;
 		let (_, _) = opt.ns_db()?;
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 		let txn = ctx.tx();
 
 		let storage_name = self.name.get_storage_name();
-		let mut md = match txn.get_db_module(ns, db, &storage_name).await {
+		let mut md = match txn.get_db_module(ns, db, &storage_name, None).await {
 			Ok(v) => v.deref().clone(),
 			Err(e) => {
 				if self.if_exists {

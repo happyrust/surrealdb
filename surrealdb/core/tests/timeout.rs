@@ -1,9 +1,11 @@
+#![recursion_limit = "256"]
+
 mod helpers;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use helpers::{Test, new_ds};
-use surrealdb_core::dbs::Session;
+use helpers::Test;
+use surrealdb_core::dbs::{Capabilities, Session};
 #[allow(unused_imports)]
 use surrealdb_core::kvs::Datastore;
 
@@ -36,6 +38,20 @@ async fn statement_timeouts() -> Result<()> {
 	Ok(())
 }
 
+async fn new_ds_with_timeout(query: Option<Duration>, transaction: Option<Duration>) -> Datastore {
+	let ds = Datastore::builder()
+		.with_capabilities(Capabilities::all())
+		.with_query_timeout(query)
+		.with_transaction_timeout(transaction)
+		.build_with_path("memory")
+		.await
+		.expect("success");
+	ds.execute("DEFINE NS `test`", &Session::owner(), None).await.expect("success");
+	let sess = Session::owner().with_ns("test");
+	ds.execute("DEFINE DB `test`", &sess, None).await.expect("success");
+	ds
+}
+
 #[tokio::test]
 async fn query_timeout() -> Result<()> {
 	let sql = "
@@ -46,7 +62,7 @@ async fn query_timeout() -> Result<()> {
 			}
 		}
 	";
-	let ds = new_ds("test", "test").await?.with_query_timeout(Some(Duration::from_millis(500)));
+	let ds = new_ds_with_timeout(Some(Duration::from_millis(500)), None).await;
 	let session = Session::owner();
 	let before = Instant::now();
 	let mut res = ds.execute(sql, &session, None).await.unwrap();
@@ -60,8 +76,7 @@ async fn query_timeout() -> Result<()> {
 
 #[tokio::test]
 async fn transaction_timeout() -> Result<()> {
-	let ds =
-		new_ds("test", "test").await?.with_transaction_timeout(Some(Duration::from_millis(500)));
+	let ds = new_ds_with_timeout(None, Some(Duration::from_millis(500))).await;
 	let session = Session::owner().with_ns("test").with_db("test");
 
 	let before = Instant::now();
@@ -81,8 +96,7 @@ async fn transaction_timeout() -> Result<()> {
 
 #[tokio::test]
 async fn transaction_timeout_begin_commit() -> Result<()> {
-	let ds =
-		new_ds("test", "test").await?.with_transaction_timeout(Some(Duration::from_millis(500)));
+	let ds = new_ds_with_timeout(None, Some(Duration::from_millis(500))).await;
 	let session = Session::owner().with_ns("test").with_db("test");
 
 	let before = Instant::now();

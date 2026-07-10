@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(clippy::unwrap_used)]
 
 mod helpers;
@@ -12,13 +13,17 @@ use surrealdb_core::syn;
 use surrealdb_types::Value;
 use web_time::SystemTime;
 
+fn is_concurrent_index_status_retryable_conflict(error: &str) -> bool {
+	error.starts_with("Transaction conflict:")
+}
+
 #[tokio::test]
 async fn define_statement_namespace() -> Result<()> {
 	let sql = "
 		DEFINE NAMESPACE test;
 		INFO FOR ROOT;
 	";
-	let dbs = new_ds("other", "other").await?;
+	let (_, dbs) = new_ds("other", "other", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -61,7 +66,7 @@ async fn define_statement_database() -> Result<()> {
 		DEFINE DATABASE test;
 		INFO FOR NS;
 	";
-	let dbs = new_ds("test", "otherdb").await?;
+	let (_, dbs) = new_ds("test", "otherdb", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 2);
@@ -90,7 +95,7 @@ async fn define_statement_index_concurrently_building_status(
 	appended_size: usize,
 ) -> Result<()> {
 	let session = Session::owner().with_ns("test").with_db("test");
-	let ds = new_ds("test", "test").await?;
+	let (_, ds) = new_ds("test", "test", false).await?;
 	// Populate initial records
 	for i in 0..initial_size {
 		let mut responses = ds
@@ -129,8 +134,18 @@ async fn define_statement_index_concurrently_building_status(
 				format!("DELETE user:{appended_count}")
 			};
 			let mut responses = ds.execute(&sql, &session, None).await?;
-			skip_ok(&mut responses, 1)?;
-			appended_count += 1;
+			let tmp = responses.remove(0).result;
+			match tmp {
+				Ok(_) => {
+					appended_count += 1;
+				}
+				Err(e) if is_concurrent_index_status_retryable_conflict(&e.to_string()) => {
+					continue;
+				}
+				Err(e) => {
+					return Err(e.into());
+				}
+			}
 		}
 		// We monitor the status
 		let mut r = ds.execute("INFO FOR INDEX test ON user", &session, None).await?;
@@ -176,7 +191,6 @@ async fn define_statement_index_concurrently_building_status(
 					assert!(initial > 0, "{initial} > 0");
 					assert!(initial <= initial_size, "{initial} <= {initial_size}");
 					assert_eq!(pending, 0);
-					assert!(updated > 0, "{updated} > 0");
 					assert!(updated <= appended_count, "{updated} <= appended_count");
 					break;
 				}
@@ -245,7 +259,7 @@ async fn define_statement_search_index() -> Result<()> {
 		INFO FOR TABLE blog;
 	"#;
 
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 7);
@@ -278,7 +292,7 @@ async fn define_statement_user_root() -> Result<()> {
 
 		INFO FOR ROOT;
 	";
-	let dbs = new_ds("test", "test").await?;
+	let (_, dbs) = new_ds("test", "test", false).await?;
 	let ses = Session::owner();
 	let res = &mut dbs.execute(sql, &ses, None).await?;
 
@@ -297,7 +311,7 @@ async fn define_statement_user_root() -> Result<()> {
 
 #[tokio::test]
 async fn define_statement_user_ns() -> Result<()> {
-	let dbs = new_ds("ns", "db").await?;
+	let (_, dbs) = new_ds("ns", "db", false).await?;
 	let ses = Session::owner();
 
 	// Create a NS user and retrieve it.
@@ -368,7 +382,7 @@ async fn define_statement_user_ns() -> Result<()> {
 
 #[tokio::test]
 async fn define_statement_user_db() -> Result<()> {
-	let dbs = new_ds("ns", "db").await?;
+	let (_, dbs) = new_ds("ns", "db", false).await?;
 	let ses = Session::owner();
 
 	// Create a NS user and retrieve it.

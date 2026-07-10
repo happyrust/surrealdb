@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(clippy::regex_creation_in_loops)]
 
 mod helpers;
@@ -52,7 +53,7 @@ async fn access_bearer_grant() {
 			ACCESS srv GRANT FOR RECORD user:tobie;
 		"
 		);
-		let dbs = new_ds("test", "test").await.unwrap();
+		let (_, dbs) = new_ds("test", "test", false).await.unwrap();
 		let ses = match level.base.as_str() {
 			"ROOT" => Session::owner(),
 			"NAMESPACE" => Session::owner().with_ns(level.ns.unwrap()),
@@ -197,7 +198,7 @@ async fn access_bearer_revoke() {
 			ACCESS srv ON {base} GRANT FOR USER jaime;
 		"
 		);
-		let dbs = new_ds("test", "test").await.unwrap();
+		let (_, dbs) = new_ds("test", "test", false).await.unwrap();
 		let ses = match level.base.as_str() {
 			"ROOT" => Session::owner(),
 			"NAMESPACE" => Session::owner().with_ns(level.ns.unwrap()),
@@ -333,7 +334,7 @@ async fn access_bearer_show() {
 			ACCESS srv ON {base} GRANT FOR USER jaime;
 		"
 		);
-		let dbs = new_ds("test", "test").await.unwrap();
+		let (_, dbs) = new_ds("test", "test", false).await.unwrap();
 		let ses = match level.base.as_str() {
 			"ROOT" => Session::owner(),
 			"NAMESPACE" => Session::owner().with_ns(level.ns.unwrap()),
@@ -490,7 +491,7 @@ async fn access_bearer_purge() {
 			ACCESS srv ON {base} GRANT FOR USER jaime;
 		"
 		);
-		let dbs = new_ds("test", "test").await.unwrap();
+		let (_, dbs) = new_ds("test", "test", false).await.unwrap();
 		let ses = match level.base.as_str() {
 			"ROOT" => Session::owner(),
 			"NAMESPACE" => Session::owner().with_ns(level.ns.unwrap()),
@@ -756,7 +757,7 @@ the database name matches", 			),
 			);
 
 			{
-				let ds = new_ds("NS", "DB").await.unwrap().with_auth_enabled(true);
+				let (_, ds) = new_ds("NS", "DB", true).await.unwrap();
 
 				let mut resp = ds.execute(&statement_setup, &sess_setup, None).await.unwrap();
 				let res = resp.remove(0).output();
@@ -771,13 +772,8 @@ the database name matches", 			),
 					assert!(res.is_ok(), "{}: {:?}", msg, res);
 					assert_ne!(res.unwrap(), Value::Array(Array::new()), "{}", msg);
 				} else {
-					let err = res.unwrap_err().to_string();
-					assert!(
-						err.contains("Not enough permissions to perform this action"),
-						"{}: {}",
-						msg,
-						err
-					)
+					let err = res.unwrap_err();
+					assert!(err.is_not_allowed(), "{msg}: expected NotAllowed, got {err}")
 				}
 			}
 		}

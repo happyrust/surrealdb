@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use reblessive::tree::Stk;
+use surrealdb_strand::Strand;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use super::DefineKind;
@@ -16,9 +17,9 @@ use crate::val::Value;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DefineModelStatement {
 	pub kind: DefineKind,
-	pub hash: String,
-	pub name: String,
-	pub version: String,
+	pub hash: Strand,
+	pub name: Strand,
+	pub version: Strand,
 	pub comment: Expr,
 	pub permissions: Permission,
 }
@@ -34,17 +35,24 @@ impl DefineModelStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Model, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Model, Base::Db)?;
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "model",
+				name: self.name.to_string(),
+			});
+		}
 		// Fetch the transaction
 		let txn = ctx.tx();
 		// Check if the definition exists
 		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
-		if let Some(model) = txn.get_db_model(ns, db, &self.name, &self.version).await? {
+		if let Some(model) = txn.get_db_model(ns, db, &self.name, &self.version, None).await? {
 			match self.kind {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::MlAlreadyExists {
-							name: model.name.clone(),
+							name: model.name.to_string(),
 						});
 					}
 				}
@@ -70,7 +78,6 @@ impl DefineModelStatement {
 				comment,
 				permissions: self.permissions.clone(),
 			},
-			None,
 		)
 		.await?;
 		// Clear the cache

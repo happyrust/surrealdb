@@ -36,7 +36,7 @@ impl RemoveSequenceStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Sequence, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Sequence, Base::Db)?;
 		// Compute the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "sequence name").await?;
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
@@ -45,7 +45,7 @@ impl RemoveSequenceStatement {
 		let txn = ctx.tx();
 
 		// Get the definition
-		let sq = match txn.get_db_sequence(ns, db, &name).await {
+		let sq = match txn.get_db_sequence(ns, db, &name, None).await {
 			Ok(x) => x,
 			Err(e) => {
 				if self.if_exists && matches!(e.downcast_ref(), Some(Error::SeqNotFound { .. })) {

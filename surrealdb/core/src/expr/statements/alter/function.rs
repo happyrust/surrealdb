@@ -1,6 +1,7 @@
 use std::ops::Deref;
 
 use anyhow::Result;
+use surrealdb_strand::Strand;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use super::AlterKind;
@@ -9,12 +10,12 @@ use crate::catalog::providers::DatabaseProvider;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::expr::{Base, Block, Kind};
-use crate::iam::{Action, ResourceKind};
+use crate::iam::{Action, AuthLimit, ResourceKind};
 use crate::val::Value;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct AlterFunctionStatement {
-	pub name: String,
+	pub name: Strand,
 	pub if_exists: bool,
 	pub args: AlterKind<Vec<(String, Kind)>>,
 	pub block: AlterKind<Block>,
@@ -26,12 +27,12 @@ pub(crate) struct AlterFunctionStatement {
 impl AlterFunctionStatement {
 	#[instrument(level = "trace", name = "AlterFunctionStatement::compute", skip_all)]
 	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
-		opt.is_allowed(Action::Edit, ResourceKind::Function, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Function, Base::Db)?;
 		let (_, _) = opt.ns_db()?;
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 		let txn = ctx.tx();
 
-		let mut fc = match txn.get_db_function(ns, db, &self.name).await {
+		let mut fc = match txn.get_db_function(ns, db, &self.name, None).await {
 			Ok(v) => v.deref().clone(),
 			Err(e) => {
 				if self.if_exists {
@@ -69,8 +70,11 @@ impl AlterFunctionStatement {
 			AlterKind::None => {}
 		}
 
+		// Recompute auth_limit from the current principal to prevent privilege escalation
+		fc.auth_limit = AuthLimit::new_from_auth(&opt.auth).into();
+
 		let key = crate::key::database::fc::new(ns, db, &self.name);
-		txn.set(&key, &fc, None).await?;
+		txn.set(&key, &fc).await?;
 		txn.clear_cache();
 		Ok(Value::None)
 	}

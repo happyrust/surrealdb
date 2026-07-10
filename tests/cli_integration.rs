@@ -2,6 +2,7 @@
 mod common;
 
 mod cli_integration {
+	use std::collections::HashMap;
 	use std::fs::File;
 	use std::io::Write;
 	#[cfg(unix)]
@@ -37,6 +38,29 @@ mod cli_integration {
 	#[test]
 	fn version_flag_long() {
 		common::run("--version").output().unwrap();
+	}
+
+	#[cfg(feature = "surrealism")]
+	#[test]
+	fn module_version_command() {
+		let output = common::run("module version").output().unwrap();
+		assert!(output.contains(surrealism_runtime::SDK_VERSION));
+	}
+
+	#[cfg(feature = "surrealism")]
+	#[test]
+	fn module_version_flag_short() {
+		let output = common::run("module -V").output().unwrap();
+		assert!(output.contains("Surrealism command-line interface"));
+		assert!(output.contains(surrealism_runtime::SDK_VERSION));
+	}
+
+	#[cfg(feature = "surrealism")]
+	#[test]
+	fn module_version_flag_long() {
+		let output = common::run("module --version").output().unwrap();
+		assert!(output.contains("Surrealism command-line interface"));
+		assert!(output.contains(surrealism_runtime::SDK_VERSION));
 	}
 
 	#[test]
@@ -214,10 +238,12 @@ mod cli_integration {
 				.output()
 				.unwrap();
 
+			// BEGIN batch: failed txn, then cancelled (skipped stmts), then explicit COMMIT error
+			// (#7207).
 			assert_eq!(
 				output.lines().filter(|s| s.contains("transaction")).count(),
-				3,
-				"missing failed txn errors in {output:?}"
+				4,
+				"missing txn-related errors in {output:?}"
 			);
 			assert!(output.contains("rgument"), "missing argument error in {output}");
 		}
@@ -1143,6 +1169,19 @@ mod cli_integration {
 		assert!(common::run_in_dir("validate", &temp_dir).output().is_err());
 	}
 
+	#[test]
+	fn validate_stdin_with_valid_query() {
+		let mut child = common::run("validate --stdin").input("CREATE thing:success;");
+		let output = child.output().unwrap();
+		assert!(output.contains("<stdin>: OK"), "expected OK, got: {output}");
+	}
+
+	#[test]
+	fn validate_stdin_with_invalid_query() {
+		let mut child = common::run("validate --stdin").input("CREATE $thing WHERE value = '';");
+		assert!(child.output().is_err());
+	}
+
 	#[cfg(unix)]
 	#[test(tokio::test)]
 	async fn test_server_graceful_shutdown() {
@@ -1965,6 +2004,29 @@ mod cli_integration {
 			"s - query: RETURN string::concat(`sleep`(1s200ms), '/', $public, '/', $secret) - params: [ $public='foo' ]"
 		));
 		println!("{stderr}");
+	}
+
+	/// `SURREAL_MEMORY_THRESHOLD` with a byte-suffix (e.g. `256m`) must start the
+	/// server without a config-parse warning (regression test for #7380).
+	///
+	/// A previous fix restored suffix parsing for the legacy env-var static but
+	/// missed the configmap path, leaving the warning intact for suffixed values.
+	#[test(tokio::test)]
+	async fn memory_threshold_suffix_no_parse_warning() {
+		let vars: HashMap<String, String> =
+			[("SURREAL_MEMORY_THRESHOLD".to_string(), "256m".to_string())].into();
+		let (_addr, mut server) = common::start_server(StartServerArguments {
+			vars: Some(vars),
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+		let stderr = server.finish().unwrap().stderr();
+		assert!(
+			!stderr.contains("Could not parse configuration value for key `MEMORY_THRESHOLD`"),
+			"byte-suffix memory threshold should parse without a warning; stderr:\n{stderr}"
+		);
 	}
 }
 

@@ -9,9 +9,53 @@ use crate::ctx::FrozenContext;
 use crate::dbs::{Options, ParameterCapturePass, Variables};
 use crate::doc::CursorDoc;
 use crate::err::Error;
-use crate::expr::visit::Visit;
-use crate::expr::{Cond, Expr, Fetchs, Fields, FlowResultExt as _};
+use crate::expr::visit::{Visit, Visitor};
+use crate::expr::{Cond, Expr, Fetchs, Fields, FlowResultExt as _, Idiom, Param};
 use crate::val::Value;
+
+/// The set of parameter names that carry per-event document data and are therefore
+/// only meaningful at notification time, not at LIVE query registration time.
+const DOC_PARAMS: &[&str] = &["value", "before", "after", "event", "this"];
+
+/// Visitor that short-circuits with `Err(())` on the first expression node that
+/// depends on the document being processed:
+///
+/// - Any field-access [`Idiom`] (e.g. `name`, `user.age`).
+/// - Any of the live-query event params: `$value`, `$before`, `$after`, `$event`, `$this`.
+///
+/// Session params (`$access`, `$auth`, `$token`, `$session`) and user-defined LET
+/// params are captured at registration time and treated as constants.
+///
+/// If the visitor completes without returning `Err`, the expression is
+/// "document-independent": its result is the same for every record that triggers
+/// the LIVE query, so it can be evaluated once at registration time to catch
+/// errors early.
+struct IsDocumentDependentChecker;
+
+impl Visitor for IsDocumentDependentChecker {
+	/// `()` is used as an early-termination signal — `Err(())` means "found a
+	/// document-dependent node, stop traversal".
+	type Error = ();
+
+	fn visit_idiom(&mut self, _idiom: &Idiom) -> Result<(), ()> {
+		Err(()) // any field access → document-dependent, stop
+	}
+
+	fn visit_param(&mut self, param: &Param) -> Result<(), ()> {
+		if DOC_PARAMS.contains(&param.as_str()) {
+			Err(()) // document-event param → document-dependent, stop
+		} else {
+			Ok(())
+		}
+	}
+}
+
+/// Returns `true` if `expr` contains any field-access idiom or document-event
+/// param, meaning its result can differ per-document and it cannot be safely
+/// evaluated at LIVE query registration time.
+fn is_document_dependent(expr: &Expr) -> bool {
+	expr.visit(&mut IsDocumentDependentChecker).is_err()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum LiveFields {
@@ -40,11 +84,11 @@ impl LiveStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Is realtime enabled?
-		opt.realtime()?;
+		ctx.realtime()?;
 		// Valid options?
 		opt.valid_for_db()?;
 		// Get the Node ID
-		let nid = opt.id();
+		let nid = ctx.node_id();
 
 		let mut vars = Variables::new();
 		let mut pass = ParameterCapturePass {
@@ -84,8 +128,11 @@ impl LiveStatement {
 			// Use the current session authentication
 			// for when we store the LIVE Statement
 			session: ctx.value("session").cloned(),
-			// Add the variables to the subscription definition
-			vars: vars.0,
+			// Add the variables to the subscription definition. Keys are
+			// copied out of `Strand` into owned `String` here because
+			// `SubscriptionDefinition` is persisted in the catalog and
+			// stores `BTreeMap<String, Value>`.
+			vars: vars.0.into_iter().map(|(k, v)| (k.into_string(), v)).collect(),
 		};
 		// Get the id
 		let live_query_id = subscription_definition.id;
@@ -107,6 +154,18 @@ impl LiveStatement {
 					let (ns, db) = opt.ns_db()?;
 					txn.expect_tb_by_name(ns, db, &tb).await?;
 				}
+				// If the WHERE clause is document-independent (no field references or
+				// document-event params), evaluate it now while we still have a full
+				// execution context. This catches obviously broken expressions such as
+				// `WHERE string::len(NONE)` at registration time instead of silently
+				// suppressing every future notification.
+				if let Some(cond) = &self.cond
+					&& !is_document_dependent(&cond.0)
+					&& let Err(e) =
+						stk.run(|stk| cond.0.compute(stk, ctx, opt, None)).await.catch_return()
+				{
+					bail!("LIVE query WHERE clause is invalid and will never match: {e}");
+				}
 				// Insert the node live query
 				let key = crate::key::node::lq::new(nid, live_query_id);
 				txn.replace(
@@ -123,7 +182,7 @@ impl LiveStatement {
 				txn.replace(&key, &subscription_definition).await?;
 				// Refresh the table cache for lives
 				if let Some(cache) = ctx.get_cache() {
-					cache.new_live_queries_version(ns, db, &tb);
+					cache.set_live_queries_version(ns, db, &tb);
 				}
 				// Clear the cache
 				txn.clear_cache();
@@ -145,6 +204,7 @@ mod tests {
 	use anyhow::Result;
 
 	use crate::catalog::providers::{CatalogProvider, TableProvider};
+	use crate::channel::Receiver;
 	use crate::dbs::{Capabilities, Session};
 	use crate::kvs::Datastore;
 	use crate::kvs::LockType::Optimistic;
@@ -154,16 +214,19 @@ mod tests {
 		PublicAction, PublicNotification, PublicRecordId, PublicRecordIdKey, PublicValue,
 	};
 
-	pub async fn new_ds() -> Result<Datastore> {
-		Ok(Datastore::new("memory")
-			.await?
+	pub async fn new_ds() -> Result<(Receiver<PublicNotification>, Datastore)> {
+		let (send, recv) = crate::channel::bounded(1000);
+		let ds = Datastore::builder()
 			.with_capabilities(Capabilities::all())
-			.with_notifications())
+			.with_notify(send)
+			.build_with_path("memory")
+			.await?;
+		Ok((recv, ds))
 	}
 
 	#[tokio::test]
 	async fn test_table_definition_is_created_for_live_query() {
-		let dbs = new_ds().await.unwrap().with_notifications();
+		let (recv, dbs) = new_ds().await.unwrap();
 		let (ns, db, tb) = ("test", "test", "person");
 		let ses = Session::owner().with_ns(ns).with_db(db).with_rt(true);
 
@@ -221,8 +284,7 @@ mod tests {
 		tx.cancel().await.unwrap();
 
 		// Validate notification
-		let notifications = dbs.notifications().expect("expected notifications");
-		let notification = notifications.recv().await.unwrap();
+		let notification = recv.recv().await.unwrap();
 		assert_eq!(
 			notification,
 			PublicNotification::new(
@@ -246,7 +308,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_table_exists_for_live_query() {
-		let dbs = new_ds().await.unwrap().with_notifications();
+		let (_, dbs) = new_ds().await.unwrap();
 		let (ns, db, tb) = ("test", "test", "person");
 		let ses = Session::owner().with_ns(ns).with_db(db).with_rt(true);
 

@@ -2,10 +2,12 @@ use std::borrow::Cow;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_channel::Receiver;
 use futures::StreamExt;
+use surrealdb_types::{ConfigurationError, QueryError, SerializationError, ValidationError};
 #[cfg(not(target_family = "wasm"))]
 use tokio::spawn;
 use uuid::Uuid;
@@ -34,9 +36,10 @@ where
 	Box::pin(async move {
 		let router = client.inner.router.extract()?;
 		if !router.features.contains(&ExtraFeatures::LiveQueries) {
-			return Err(Error::internal(
+			return Err(Error::configuration(
 				"The protocol or storage engine does not support live queries on this architecture"
 					.to_string(),
+				ConfigurationError::LiveQueryNotSupported,
 			));
 		}
 
@@ -59,10 +62,16 @@ where
 				"LIVE SELECT * FROM $_table WHERE id = $_record_id".to_string()
 			}
 			Resource::Object(_) => {
-				return Err(Error::internal("Live queries on objects not supported".to_string()));
+				return Err(Error::validation(
+					"Live queries on objects not supported".to_string(),
+					ValidationError::InvalidParams,
+				));
 			}
 			Resource::Array(_) => {
-				return Err(Error::internal("Live queries on arrays not supported".to_string()));
+				return Err(Error::validation(
+					"Live queries on arrays not supported".to_string(),
+					ValidationError::InvalidParams,
+				));
 			}
 			Resource::Range(query_range) => {
 				// For live queries with ranges, we can't use the range in FROM clause
@@ -133,10 +142,9 @@ where
 			.await?;
 
 		// Get the first result which should be the UUID
-		let result = results
-			.into_iter()
-			.next()
-			.ok_or_else(|| Error::internal("LIVE query returned no results".to_string()))?;
+		let result = results.into_iter().next().ok_or_else(|| {
+			Error::query("LIVE query returned no results".to_string(), QueryError::NotExecuted)
+		})?;
 
 		let id = match result.result? {
 			Value::Uuid(id) => *id,
@@ -157,7 +165,7 @@ where
 		};
 
 		let rx = register(router, id, client.session_id).await?;
-		Ok(Stream::new(client.inner.clone().into(), id, Some(rx)))
+		Ok(Stream::new(Arc::clone(&client.inner).into(), id, Some(rx)))
 	})
 }
 
@@ -217,7 +225,9 @@ where
 	}
 }
 
-/// A stream of live query notifications
+/// Notifications from [`Select::live`](crate::method::Select::live) (built via
+/// [`Surreal::select`](crate::Surreal::select)) or from live handles inside
+/// [`Surreal::query`](crate::Surreal::query).
 #[derive(Debug)]
 #[must_use = "streams do nothing unless you poll them"]
 pub struct Stream<R> {
@@ -372,7 +382,10 @@ where
 				data,
 				action,
 			})),
-			Err(error) => Some(Err(Error::internal(error.to_string()))),
+			Err(error) => Some(Err(Error::serialization(
+				error.to_string(),
+				SerializationError::Deserialization,
+			))),
 		},
 	}
 }

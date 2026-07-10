@@ -13,8 +13,7 @@ use wasmtimer::tokio::MissedTickBehavior;
 
 use super::{
 	HandleResult, PATH, PING_INTERVAL, SessionState, WsMessage, create_ping_message,
-	handle_response, handle_route, handle_session_clone, handle_session_drop,
-	handle_session_initial, replay_session, reset_sessions,
+	handle_response, handle_route, handle_session, replay_session, reset_sessions,
 };
 use crate::conn::{self, Route, Router};
 use crate::engine::{IntervalStream, SessionError};
@@ -167,7 +166,13 @@ pub(crate) async fn run_router(
 	let socket = match connect_with_protocols(ws_url, &["flatbuffers"]).await {
 		Ok(socket) => socket,
 		Err(error) => {
-			conn_tx.send(Err(Error::internal(format!("WebSocket error: {}", error)))).await.ok();
+			conn_tx
+				.send(Err(Error::connection(
+					format!("WebSocket error: {}", error),
+					surrealdb_types::ConnectionError::ConnectionFailed,
+				)))
+				.await
+				.ok();
 			return;
 		}
 	};
@@ -195,23 +200,7 @@ pub(crate) async fn run_router(
 					let Ok(session_id) = session else {
 						break 'router
 					};
-					match session_id {
-						SessionId::Initial(session_id) => {
-							handle_session_initial::<Message, _, _>(
-								session_id, &state.sessions, &state.sink
-							).await;
-						}
-						SessionId::Clone { old, new } => {
-							handle_session_clone::<Message, _, _>(
-								old, new, &state.sessions, &state.sink
-							).await;
-						}
-						SessionId::Drop(session_id) => {
-							handle_session_drop::<Message, _, _>(
-								session_id, &state.sessions, &state.sink
-							).await;
-						}
-					}
+					handle_session::<Message, _, _>(session_id, &state.sessions, &state.sink).await;
 				}
 				route = route_rx.recv().fuse() => {
 					let Ok(route) = route else {
@@ -220,6 +209,15 @@ pub(crate) async fn run_router(
 						}
 						break 'router;
 					};
+
+					// Apply any session-lifecycle events that were enqueued before this
+					// query. The session channel is separate from the route channel, so a
+					// freshly registered or cloned session may not have been processed yet;
+					// receiving this route establishes a happens-before with the sender, so
+					// those earlier events are now observable and one drain pass suffices.
+					while let Ok(session_id) = session_rx.try_recv() {
+						handle_session::<Message, _, _>(session_id, &state.sessions, &state.sink).await;
+					}
 
 					match handle_route::<Message, _, _>(
 						route, None, &state.sessions, &state.sink
