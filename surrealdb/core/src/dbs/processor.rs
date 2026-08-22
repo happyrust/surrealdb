@@ -979,7 +979,7 @@ pub(super) trait Collector {
 		};
 		// Create a new iterable range
 		let txn = ctx.tx();
-		let mut cursor = txn.open_vals_cursor(rng, sc, 0, None).await?;
+		let mut cursor = txn.open_vals_cursor(rng, sc, 0, opt.version).await?;
 		// Loop until no more entries
 		let mut count = 0;
 		'outer: loop {
